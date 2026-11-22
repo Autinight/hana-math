@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "sourceRepository": "Danus",
+  "scope": "Verbatim static contracts only; dynamic TASK.md, Statement, Proof and kickoff inputs are not copied. This is provenance metadata, not a runtime dependency on the Danus repository.",
+  "promptFields": {
+    "agents": "Complete UTF-8 source, preserving every line break and the trailing newline.",
+    "identity": "Verbatim first complete body paragraph after the source title, excluding the separating blank lines.",
+    "publicAgents": "The same verbatim first body paragraph as identity; no authored summary."
+  },
+  "roles": {
+    "main": {
+      "sourcePath": "AGENTS.md",
+      "sha256": "2a6ba2b3fd4e267e587e90bcc63c45d0f8c73bf16e403b3ba0e18a56673ae975",
+      "sourceGitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c",
+      "sourceLocallyModified": false,
+      "adaptedSha256": "333f947a11d6b3a71712afa5849d9fa10f250cb31a5ea4e16668792e250a8bd0",
+      "adaptation": {
+        "module": "contract-adaptation.mjs",
+        "replacements": 5
+      }
+    },
+    "worker": {
+      "sourcePath": "agents/contracts/worker.md",
+      "sha256": "44576585a4975f4417f0adf78e6ec1bb71be316fde7e4ab182020d831ef8ab19",
+      "sourceGitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c",
+      "sourceLocallyModified": false,
+      "adaptedSha256": "e391229a6c60d923375a79a9cf0f389e438461a4211808ed9e311f728caa51d2",
+      "adaptation": {
+        "module": "contract-adaptation.mjs",
+        "replacements": 7
+      }
+    },
+    "verifier": {
+      "sourcePath": "agents/contracts/verifier.md",
+      "sha256": "256229a5ee9f95c4d03ec2d1258eb3bb75f78df6e36ac193e870bea4ef32c563",
+      "sourceGitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c",
+      "sourceLocallyModified": false,
+      "adaptedSha256": "3beba8abd4c3be50e3b89e0287876ba62ebdc7c1f1e58aec465b8768c90eacd3",
+      "adaptation": {
+        "module": "contract-adaptation.mjs",
+        "replacements": 3
+      }
+    }
+  }
+}

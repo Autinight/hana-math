@@ -1,0 +1,28 @@
+{
+  "manifestVersion": 2,
+  "id": "hana-math",
+  "name": "Hana Math",
+  "version": "0.36.1",
+  "entry": "index.js",
+  "capabilities": ["app/agents.read", "app/agents.manage", "app/resources.read", "app/resources.write", "app/runtime.execute", "app/runtime.native", "app/runtime.network", "app/tools.expose-to-model", "app/tasks.manage", "app/session.start-turn", "app/session.switch-model", "app/session.thinking-level", "app/session.tools.configure", "app/session.stage-file", "app/sessions.home"],
+  "network": {
+    "allowedHosts": ["leansearch.net"],
+    "methods": ["POST"],
+    "allowLocalhost": false,
+    "defaultTimeoutMs": 20000,
+    "maxResponseBytes": 1048576
+  },
+  "contributes": {
+    "settings": { "title": "Math", "ui": { "route": "/panel.html" } },
+    "cards": [
+      { "id": "research-dashboard-page", "title": "研究看板", "face": { "image": "assets/cover.svg" }, "route": "/dashboard/workspace.html", "realization": "page", "siteNavEntry": true, "pageIcon": "assets/dashboard-nav.svg", "cardForm": "edge-to-edge", "titleMode": "hide" }
+    ],
+    "previewers": [
+      { "id": "factgraph-snapshot", "title": "Hana Math Fact Graph", "selectors": [{ "extensions": ["hanamathgraph"] }], "route": "/dashboard/index.html", "mode": "read" },
+      { "id": "live-dashboard", "title": "Hana Math Research Dashboard", "selectors": [{ "extensions": ["hanamathboard"] }], "route": "/dashboard/live.html", "mode": "read" }
+    ],
+    "cliFlags": [{ "name": "core-self-test", "type": "boolean", "description": "Run one offline managed-core diagnostic during explicit validation startup", "default": false }]
+  },
+  "icon": "assets/icon.svg",
+  "minAppVersion": "1.5.48-beta"
+}

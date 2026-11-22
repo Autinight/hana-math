@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Verified fact index · Project graph</title>
+<style>@@STYLE@@</style>
+</head>
+<body>
+<main>
+<header><h1>Verified fact index</h1><p id="metadata"></p><p id="revision" class="mono"></p></header>
+<p class="notice">Snapshot · previews only. Proof bodies are not included. Arrows run from predecessor to dependent. A layer describes recorded relations, not mathematical strength.</p>
+<noscript>This offline snapshot needs JavaScript to display its fact index and graph. Enable JavaScript to explore the embedded index; no network connection is needed.</noscript>
+<p id="summary" role="status"></p><p id="warnings" class="warning" role="status"></p>
+<div class="toolbar" aria-label="Graph view controls">
+<button id="zoom-in" type="button">Zoom in</button><button id="zoom-out" type="button">Zoom out</button><button id="reset" type="button">Reset view</button><span id="zoom-status"></span>
+</div>
+<p class="hint">Drag the graph to pan; use the buttons to zoom. Choose a node below to inspect it. Selection centers the node.</p>
+<svg id="graph" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 520" role="img" aria-labelledby="graph-title graph-description">
+<title id="graph-title">Verified fact predecessor graph</title><desc id="graph-description">Arrows point to dependents. The node list below provides keyboard selection and relation navigation.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrow"/></marker></defs>
+<g id="viewport"><g id="edges"></g><g id="nodes"></g></g>
+</svg>
+<div class="details-grid">
+<section aria-labelledby="list-title"><h2 id="list-title">Node index</h2><label for="filter">Filter by fact ID or statement preview</label><input id="filter" type="search" autocomplete="off"><p id="filter-count" role="status"></p><ul id="node-list" class="node-list"></ul></section>
+<section aria-labelledby="selection-title"><h2 id="selection-title">Selected node</h2><p id="selection-status" role="status"></p><label for="fact-id">Fact ID (select to copy)</label><input id="fact-id" class="mono" readonly><p id="preview" class="preview"></p><p id="fact-meta"></p><p>Retrieve the full proof in Hana with <code>math_project</code> using this plain example (no tool is run here):</p><pre id="proof-example"></pre><h3>Predecessors</h3><ul id="predecessors"></ul><h3>Dependents</h3><ul id="dependents"></ul></section>
+</div>
+</main>
+<script id="snapshot-data" type="application/json">@@DATA@@</script>
+<script>@@SCRIPT@@</script>
+</body>
+</html>

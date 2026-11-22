@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "upstream": "Danus",
+  "commit": "839c471d0560b9b5308afc6cbb59a138819fe16c",
+  "files": [
+    {
+      "source": "danus/verify/prechecks.py",
+      "destination": "src/hana_math_engine/vendor/verify_prechecks.py",
+      "sha256": "bbfd44ba734c7f81abeaeba6438793b935c805f2de51a897d773ce9fa1e160eb",
+      "modifications": "none; byte-identical independent stdlib module"
+    }
+  ],
+  "environmentBoundary": "VERIFY_* are inherited from the managed host process at module import; the public command runtime has no per-call env option. Host/deployment configuration is trusted, while Node owns context and the verification envelope. Tool arguments cannot override these. Defaults are unchanged upstream prechecks; their domain-specific textual rejection rules are not a universal correctness test.",
+  "limits": {
+    "requestAndOutputBytes": 1048576,
+    "fileBytes": 1048576,
+    "textFieldBytes": 262144,
+    "smallTextFieldBytes": 4096,
+    "glossaryKeyBytes": 128,
+    "collectionItems": 128,
+    "jsonDepth": 6,
+    "projectFiles": 4096,
+    "projectBytes": 67108864,
+    "controlBytes": 536870912,
+    "controlEntries": 16384,
+    "ipcHistoryBytes": 536870912,
+    "ipcDirectories": 2048
+  },
+  "durability": "Project nonblocking flock; started/ended request journals; per-file atomic snapshot publication, not multi-file transactions or exactly-once. Unsettled mutation IDs require reconciliation. Completed same-payload retries return saved response. OS ownership and exclusion of external filesystem writers are required.",
+  "receipt": "sha256 of compact UTF-8 sorted-key JSON {context,arguments}; predecessors map IDs to canonical Markdown file sha256. No signature/authentication: trusted backend only. Full supplied arguments (including omitted-vs-explicit optional fields) are bound; duplicate predecessors rejected. verifierSessionId is a safe 1-128 character identifier; report issues and gaps both contain {location,issue}."
+}

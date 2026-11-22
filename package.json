@@ -1,0 +1,14 @@
+{
+  "name": "hana-math-development",
+  "version": "0.36.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/test.mjs",
+    "preview": "node tests/preview-server.mjs",
+    "test:visual": "electron tests/visual-smoke.cjs"
+  },
+  "devDependencies": {
+    "electron": "45.2.1"
+  }
+}

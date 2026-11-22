@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hana-math-engine"
+version = "0.1.0"
+description = "Standalone Hana Math core with a vendored Danus compatibility namespace"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["danus", "danus.*", "hana_math_engine", "hana_math_engine.*"]
+
+[tool.setuptools.package-data]
+"danus.core" = ["glossary_global.json", "README.md", "DATA_MODEL.md", "INTERFACES.md"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

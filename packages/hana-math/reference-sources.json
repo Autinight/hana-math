@@ -1,0 +1,1229 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c",
+    "url": "https://github.com/frenzymath/Danus"
+  },
+  "files": [
+    {
+      "source": ".agents/skills/elaboration/SKILL.md",
+      "target": "references/danus/.agents/skills/elaboration/SKILL.md",
+      "sha256": "fb0fe75328f3cd2571a649ccc0183447bd87639401843bef955a0a3648ba6985"
+    },
+    {
+      "source": ".agents/skills/human-summary/SKILL.md",
+      "target": "references/danus/.agents/skills/human-summary/SKILL.md",
+      "sha256": "b48c163a77f9efc894a64cd954c73c5fd5f9e86558bfbe51fd808b7bf4b354bf"
+    },
+    {
+      "source": ".agents/skills/initialize/SKILL.md",
+      "target": "references/danus/.agents/skills/initialize/SKILL.md",
+      "sha256": "e17785a2a528b8ac5a99f79646b67cd991dec3bb49b4c56a5fa6bdd52e3cd2ba"
+    },
+    {
+      "source": ".agents/skills/write-paper/README.md",
+      "target": "references/danus/.agents/skills/write-paper/README.md",
+      "sha256": "a77927a179d39d7e84d134b04a94004e8b134fc7f69a606d53914786551d18c3"
+    },
+    {
+      "source": ".agents/skills/write-paper/SKILL.md",
+      "target": "references/danus/.agents/skills/write-paper/SKILL.md",
+      "sha256": "5d7dbb9339aa65b8bd75b0061ca8b57889f86ad28baaecdf4e430d0c133a1b98"
+    },
+    {
+      "source": "AGENTS.md",
+      "target": "references/danus/AGENTS.md",
+      "sha256": "2a6ba2b3fd4e267e587e90bcc63c45d0f8c73bf16e403b3ba0e18a56673ae975"
+    },
+    {
+      "source": "ARCHITECTURE.md",
+      "target": "references/danus/ARCHITECTURE.md",
+      "sha256": "c5f7454e69bf25b554eb6e5a0b80651d13a2dbcbf49949a466f2c276fcddfe1a"
+    },
+    {
+      "source": "LICENSE",
+      "target": "references/danus/LICENSE",
+      "sha256": "d51dbb6676bff13e23abd800608ec96bd6e637fd5b5194ef9ea8d848416d8ef3"
+    },
+    {
+      "source": "agents/contracts/README.md",
+      "target": "references/danus/agents/contracts/README.md",
+      "sha256": "3a0d2e816e3b2243725bd17c35686c91a28237a6d87e6e5e42776f4a00628287"
+    },
+    {
+      "source": "agents/contracts/main_agent.md",
+      "target": "references/danus/agents/contracts/main_agent.md",
+      "sha256": "0d7e651aa9477f1ba9714eed712e553f75527ce8baa4b08fa0ef931244120477"
+    },
+    {
+      "source": "agents/contracts/verifier.md",
+      "target": "references/danus/agents/contracts/verifier.md",
+      "sha256": "256229a5ee9f95c4d03ec2d1258eb3bb75f78df6e36ac193e870bea4ef32c563"
+    },
+    {
+      "source": "agents/contracts/worker.md",
+      "target": "references/danus/agents/contracts/worker.md",
+      "sha256": "44576585a4975f4417f0adf78e6ec1bb71be316fde7e4ab182020d831ef8ab19"
+    },
+    {
+      "source": "agents/skills/human-summary/REPORT_WRITER_PROMPT.md",
+      "target": "references/danus/agents/skills/human-summary/REPORT_WRITER_PROMPT.md",
+      "sha256": "4513712ae72f5c53fd8e4fb9c565c4cb731a3c33cbd295bd5c41c99b3feb28da"
+    },
+    {
+      "source": "agents/skills/verify/check-referenced-statements/SKILL.md",
+      "target": "references/danus/agents/skills/verify/check-referenced-statements/SKILL.md",
+      "sha256": "8ad6aaeedc4c8af604d54bf2dc4cd0188b42b3284fa8ec14d030f602709e4d0c"
+    },
+    {
+      "source": "agents/skills/verify/check-referenced-statements/agents/openai.yaml",
+      "target": "references/danus/agents/skills/verify/check-referenced-statements/agents/openai.yaml",
+      "sha256": "edb05e1ae1249572f4af17d7cc0989eb3a2cb150fde1edaff2e6477514b47f04"
+    },
+    {
+      "source": "agents/skills/verify/synthesize-verification-report/SKILL.md",
+      "target": "references/danus/agents/skills/verify/synthesize-verification-report/SKILL.md",
+      "sha256": "d917e6fa14b393cac008b99295de1f4bec273efd64dcf10ad0e1b4537c67b22c"
+    },
+    {
+      "source": "agents/skills/verify/synthesize-verification-report/agents/openai.yaml",
+      "target": "references/danus/agents/skills/verify/synthesize-verification-report/agents/openai.yaml",
+      "sha256": "59809ad917671724fe8fb1237129826b6e96565b3125ca207fbdbde86ef74deb"
+    },
+    {
+      "source": "agents/skills/verify/verify-sequential-statements/SKILL.md",
+      "target": "references/danus/agents/skills/verify/verify-sequential-statements/SKILL.md",
+      "sha256": "f9db950ccac92a6c131db011184044f46e814df24f8fb179297046c15a80f31e"
+    },
+    {
+      "source": "agents/skills/verify/verify-sequential-statements/agents/openai.yaml",
+      "target": "references/danus/agents/skills/verify/verify-sequential-statements/agents/openai.yaml",
+      "sha256": "45209a0bc0fddf9d4d9f429c1faa4c5497a711b7a868dd150f4b5ae97da166af"
+    },
+    {
+      "source": "agents/skills/worker/construct-counterexamples/SKILL.md",
+      "target": "references/danus/agents/skills/worker/construct-counterexamples/SKILL.md",
+      "sha256": "dac7c1207a0462d978e39f5556ac1774662ca8a068ef71d895949072d8c2316f"
+    },
+    {
+      "source": "agents/skills/worker/construct-counterexamples/agents/openai.yaml",
+      "target": "references/danus/agents/skills/worker/construct-counterexamples/agents/openai.yaml",
+      "sha256": "a63b9003b15309f61d2723f0d35c54543c42ed0cf623c96154c61f8fb878f991"
+    },
+    {
+      "source": "agents/skills/worker/construct-toy-examples/SKILL.md",
+      "target": "references/danus/agents/skills/worker/construct-toy-examples/SKILL.md",
+      "sha256": "36bd2f2f392ab98b7e62aaad75d7fa3d20c6d45ae6d3b734603e3eff488b1d51"
+    },
+    {
+      "source": "agents/skills/worker/construct-toy-examples/agents/openai.yaml",
+      "target": "references/danus/agents/skills/worker/construct-toy-examples/agents/openai.yaml",
+      "sha256": "d58e06f2a5534535b1f2d000aa3f3667e4ecb991e34ac413dfb8f289e34f7507"
+    },
+    {
+      "source": "agents/skills/worker/direct-proving/SKILL.md",
+      "target": "references/danus/agents/skills/worker/direct-proving/SKILL.md",
+      "sha256": "9e1c22241444d5bf868f06cc2263fe8ca39c307a87511eb375802c72e9a52c0f"
+    },
+    {
+      "source": "agents/skills/worker/direct-proving/agents/openai.yaml",
+      "target": "references/danus/agents/skills/worker/direct-proving/agents/openai.yaml",
+      "sha256": "89a1716339bac287fed695b3f8f0315d2a5ab304abb2a0b0ec56b1783312649a"
+    },
+    {
+      "source": "agents/skills/worker/identify-key-failures/SKILL.md",
+      "target": "references/danus/agents/skills/worker/identify-key-failures/SKILL.md",
+      "sha256": "d0415be93a8e0b3dc605514c5e0e9a5a5a8f87eabff6eac88e73a4df78466b7a"
+    },
+    {
+      "source": "agents/skills/worker/identify-key-failures/agents/openai.yaml",
+      "target": "references/danus/agents/skills/worker/identify-key-failures/agents/openai.yaml",
+      "sha256": "e690f6e479927f6a29bad120099072955f55eebc6419c9ff8d212ae32e48158d"
+    },
+    {
+      "source": "agents/skills/worker/obtain-immediate-conclusions/SKILL.md",
+      "target": "references/danus/agents/skills/worker/obtain-immediate-conclusions/SKILL.md",
+      "sha256": "5d203469d2dec4b00663d3b81c0df412e5a62d98420cba8b0a63c7a904731125"
+    },
+    {
+      "source": "agents/skills/worker/obtain-immediate-conclusions/agents/openai.yaml",
+      "target": "references/danus/agents/skills/worker/obtain-immediate-conclusions/agents/openai.yaml",
+      "sha256": "f0df471853192a295cebc88e5805a2fc1d6b967e2f55cad93a6c78b194d3c623"
+    },
+    {
+      "source": "agents/skills/worker/propose-subgoal-decomposition-plans/SKILL.md",
+      "target": "references/danus/agents/skills/worker/propose-subgoal-decomposition-plans/SKILL.md",
+      "sha256": "47fba96ab5cc52bd5fa6af6940e7051bd2c1a744381d2c0527465690d398508a"
+    },
+    {
+      "source": "agents/skills/worker/propose-subgoal-decomposition-plans/agents/openai.yaml",
+      "target": "references/danus/agents/skills/worker/propose-subgoal-decomposition-plans/agents/openai.yaml",
+      "sha256": "a0400944fed038b18afae60e67a06f68149975305ff82b16df2404a4b68a733c"
+    },
+    {
+      "source": "agents/skills/worker/query-memory/SKILL.md",
+      "target": "references/danus/agents/skills/worker/query-memory/SKILL.md",
+      "sha256": "17a6355fdf1f78bb6be992592d5010b8090726e0b5e2434e190fd8321f913a20"
+    },
+    {
+      "source": "agents/skills/worker/query-memory/agents/openai.yaml",
+      "target": "references/danus/agents/skills/worker/query-memory/agents/openai.yaml",
+      "sha256": "9e76ff533ab11f1cce0cf725879d4b33ddbf67cc739ced63c3e44431e8e86a92"
+    },
+    {
+      "source": "agents/skills/worker/search-math-results/SKILL.md",
+      "target": "references/danus/agents/skills/worker/search-math-results/SKILL.md",
+      "sha256": "730b19c6b119afab321df3f8bc054cd6fa74e5d275a4bd93a4a2ed27b130cf68"
+    },
+    {
+      "source": "agents/skills/worker/search-math-results/agents/openai.yaml",
+      "target": "references/danus/agents/skills/worker/search-math-results/agents/openai.yaml",
+      "sha256": "0b6da7739d16d4c53fb69040e7fa509aeac54e760d50cf8ab57a773e0ddf23ae"
+    },
+    {
+      "source": "agents/skills/worker/verify-proof/SKILL.md",
+      "target": "references/danus/agents/skills/worker/verify-proof/SKILL.md",
+      "sha256": "9ce9ebc7983e5481e5c34f0833300404e4ed84d43ed4770ba74508993412011c"
+    },
+    {
+      "source": "agents/skills/worker/verify-proof/agents/openai.yaml",
+      "target": "references/danus/agents/skills/worker/verify-proof/agents/openai.yaml",
+      "sha256": "808261f67de8697c1abc91a0f5704164d81a69973fd2d364090fa0733e4f049a"
+    },
+    {
+      "source": "agents/skills/write-paper/README.md",
+      "target": "references/danus/agents/skills/write-paper/README.md",
+      "sha256": "3cedb56bc9077418ce603eec6a4613d82b321bf70509869827c48016f9f2d4ed"
+    },
+    {
+      "source": "agents/skills/write-paper/boilerplate/acknowledgement.md",
+      "target": "references/danus/agents/skills/write-paper/boilerplate/acknowledgement.md",
+      "sha256": "32c280a4538453af0010f1f8c709253538223f755485b60c7b11c724fd42f69c"
+    },
+    {
+      "source": "agents/skills/write-paper/roles/AGENTS.md",
+      "target": "references/danus/agents/skills/write-paper/roles/AGENTS.md",
+      "sha256": "a488190965c1495a82e44db27474e330cdaff475b2daf054ef1ff3404e0de596"
+    },
+    {
+      "source": "agents/skills/write-paper/roles/PAPER_MATH_VERIFIER_PROMPT.md",
+      "target": "references/danus/agents/skills/write-paper/roles/PAPER_MATH_VERIFIER_PROMPT.md",
+      "sha256": "6f42cf7c81930734d7d7e5084f505938988927a840a3e2a3224552d599d04555"
+    },
+    {
+      "source": "agents/skills/write-paper/roles/PAPER_PLANNER_PROMPT.md",
+      "target": "references/danus/agents/skills/write-paper/roles/PAPER_PLANNER_PROMPT.md",
+      "sha256": "7e63847af5393928536e677589f4f0f3ff11f0eb09e2af302eb19e918ed44e24"
+    },
+    {
+      "source": "agents/skills/write-paper/roles/PAPER_REVISER_PROMPT.md",
+      "target": "references/danus/agents/skills/write-paper/roles/PAPER_REVISER_PROMPT.md",
+      "sha256": "e59d137e32fba668592023fd6dfb81e138e047a2aeb40d0bf63a5150eb447a8c"
+    },
+    {
+      "source": "agents/skills/write-paper/roles/PAPER_SECTION_WRITER_PROMPT.md",
+      "target": "references/danus/agents/skills/write-paper/roles/PAPER_SECTION_WRITER_PROMPT.md",
+      "sha256": "cc59e6106754fc9147cf98a950010efef85f45b4aac062dbf403b7820772d5d6"
+    },
+    {
+      "source": "agents/skills/write-paper/roles/PAPER_WRITER_PROMPT.md",
+      "target": "references/danus/agents/skills/write-paper/roles/PAPER_WRITER_PROMPT.md",
+      "sha256": "1fe00a28eb9d2922a95fb235baab85fd2c7c98e64fb0b47485bcd9ecb032ad1a"
+    },
+    {
+      "source": "agents/skills/write-paper/roles/REFERENCE_AUDITOR_PROMPT.md",
+      "target": "references/danus/agents/skills/write-paper/roles/REFERENCE_AUDITOR_PROMPT.md",
+      "sha256": "971f73d150b3451a39abfa49e8f59c40bbe0464f7b1e66d62324813e98587580"
+    },
+    {
+      "source": "agents/skills/write-paper/roles/REFERENCE_VERIFIER_PROMPT.md",
+      "target": "references/danus/agents/skills/write-paper/roles/REFERENCE_VERIFIER_PROMPT.md",
+      "sha256": "30f8a9640b22815a39aab863df0ab8e0a2bfdbcb314c5711082a24eb679d8c38"
+    },
+    {
+      "source": "agents/skills/write-paper/roles/STYLE_DISTILLER_PROMPT.md",
+      "target": "references/danus/agents/skills/write-paper/roles/STYLE_DISTILLER_PROMPT.md",
+      "sha256": "2d4fb054fe570ef9f180278475cddaad944d19fa25151a0d073000e7c92ffc8e"
+    },
+    {
+      "source": "agents/skills/write-paper/style/PAPER_STRUCTURE.md",
+      "target": "references/danus/agents/skills/write-paper/style/PAPER_STRUCTURE.md",
+      "sha256": "61d377ae07a94e41c55d3476c99e6809fd784395f9ea474f239620c2decd3314"
+    },
+    {
+      "source": "agents/skills/write-paper/style/README.md",
+      "target": "references/danus/agents/skills/write-paper/style/README.md",
+      "sha256": "3165834533bf18872e03091122ce238b1b6455526c8e64dae1faee38fd49eec8"
+    },
+    {
+      "source": "agents/skills/write-paper/style/STYLE_GUIDE.md",
+      "target": "references/danus/agents/skills/write-paper/style/STYLE_GUIDE.md",
+      "sha256": "9dfd559f95104d3297250584a86adfab40f5412d09abf718355b50cb8e485750"
+    },
+    {
+      "source": "danus/core/DATA_MODEL.md",
+      "target": "references/danus/danus/core/DATA_MODEL.md",
+      "sha256": "a0496cad1db9380510ac38464b5d1b726b24ca5fdaec1b076e18748183c8f75f"
+    },
+    {
+      "source": "danus/core/INTERFACES.md",
+      "target": "references/danus/danus/core/INTERFACES.md",
+      "sha256": "92ab45f0a11d1053afdb40b0a4fb6daaa0e5b6eba5491dcf55c04f4c43cfa511"
+    },
+    {
+      "source": "danus/core/README.md",
+      "target": "references/danus/danus/core/README.md",
+      "sha256": "1e35d24cc7e5d6679e890c7231928d82a0c0e6cb16412a9fb7621053b9702486"
+    },
+    {
+      "source": "danus/core/glossary_global.json",
+      "target": "references/danus/danus/core/glossary_global.json",
+      "sha256": "c2eda900107ccaa7b80eb14cb88c13034799984d270783bc76b2837a9cd41ed2"
+    },
+    {
+      "source": ".agents/skills/elaboration/SKILL.md",
+      "target": "roles/main/skills/elaboration/SKILL.md",
+      "sha256": "fb0fe75328f3cd2571a649ccc0183447bd87639401843bef955a0a3648ba6985"
+    },
+    {
+      "source": "agents/skills/worker/construct-counterexamples/SKILL.md",
+      "target": "roles/worker/skills/construct-counterexamples/SKILL.md",
+      "sha256": "dac7c1207a0462d978e39f5556ac1774662ca8a068ef71d895949072d8c2316f"
+    },
+    {
+      "source": "agents/skills/worker/construct-counterexamples/agents/openai.yaml",
+      "target": "roles/worker/skills/construct-counterexamples/agents/openai.yaml",
+      "sha256": "a63b9003b15309f61d2723f0d35c54543c42ed0cf623c96154c61f8fb878f991"
+    },
+    {
+      "source": "agents/skills/worker/construct-toy-examples/SKILL.md",
+      "target": "roles/worker/skills/construct-toy-examples/SKILL.md",
+      "sha256": "36bd2f2f392ab98b7e62aaad75d7fa3d20c6d45ae6d3b734603e3eff488b1d51"
+    },
+    {
+      "source": "agents/skills/worker/construct-toy-examples/agents/openai.yaml",
+      "target": "roles/worker/skills/construct-toy-examples/agents/openai.yaml",
+      "sha256": "d58e06f2a5534535b1f2d000aa3f3667e4ecb991e34ac413dfb8f289e34f7507"
+    },
+    {
+      "source": "agents/skills/worker/direct-proving/SKILL.md",
+      "target": "roles/worker/skills/direct-proving/SKILL.md",
+      "sha256": "9e1c22241444d5bf868f06cc2263fe8ca39c307a87511eb375802c72e9a52c0f"
+    },
+    {
+      "source": "agents/skills/worker/direct-proving/agents/openai.yaml",
+      "target": "roles/worker/skills/direct-proving/agents/openai.yaml",
+      "sha256": "89a1716339bac287fed695b3f8f0315d2a5ab304abb2a0b0ec56b1783312649a"
+    },
+    {
+      "source": "agents/skills/worker/identify-key-failures/SKILL.md",
+      "target": "roles/worker/skills/identify-key-failures/SKILL.md",
+      "sha256": "d0415be93a8e0b3dc605514c5e0e9a5a5a8f87eabff6eac88e73a4df78466b7a"
+    },
+    {
+      "source": "agents/skills/worker/identify-key-failures/agents/openai.yaml",
+      "target": "roles/worker/skills/identify-key-failures/agents/openai.yaml",
+      "sha256": "e690f6e479927f6a29bad120099072955f55eebc6419c9ff8d212ae32e48158d"
+    },
+    {
+      "source": "agents/skills/worker/obtain-immediate-conclusions/SKILL.md",
+      "target": "roles/worker/skills/obtain-immediate-conclusions/SKILL.md",
+      "sha256": "5d203469d2dec4b00663d3b81c0df412e5a62d98420cba8b0a63c7a904731125"
+    },
+    {
+      "source": "agents/skills/worker/obtain-immediate-conclusions/agents/openai.yaml",
+      "target": "roles/worker/skills/obtain-immediate-conclusions/agents/openai.yaml",
+      "sha256": "f0df471853192a295cebc88e5805a2fc1d6b967e2f55cad93a6c78b194d3c623"
+    },
+    {
+      "source": "agents/skills/worker/propose-subgoal-decomposition-plans/SKILL.md",
+      "target": "roles/worker/skills/propose-subgoal-decomposition-plans/SKILL.md",
+      "sha256": "47fba96ab5cc52bd5fa6af6940e7051bd2c1a744381d2c0527465690d398508a"
+    },
+    {
+      "source": "agents/skills/worker/propose-subgoal-decomposition-plans/agents/openai.yaml",
+      "target": "roles/worker/skills/propose-subgoal-decomposition-plans/agents/openai.yaml",
+      "sha256": "a0400944fed038b18afae60e67a06f68149975305ff82b16df2404a4b68a733c"
+    },
+    {
+      "source": "agents/skills/worker/query-memory/SKILL.md",
+      "target": "roles/worker/skills/query-memory/SKILL.md",
+      "sha256": "17a6355fdf1f78bb6be992592d5010b8090726e0b5e2434e190fd8321f913a20"
+    },
+    {
+      "source": "agents/skills/worker/query-memory/agents/openai.yaml",
+      "target": "roles/worker/skills/query-memory/agents/openai.yaml",
+      "sha256": "9e76ff533ab11f1cce0cf725879d4b33ddbf67cc739ced63c3e44431e8e86a92"
+    },
+    {
+      "source": "agents/skills/worker/search-math-results/SKILL.md",
+      "target": "roles/worker/skills/search-math-results/SKILL.md",
+      "sha256": "730b19c6b119afab321df3f8bc054cd6fa74e5d275a4bd93a4a2ed27b130cf68"
+    },
+    {
+      "source": "agents/skills/worker/search-math-results/agents/openai.yaml",
+      "target": "roles/worker/skills/search-math-results/agents/openai.yaml",
+      "sha256": "0b6da7739d16d4c53fb69040e7fa509aeac54e760d50cf8ab57a773e0ddf23ae"
+    },
+    {
+      "source": "agents/skills/worker/verify-proof/SKILL.md",
+      "target": "roles/worker/skills/verify-proof/SKILL.md",
+      "sha256": "9ce9ebc7983e5481e5c34f0833300404e4ed84d43ed4770ba74508993412011c"
+    },
+    {
+      "source": "agents/skills/worker/verify-proof/agents/openai.yaml",
+      "target": "roles/worker/skills/verify-proof/agents/openai.yaml",
+      "sha256": "808261f67de8697c1abc91a0f5704164d81a69973fd2d364090fa0733e4f049a"
+    },
+    {
+      "source": "agents/skills/verify/check-referenced-statements/SKILL.md",
+      "target": "roles/verifier/skills/check-referenced-statements/SKILL.md",
+      "sha256": "8ad6aaeedc4c8af604d54bf2dc4cd0188b42b3284fa8ec14d030f602709e4d0c"
+    },
+    {
+      "source": "agents/skills/verify/check-referenced-statements/agents/openai.yaml",
+      "target": "roles/verifier/skills/check-referenced-statements/agents/openai.yaml",
+      "sha256": "edb05e1ae1249572f4af17d7cc0989eb3a2cb150fde1edaff2e6477514b47f04"
+    },
+    {
+      "source": "agents/skills/verify/synthesize-verification-report/SKILL.md",
+      "target": "roles/verifier/skills/synthesize-verification-report/SKILL.md",
+      "sha256": "d917e6fa14b393cac008b99295de1f4bec273efd64dcf10ad0e1b4537c67b22c"
+    },
+    {
+      "source": "agents/skills/verify/synthesize-verification-report/agents/openai.yaml",
+      "target": "roles/verifier/skills/synthesize-verification-report/agents/openai.yaml",
+      "sha256": "59809ad917671724fe8fb1237129826b6e96565b3125ca207fbdbde86ef74deb"
+    },
+    {
+      "source": "agents/skills/verify/verify-sequential-statements/SKILL.md",
+      "target": "roles/verifier/skills/verify-sequential-statements/SKILL.md",
+      "sha256": "f9db950ccac92a6c131db011184044f46e814df24f8fb179297046c15a80f31e"
+    },
+    {
+      "source": "agents/skills/verify/verify-sequential-statements/agents/openai.yaml",
+      "target": "roles/verifier/skills/verify-sequential-statements/agents/openai.yaml",
+      "sha256": "45209a0bc0fddf9d4d9f429c1faa4c5497a711b7a868dd150f4b5ae97da166af"
+    }
+  ],
+  "roles": {
+    "main": {
+      "contract": "references/danus/AGENTS.md",
+      "skills": [
+        {
+          "name": "elaboration",
+          "path": "roles/main/skills/elaboration"
+        }
+      ]
+    },
+    "worker": {
+      "contract": "references/danus/agents/contracts/worker.md",
+      "skills": [
+        {
+          "name": "construct-counterexamples",
+          "path": "roles/worker/skills/construct-counterexamples"
+        },
+        {
+          "name": "construct-toy-examples",
+          "path": "roles/worker/skills/construct-toy-examples"
+        },
+        {
+          "name": "direct-proving",
+          "path": "roles/worker/skills/direct-proving"
+        },
+        {
+          "name": "identify-key-failures",
+          "path": "roles/worker/skills/identify-key-failures"
+        },
+        {
+          "name": "obtain-immediate-conclusions",
+          "path": "roles/worker/skills/obtain-immediate-conclusions"
+        },
+        {
+          "name": "propose-subgoal-decomposition-plans",
+          "path": "roles/worker/skills/propose-subgoal-decomposition-plans"
+        },
+        {
+          "name": "query-memory",
+          "path": "roles/worker/skills/query-memory"
+        },
+        {
+          "name": "search-math-results",
+          "path": "roles/worker/skills/search-math-results"
+        },
+        {
+          "name": "verify-proof",
+          "path": "roles/worker/skills/verify-proof"
+        }
+      ]
+    },
+    "verifier": {
+      "contract": "references/danus/agents/contracts/verifier.md",
+      "skills": [
+        {
+          "name": "check-referenced-statements",
+          "path": "roles/verifier/skills/check-referenced-statements"
+        },
+        {
+          "name": "synthesize-verification-report",
+          "path": "roles/verifier/skills/synthesize-verification-report"
+        },
+        {
+          "name": "verify-sequential-statements",
+          "path": "roles/verifier/skills/verify-sequential-statements"
+        }
+      ]
+    }
+  },
+  "workspaces": {
+    "main": [
+      {
+        "from": "references/danus/AGENTS.md",
+        "to": "AGENTS.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/human-summary/SKILL.md",
+        "to": "references/danus/.agents/skills/human-summary/SKILL.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/initialize/SKILL.md",
+        "to": "references/danus/.agents/skills/initialize/SKILL.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/write-paper/README.md",
+        "to": "references/danus/.agents/skills/write-paper/README.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/write-paper/SKILL.md",
+        "to": "references/danus/.agents/skills/write-paper/SKILL.md"
+      },
+      {
+        "from": "references/danus/ARCHITECTURE.md",
+        "to": "ARCHITECTURE.md"
+      },
+      {
+        "from": "references/danus/LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "references/danus/agents/contracts/README.md",
+        "to": "agents/contracts/README.md"
+      },
+      {
+        "from": "references/danus/agents/contracts/main_agent.md",
+        "to": "agents/contracts/main_agent.md"
+      },
+      {
+        "from": "references/danus/agents/contracts/verifier.md",
+        "to": "agents/contracts/verifier.md"
+      },
+      {
+        "from": "references/danus/agents/contracts/worker.md",
+        "to": "agents/contracts/worker.md"
+      },
+      {
+        "from": "references/danus/agents/skills/human-summary/REPORT_WRITER_PROMPT.md",
+        "to": "agents/skills/human-summary/REPORT_WRITER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/check-referenced-statements/SKILL.md",
+        "to": "agents/skills/verify/check-referenced-statements/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/check-referenced-statements/agents/openai.yaml",
+        "to": "agents/skills/verify/check-referenced-statements/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/synthesize-verification-report/SKILL.md",
+        "to": "agents/skills/verify/synthesize-verification-report/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/synthesize-verification-report/agents/openai.yaml",
+        "to": "agents/skills/verify/synthesize-verification-report/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/verify-sequential-statements/SKILL.md",
+        "to": "agents/skills/verify/verify-sequential-statements/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/verify-sequential-statements/agents/openai.yaml",
+        "to": "agents/skills/verify/verify-sequential-statements/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-counterexamples/SKILL.md",
+        "to": "agents/skills/worker/construct-counterexamples/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-counterexamples/agents/openai.yaml",
+        "to": "agents/skills/worker/construct-counterexamples/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-toy-examples/SKILL.md",
+        "to": "agents/skills/worker/construct-toy-examples/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-toy-examples/agents/openai.yaml",
+        "to": "agents/skills/worker/construct-toy-examples/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/direct-proving/SKILL.md",
+        "to": "agents/skills/worker/direct-proving/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/direct-proving/agents/openai.yaml",
+        "to": "agents/skills/worker/direct-proving/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/identify-key-failures/SKILL.md",
+        "to": "agents/skills/worker/identify-key-failures/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/identify-key-failures/agents/openai.yaml",
+        "to": "agents/skills/worker/identify-key-failures/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/obtain-immediate-conclusions/SKILL.md",
+        "to": "agents/skills/worker/obtain-immediate-conclusions/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/obtain-immediate-conclusions/agents/openai.yaml",
+        "to": "agents/skills/worker/obtain-immediate-conclusions/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/propose-subgoal-decomposition-plans/SKILL.md",
+        "to": "agents/skills/worker/propose-subgoal-decomposition-plans/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/propose-subgoal-decomposition-plans/agents/openai.yaml",
+        "to": "agents/skills/worker/propose-subgoal-decomposition-plans/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/query-memory/SKILL.md",
+        "to": "agents/skills/worker/query-memory/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/query-memory/agents/openai.yaml",
+        "to": "agents/skills/worker/query-memory/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/search-math-results/SKILL.md",
+        "to": "agents/skills/worker/search-math-results/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/search-math-results/agents/openai.yaml",
+        "to": "agents/skills/worker/search-math-results/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/verify-proof/SKILL.md",
+        "to": "agents/skills/worker/verify-proof/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/verify-proof/agents/openai.yaml",
+        "to": "agents/skills/worker/verify-proof/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/README.md",
+        "to": "agents/skills/write-paper/README.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/AGENTS.md",
+        "to": "agents/skills/write-paper/roles/AGENTS.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_MATH_VERIFIER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_MATH_VERIFIER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_PLANNER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_PLANNER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_REVISER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_REVISER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_SECTION_WRITER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_SECTION_WRITER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_WRITER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_WRITER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/REFERENCE_AUDITOR_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/REFERENCE_AUDITOR_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/REFERENCE_VERIFIER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/REFERENCE_VERIFIER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/STYLE_DISTILLER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/STYLE_DISTILLER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/style/PAPER_STRUCTURE.md",
+        "to": "agents/skills/write-paper/style/PAPER_STRUCTURE.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/style/README.md",
+        "to": "agents/skills/write-paper/style/README.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/style/STYLE_GUIDE.md",
+        "to": "agents/skills/write-paper/style/STYLE_GUIDE.md"
+      },
+      {
+        "from": "references/danus/danus/core/DATA_MODEL.md",
+        "to": "danus/core/DATA_MODEL.md"
+      },
+      {
+        "from": "references/danus/danus/core/INTERFACES.md",
+        "to": "danus/core/INTERFACES.md"
+      },
+      {
+        "from": "references/danus/danus/core/README.md",
+        "to": "danus/core/README.md"
+      },
+      {
+        "from": "references/danus/danus/core/glossary_global.json",
+        "to": "danus/core/glossary_global.json"
+      },
+      {
+        "from": "roles/main/skills/elaboration/SKILL.md",
+        "to": ".agents/skills/elaboration/SKILL.md"
+      }
+    ],
+    "worker": [
+      {
+        "from": "references/danus/agents/contracts/worker.md",
+        "to": "AGENTS.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/human-summary/SKILL.md",
+        "to": "references/danus/.agents/skills/human-summary/SKILL.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/initialize/SKILL.md",
+        "to": "references/danus/.agents/skills/initialize/SKILL.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/write-paper/README.md",
+        "to": "references/danus/.agents/skills/write-paper/README.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/write-paper/SKILL.md",
+        "to": "references/danus/.agents/skills/write-paper/SKILL.md"
+      },
+      {
+        "from": "references/danus/ARCHITECTURE.md",
+        "to": "ARCHITECTURE.md"
+      },
+      {
+        "from": "references/danus/LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "references/danus/agents/contracts/README.md",
+        "to": "agents/contracts/README.md"
+      },
+      {
+        "from": "references/danus/agents/contracts/main_agent.md",
+        "to": "agents/contracts/main_agent.md"
+      },
+      {
+        "from": "references/danus/agents/contracts/verifier.md",
+        "to": "agents/contracts/verifier.md"
+      },
+      {
+        "from": "references/danus/agents/contracts/worker.md",
+        "to": "agents/contracts/worker.md"
+      },
+      {
+        "from": "references/danus/agents/skills/human-summary/REPORT_WRITER_PROMPT.md",
+        "to": "agents/skills/human-summary/REPORT_WRITER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/check-referenced-statements/SKILL.md",
+        "to": "agents/skills/verify/check-referenced-statements/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/check-referenced-statements/agents/openai.yaml",
+        "to": "agents/skills/verify/check-referenced-statements/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/synthesize-verification-report/SKILL.md",
+        "to": "agents/skills/verify/synthesize-verification-report/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/synthesize-verification-report/agents/openai.yaml",
+        "to": "agents/skills/verify/synthesize-verification-report/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/verify-sequential-statements/SKILL.md",
+        "to": "agents/skills/verify/verify-sequential-statements/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/verify-sequential-statements/agents/openai.yaml",
+        "to": "agents/skills/verify/verify-sequential-statements/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-counterexamples/SKILL.md",
+        "to": "agents/skills/worker/construct-counterexamples/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-counterexamples/agents/openai.yaml",
+        "to": "agents/skills/worker/construct-counterexamples/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-toy-examples/SKILL.md",
+        "to": "agents/skills/worker/construct-toy-examples/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-toy-examples/agents/openai.yaml",
+        "to": "agents/skills/worker/construct-toy-examples/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/direct-proving/SKILL.md",
+        "to": "agents/skills/worker/direct-proving/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/direct-proving/agents/openai.yaml",
+        "to": "agents/skills/worker/direct-proving/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/identify-key-failures/SKILL.md",
+        "to": "agents/skills/worker/identify-key-failures/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/identify-key-failures/agents/openai.yaml",
+        "to": "agents/skills/worker/identify-key-failures/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/obtain-immediate-conclusions/SKILL.md",
+        "to": "agents/skills/worker/obtain-immediate-conclusions/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/obtain-immediate-conclusions/agents/openai.yaml",
+        "to": "agents/skills/worker/obtain-immediate-conclusions/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/propose-subgoal-decomposition-plans/SKILL.md",
+        "to": "agents/skills/worker/propose-subgoal-decomposition-plans/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/propose-subgoal-decomposition-plans/agents/openai.yaml",
+        "to": "agents/skills/worker/propose-subgoal-decomposition-plans/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/query-memory/SKILL.md",
+        "to": "agents/skills/worker/query-memory/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/query-memory/agents/openai.yaml",
+        "to": "agents/skills/worker/query-memory/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/search-math-results/SKILL.md",
+        "to": "agents/skills/worker/search-math-results/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/search-math-results/agents/openai.yaml",
+        "to": "agents/skills/worker/search-math-results/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/verify-proof/SKILL.md",
+        "to": "agents/skills/worker/verify-proof/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/verify-proof/agents/openai.yaml",
+        "to": "agents/skills/worker/verify-proof/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/README.md",
+        "to": "agents/skills/write-paper/README.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/AGENTS.md",
+        "to": "agents/skills/write-paper/roles/AGENTS.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_MATH_VERIFIER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_MATH_VERIFIER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_PLANNER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_PLANNER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_REVISER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_REVISER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_SECTION_WRITER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_SECTION_WRITER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_WRITER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_WRITER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/REFERENCE_AUDITOR_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/REFERENCE_AUDITOR_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/REFERENCE_VERIFIER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/REFERENCE_VERIFIER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/STYLE_DISTILLER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/STYLE_DISTILLER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/style/PAPER_STRUCTURE.md",
+        "to": "agents/skills/write-paper/style/PAPER_STRUCTURE.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/style/README.md",
+        "to": "agents/skills/write-paper/style/README.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/style/STYLE_GUIDE.md",
+        "to": "agents/skills/write-paper/style/STYLE_GUIDE.md"
+      },
+      {
+        "from": "references/danus/danus/core/DATA_MODEL.md",
+        "to": "danus/core/DATA_MODEL.md"
+      },
+      {
+        "from": "references/danus/danus/core/INTERFACES.md",
+        "to": "danus/core/INTERFACES.md"
+      },
+      {
+        "from": "references/danus/danus/core/README.md",
+        "to": "danus/core/README.md"
+      },
+      {
+        "from": "references/danus/danus/core/glossary_global.json",
+        "to": "danus/core/glossary_global.json"
+      },
+      {
+        "from": "roles/worker/skills/construct-counterexamples/SKILL.md",
+        "to": ".agents/skills/construct-counterexamples/SKILL.md"
+      },
+      {
+        "from": "roles/worker/skills/construct-counterexamples/agents/openai.yaml",
+        "to": ".agents/skills/construct-counterexamples/agents/openai.yaml"
+      },
+      {
+        "from": "roles/worker/skills/construct-toy-examples/SKILL.md",
+        "to": ".agents/skills/construct-toy-examples/SKILL.md"
+      },
+      {
+        "from": "roles/worker/skills/construct-toy-examples/agents/openai.yaml",
+        "to": ".agents/skills/construct-toy-examples/agents/openai.yaml"
+      },
+      {
+        "from": "roles/worker/skills/direct-proving/SKILL.md",
+        "to": ".agents/skills/direct-proving/SKILL.md"
+      },
+      {
+        "from": "roles/worker/skills/direct-proving/agents/openai.yaml",
+        "to": ".agents/skills/direct-proving/agents/openai.yaml"
+      },
+      {
+        "from": "roles/worker/skills/identify-key-failures/SKILL.md",
+        "to": ".agents/skills/identify-key-failures/SKILL.md"
+      },
+      {
+        "from": "roles/worker/skills/identify-key-failures/agents/openai.yaml",
+        "to": ".agents/skills/identify-key-failures/agents/openai.yaml"
+      },
+      {
+        "from": "roles/worker/skills/obtain-immediate-conclusions/SKILL.md",
+        "to": ".agents/skills/obtain-immediate-conclusions/SKILL.md"
+      },
+      {
+        "from": "roles/worker/skills/obtain-immediate-conclusions/agents/openai.yaml",
+        "to": ".agents/skills/obtain-immediate-conclusions/agents/openai.yaml"
+      },
+      {
+        "from": "roles/worker/skills/propose-subgoal-decomposition-plans/SKILL.md",
+        "to": ".agents/skills/propose-subgoal-decomposition-plans/SKILL.md"
+      },
+      {
+        "from": "roles/worker/skills/propose-subgoal-decomposition-plans/agents/openai.yaml",
+        "to": ".agents/skills/propose-subgoal-decomposition-plans/agents/openai.yaml"
+      },
+      {
+        "from": "roles/worker/skills/query-memory/SKILL.md",
+        "to": ".agents/skills/query-memory/SKILL.md"
+      },
+      {
+        "from": "roles/worker/skills/query-memory/agents/openai.yaml",
+        "to": ".agents/skills/query-memory/agents/openai.yaml"
+      },
+      {
+        "from": "roles/worker/skills/search-math-results/SKILL.md",
+        "to": ".agents/skills/search-math-results/SKILL.md"
+      },
+      {
+        "from": "roles/worker/skills/search-math-results/agents/openai.yaml",
+        "to": ".agents/skills/search-math-results/agents/openai.yaml"
+      },
+      {
+        "from": "roles/worker/skills/verify-proof/SKILL.md",
+        "to": ".agents/skills/verify-proof/SKILL.md"
+      },
+      {
+        "from": "roles/worker/skills/verify-proof/agents/openai.yaml",
+        "to": ".agents/skills/verify-proof/agents/openai.yaml"
+      }
+    ],
+    "verifier": [
+      {
+        "from": "references/danus/agents/contracts/verifier.md",
+        "to": "AGENTS.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/human-summary/SKILL.md",
+        "to": "references/danus/.agents/skills/human-summary/SKILL.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/initialize/SKILL.md",
+        "to": "references/danus/.agents/skills/initialize/SKILL.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/write-paper/README.md",
+        "to": "references/danus/.agents/skills/write-paper/README.md"
+      },
+      {
+        "from": "references/danus/.agents/skills/write-paper/SKILL.md",
+        "to": "references/danus/.agents/skills/write-paper/SKILL.md"
+      },
+      {
+        "from": "references/danus/ARCHITECTURE.md",
+        "to": "ARCHITECTURE.md"
+      },
+      {
+        "from": "references/danus/LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "references/danus/agents/contracts/README.md",
+        "to": "agents/contracts/README.md"
+      },
+      {
+        "from": "references/danus/agents/contracts/main_agent.md",
+        "to": "agents/contracts/main_agent.md"
+      },
+      {
+        "from": "references/danus/agents/contracts/verifier.md",
+        "to": "agents/contracts/verifier.md"
+      },
+      {
+        "from": "references/danus/agents/contracts/worker.md",
+        "to": "agents/contracts/worker.md"
+      },
+      {
+        "from": "references/danus/agents/skills/human-summary/REPORT_WRITER_PROMPT.md",
+        "to": "agents/skills/human-summary/REPORT_WRITER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/check-referenced-statements/SKILL.md",
+        "to": "agents/skills/verify/check-referenced-statements/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/check-referenced-statements/agents/openai.yaml",
+        "to": "agents/skills/verify/check-referenced-statements/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/synthesize-verification-report/SKILL.md",
+        "to": "agents/skills/verify/synthesize-verification-report/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/synthesize-verification-report/agents/openai.yaml",
+        "to": "agents/skills/verify/synthesize-verification-report/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/verify-sequential-statements/SKILL.md",
+        "to": "agents/skills/verify/verify-sequential-statements/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/verify/verify-sequential-statements/agents/openai.yaml",
+        "to": "agents/skills/verify/verify-sequential-statements/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-counterexamples/SKILL.md",
+        "to": "agents/skills/worker/construct-counterexamples/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-counterexamples/agents/openai.yaml",
+        "to": "agents/skills/worker/construct-counterexamples/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-toy-examples/SKILL.md",
+        "to": "agents/skills/worker/construct-toy-examples/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/construct-toy-examples/agents/openai.yaml",
+        "to": "agents/skills/worker/construct-toy-examples/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/direct-proving/SKILL.md",
+        "to": "agents/skills/worker/direct-proving/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/direct-proving/agents/openai.yaml",
+        "to": "agents/skills/worker/direct-proving/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/identify-key-failures/SKILL.md",
+        "to": "agents/skills/worker/identify-key-failures/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/identify-key-failures/agents/openai.yaml",
+        "to": "agents/skills/worker/identify-key-failures/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/obtain-immediate-conclusions/SKILL.md",
+        "to": "agents/skills/worker/obtain-immediate-conclusions/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/obtain-immediate-conclusions/agents/openai.yaml",
+        "to": "agents/skills/worker/obtain-immediate-conclusions/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/propose-subgoal-decomposition-plans/SKILL.md",
+        "to": "agents/skills/worker/propose-subgoal-decomposition-plans/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/propose-subgoal-decomposition-plans/agents/openai.yaml",
+        "to": "agents/skills/worker/propose-subgoal-decomposition-plans/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/query-memory/SKILL.md",
+        "to": "agents/skills/worker/query-memory/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/query-memory/agents/openai.yaml",
+        "to": "agents/skills/worker/query-memory/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/search-math-results/SKILL.md",
+        "to": "agents/skills/worker/search-math-results/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/search-math-results/agents/openai.yaml",
+        "to": "agents/skills/worker/search-math-results/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/verify-proof/SKILL.md",
+        "to": "agents/skills/worker/verify-proof/SKILL.md"
+      },
+      {
+        "from": "references/danus/agents/skills/worker/verify-proof/agents/openai.yaml",
+        "to": "agents/skills/worker/verify-proof/agents/openai.yaml"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/README.md",
+        "to": "agents/skills/write-paper/README.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/AGENTS.md",
+        "to": "agents/skills/write-paper/roles/AGENTS.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_MATH_VERIFIER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_MATH_VERIFIER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_PLANNER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_PLANNER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_REVISER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_REVISER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_SECTION_WRITER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_SECTION_WRITER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/PAPER_WRITER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/PAPER_WRITER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/REFERENCE_AUDITOR_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/REFERENCE_AUDITOR_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/REFERENCE_VERIFIER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/REFERENCE_VERIFIER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/roles/STYLE_DISTILLER_PROMPT.md",
+        "to": "agents/skills/write-paper/roles/STYLE_DISTILLER_PROMPT.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/style/PAPER_STRUCTURE.md",
+        "to": "agents/skills/write-paper/style/PAPER_STRUCTURE.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/style/README.md",
+        "to": "agents/skills/write-paper/style/README.md"
+      },
+      {
+        "from": "references/danus/agents/skills/write-paper/style/STYLE_GUIDE.md",
+        "to": "agents/skills/write-paper/style/STYLE_GUIDE.md"
+      },
+      {
+        "from": "references/danus/danus/core/DATA_MODEL.md",
+        "to": "danus/core/DATA_MODEL.md"
+      },
+      {
+        "from": "references/danus/danus/core/INTERFACES.md",
+        "to": "danus/core/INTERFACES.md"
+      },
+      {
+        "from": "references/danus/danus/core/README.md",
+        "to": "danus/core/README.md"
+      },
+      {
+        "from": "references/danus/danus/core/glossary_global.json",
+        "to": "danus/core/glossary_global.json"
+      },
+      {
+        "from": "roles/verifier/skills/check-referenced-statements/SKILL.md",
+        "to": ".agents/skills/check-referenced-statements/SKILL.md"
+      },
+      {
+        "from": "roles/verifier/skills/check-referenced-statements/agents/openai.yaml",
+        "to": ".agents/skills/check-referenced-statements/agents/openai.yaml"
+      },
+      {
+        "from": "roles/verifier/skills/synthesize-verification-report/SKILL.md",
+        "to": ".agents/skills/synthesize-verification-report/SKILL.md"
+      },
+      {
+        "from": "roles/verifier/skills/synthesize-verification-report/agents/openai.yaml",
+        "to": ".agents/skills/synthesize-verification-report/agents/openai.yaml"
+      },
+      {
+        "from": "roles/verifier/skills/verify-sequential-statements/SKILL.md",
+        "to": ".agents/skills/verify-sequential-statements/SKILL.md"
+      },
+      {
+        "from": "roles/verifier/skills/verify-sequential-statements/agents/openai.yaml",
+        "to": ".agents/skills/verify-sequential-statements/agents/openai.yaml"
+      }
+    ]
+  },
+  "unavailableCapabilities": [
+    "initialize: archived reference only; no deployment or account provisioning",
+    "human-summary: archived reference only; no report/PDF renderer",
+    "write-paper: archived reference only; no paper driver, TeX, publishing or user anchors",
+    "Danus CLI, MCP server, research scheduling and verifier/model execution are not connected by this static snapshot"
+  ],
+  "snapshotPolicy": "Original reference snapshots, not user-customization storage. Dynamic OPERATOR/PROBLEM/TASK and shared stores are never copied by these mappings."
+}

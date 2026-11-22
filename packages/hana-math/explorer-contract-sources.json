@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "adapterIdentitySha256": "d9e90365ccddf5e59fde2099f17c47f63bc74c3a53548c1552a19dc64d012624",
+  "adapterContractSha256": "2735f99e733a5cb182b46d0b0150102b9dd1d06955006f4b9537435580d136ee",
+  "scope": "Derived explorer adapter only; does not redefine original prompt-sources or original13 Skills.",
+  "upstreamStandaloneExplorer": false,
+  "sourceRepository": "Danus",
+  "sourceGitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c",
+  "sources": [
+    {
+      "path": "AGENTS.md",
+      "sha256": "2a6ba2b3fd4e267e587e90bcc63c45d0f8c73bf16e403b3ba0e18a56673ae975"
+    },
+    {
+      "path": "agents/contracts/main_agent.md",
+      "sha256": "0d7e651aa9477f1ba9714eed712e553f75527ce8baa4b08fa0ef931244120477"
+    }
+  ],
+  "quotes": [
+    {
+      "sourcePath": "AGENTS.md",
+      "start": "## Two exploration lanes",
+      "end": "## Continuous parallel mathematical reasoning",
+      "text": "## Two exploration lanes\n\nCodex subagents and Danus workers serve different purposes:\n\n1. **Subagents are speculative.** They may reason deeply and freely without the\n   fact format or verifier gate. Their output is advice to you, not a fact and not\n   a valid predecessor. Never present it as established or insert it directly\n   into the fact graph.\n2. **Danus workers are evidentiary.** They prove candidate statements and submit\n   them through `fact_submit`. Only accepted submissions become reusable facts.\n\nPromising subagent ideas must be converted into precise worker assignments and\npass the verifier before downstream proofs may rely on them.\n\n"
+    },
+    {
+      "sourcePath": "AGENTS.md",
+      "start": "- Do not read or modify worker-local memory.",
+      "end": "- Stop the swarm when every target",
+      "text": "- Do not read or modify worker-local memory.\n- **All mathematical work is text-only; executable computation is forbidden.**\n  Neither you nor any subagent you create may run Python or other code for\n  mathematical experimentation, even for a supposedly small example. Do not run\n  brute-force searches, numerical sweeps, symbolic algebra, SAT/SMT solvers,\n  proof assistants, compiled programs, parallel compute, or any other\n  CPU-intensive job. There is no \"tiny check\" exception. Lightweight file/text\n  inspection, literature retrieval, and Danus process orchestration are allowed;\n  the mathematics itself must be symbolic reasoning written in text. Repeat this\n  boundary explicitly in every subagent assignment and redirect computational\n  questions toward structural arguments.\n"
+    },
+    {
+      "sourcePath": "agents/contracts/main_agent.md",
+      "start": "Subagents are an unverified scratch layer.",
+      "end": "They are not merely preliminary scouts",
+      "text": "Subagents are an unverified scratch layer. Their reports may suggest a lemma,\ncounterexample, reference, or strategy, but are never facts and cannot be cited as\npredecessors. The main agent must label them as hypotheses and send any result\nneeded by the proof to a Danus worker.\n\n"
+    },
+    {
+      "sourcePath": "agents/contracts/main_agent.md",
+      "start": "- **Text-only mathematics is absolute.**",
+      "end": "- Never push, publish, finalize",
+      "text": "- **Text-only mathematics is absolute.** Neither the main agent nor any subagent\n  it creates may execute Python, numerical or symbolic programs, brute-force\n  searches, solvers, proof assistants, compiled code, or parallel computation for\n  mathematical work—not even a tiny finite check. Only lightweight text/file\n  inspection, literature retrieval, and Danus orchestration are allowed. State\n  this boundary in every subagent assignment; replace computational experiments\n  with written structural reasoning.\n"
+    }
+  ]
+}

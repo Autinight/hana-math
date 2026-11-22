@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "upstream": "Danus",
+  "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c",
+  "sourceRepository": "danus",
+  "url": "https://github.com/frenzymath/Danus",
+  "author": "Bin Wu",
+  "license": "Apache-2.0",
+  "notice": null,
+  "noticeExplanation": "No root NOTICE file exists in the upstream source snapshot.",
+  "scope": "Byte-identical core, package initializer, role table and original core tests; not the complete Danus runtime.",
+  "files": [
+    {"source": "danus/__init__.py", "target": "src/danus/__init__.py", "sha256": "a60fdbe71b9bb671bedb2716a9284d0b3ff4c9f4c870976bbdfb72f5bb91f3cb", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/__init__.py", "target": "src/danus/core/__init__.py", "sha256": "b4d2134ada3c011cfc6ce9320904ff4f9ddf1e12139dd7c999af175647cc6124", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/_util.py", "target": "src/danus/core/_util.py", "sha256": "4ee3d35650241ad049da016fe09b5b3a6a10bfa261cf6a051fcdb432f3b11101", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/bm25.py", "target": "src/danus/core/bm25.py", "sha256": "cd3e40cb35f66cd765d83ee10b462c19e2fee153484fa1e09ca5c74165be668a", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/factgraph.py", "target": "src/danus/core/factgraph.py", "sha256": "4d2e8fbb132f9be20e02e502bd025b84c0cfdb4eb39121ff3231ffcdb75822fc", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/global_memory.py", "target": "src/danus/core/global_memory.py", "sha256": "91a31c696d56d9fb567cd6f5e49192129f5e4268f629c4f5612baffc0f0516e5", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/glossary.py", "target": "src/danus/core/glossary.py", "sha256": "fc10aec09911ae2e98a6d790e3526d4c6bdc36cc02994d6970199c4bb3204894", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/local_memory.py", "target": "src/danus/core/local_memory.py", "sha256": "41903aa39f6fe4201a97eee68805bea876fb3e2d8fd2393d6cfd6d4b88f1f497", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/schema.py", "target": "src/danus/core/schema.py", "sha256": "1426a8af1887071539c9175fef8c4c738d6bdebcf2d070d83133b9f0570e3f47", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/glossary_global.json", "target": "src/danus/core/glossary_global.json", "sha256": "c2eda900107ccaa7b80eb14cb88c13034799984d270783bc76b2837a9cd41ed2", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/README.md", "target": "src/danus/core/README.md", "sha256": "1e35d24cc7e5d6679e890c7231928d82a0c0e6cb16412a9fb7621053b9702486", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/DATA_MODEL.md", "target": "src/danus/core/DATA_MODEL.md", "sha256": "a0496cad1db9380510ac38464b5d1b726b24ca5fdaec1b076e18748183c8f75f", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/INTERFACES.md", "target": "src/danus/core/INTERFACES.md", "sha256": "92ab45f0a11d1053afdb40b0a4fb6daaa0e5b6eba5491dcf55c04f4c43cfa511", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/gateway/roles.py", "target": "src/danus/gateway/roles.py", "sha256": "304f7ab56169d5c2e2b4ebe335cf912c8e6a326a6a2ccf147af2fb0cf1129146", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/tests/__init__.py", "target": "tests/upstream/__init__.py", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "danus/core/tests/test_core.py", "target": "tests/upstream/test_core.py", "sha256": "b93bea4f7e52e83538d2ceead479ac43c507214a289a7ae6b89f90d2dbb72e6b", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false},
+    {"source": "LICENSE", "target": "LICENSE", "sha256": "d51dbb6676bff13e23abd800608ec96bd6e637fd5b5194ef9ea8d848416d8ef3", "gitHead": "839c471d0560b9b5308afc6cbb59a138819fe16c", "localModified": false}
+  ]
+}
