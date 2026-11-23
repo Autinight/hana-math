@@ -5,6 +5,9 @@ import fs from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createProjectReportService } from '../packages/hana-math/project-report-service.mjs';
 import { capturePlanMaterial } from '../packages/hana-math/paper-plan.mjs';
+import path from 'node:path';
+import { pairingFixture } from './helpers/managed-ipc-pairing-fixture.mjs';
+import { origin } from './helpers/project-service-fixture.mjs';
 const clone = v => structuredClone(v), hash = v => createHash('sha256').update(v).digest('hex');
 const fault = code => Object.assign(new Error(code), { code });
 const defer = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
@@ -69,6 +72,93 @@ async function fixture(t, { sections = 2, factCount = 1, proofBytes = 0 } = {}) 
     mutate(q, update) { const value = JSON.parse(files.get(metadataPath(q))); update(value); files.set(metadataPath(q), Buffer.from(JSON.stringify(value))); },
     event: q => { const row = [...schedules.values()].find(s => s.payload.reportId === q.reportId); return { kind: 'schedule', scheduleId: row.scheduleId, input: clone(row.payload) }; }, handle: event => handler.run(event) };
 }
+
+test('creator math review consumes the exact public stitch and frozen ledger without editing the chain', { timeout: 15000 }, async t => {
+  const preamble = '\\documentclass{article}\n\\newcommand{\\sample}{A}\n';
+  const frontmatter = '\\begin{document}\n\\title{Synthetic manuscript}\n\\author{Fixture}\n\\maketitle\n';
+  const sections = [{ title: 'Claim', label: 'sec:claim', fact_ids: [fid] }, { title: 'Closing', label: 'sec:closing', fact_ids: [] }];
+  const fragments = ['\\section{Claim}\\label{sec:claim}\nThe claim concerns \\sample.\n',
+    '\\section{Closing}\\label{sec:closing}\nThis closes the synthetic manuscript.\n'];
+  const findings = [{ location: 'Claim', issue: 'A hypothesis is missing.', class: 'must-fix' }];
+  const stages = [], prompts = [];
+  const g = await pairingFixture(t, {
+    plannerOutput: `%%%PREAMBLE%%%\n${preamble}%%%FRONTMATTER%%%\n${frontmatter}%%%SECTIONS%%%\n${JSON.stringify(sections)}\n%%%BIBLIOGRAPHY%%%\n\\begin{thebibliography}{9}\n\\end{thebibliography}\n`,
+    sectionOutput: input => (input.reportId === rootId ? fragments[0] : fragments[1]),
+    mathOutput(input) { prompts.push(input.prompt); return JSON.stringify({ findings, report: 'Synthetic review.' }); },
+    async stage(input) {
+      stages.push({ ...input, bytes: await fs.readFile(input.path) });
+      return { resource: { kind: 'session-file', sessionId: 'creator-stable', fileId: `fixture-${stages.length}` } };
+    },
+  });
+  const plan = await g.parent(), selector = { projectId: g.projectId, planReportId: plan.reportId };
+  const root = await g.f.service.paperSection(selector, origin), rootId = root.reportId;
+  await g.dispatch(rootId);
+  const final = await g.f.service.paperSection({ ...selector, previousSectionReportId: rootId }, origin);
+  await g.dispatch(final.reportId);
+  const chain = { ...selector, finalSectionReportId: final.reportId };
+  const file = (q, name) => path.join(g.reports, q.reportId, name);
+  const artifactNames = [[plan, 'metadata.json'], [plan, 'REFERENCE_LEDGER.md'], [root, 'metadata.json'], [root, 'section.tex'],
+    [root, 'REFERENCE_LEDGER.md'], [final, 'metadata.json'], [final, 'section.tex'], [final, 'REFERENCE_LEDGER.md']];
+  const readChain = () => Promise.all(artifactNames.map(([q, name]) => fs.readFile(file(q, name))));
+  const before = await readChain(), ledger = before[1], baseline = await g.counts();
+  assert.ok(baseline.runtimeStarts > 0, 'plan and section preparation exercised the fixture Core');
+  assert.deepEqual(before[4], ledger); assert.deepEqual(before[7], ledger);
+  const good = async (action, args) => {
+    const reply = await g.execute({ action, ...args });
+    assert.equal(reply.isError, false, JSON.stringify(reply.details));
+    return reply.details;
+  };
+  const stitch = await good('paper_stitch', chain);
+  assert.deepEqual(stitch.sections.map(s => s.reportId), [rootId, final.reportId]);
+  assert.equal(stages.length, 1); assert.equal(stages[0].name, 'main.tex');
+  const stitched = stages[0].bytes;
+  assert.deepEqual(stitched, Buffer.from(`${preamble}\n${frontmatter}\n${fragments.join('\n')}\n\\end{document}\n`));
+  assert.equal(stitch.sha256, hash(stitched));
+  assert.deepEqual(await g.counts(), baseline, 'stitch does not start a report, writer or Core read');
+
+  const math = await good('paper_verify_math', chain);
+  assert.equal(math.state, 'queued'); assert.equal(prompts.length, 0);
+  assert.equal(stages.length, 1);
+  await g.dispatch(math.reportId);
+  assert.equal(prompts.length, 1);
+  const envelope = JSON.parse(prompts[0].trimEnd().split('\n').at(-1));
+  assert.deepEqual(Buffer.from(envelope.mainTex), stitched);
+  assert.deepEqual(Buffer.from(envelope.ledger), ledger);
+  const record = await g.metadata(math.reportId);
+  assert.equal(record.state, 'completed');
+  assert.equal(record.taskSettlement, 'confirmed');
+  assert.equal(g.f.tasks.get(math.taskId).status, 'completed');
+  assert.deepEqual({ ...record.math }, { planReportId: plan.reportId, finalSectionReportId: final.reportId,
+    mainSha256: hash(stitched), ledgerSha256: hash(ledger), contractSha256: hash(envelope.contract),
+    verifierPromptSha256: hash(envelope.verifierPrompt), promptSha256: hash(prompts[0]) });
+  const result = await good('paper_verify_math_result', { projectId: g.projectId, reportId: math.reportId });
+  assert.equal(result.mathVerdict, 'wrong');
+  assert.deepEqual(stages.map(s => s.name), ['main.tex', 'MATH_REVIEW.json']);
+  assert.equal(stages[1].mime, 'application/json');
+  assert.equal(stages[1].path, file(math, 'MATH_REVIEW.json'));
+  assert.deepEqual(result.files, [{ role: 'review', name: 'MATH_REVIEW.json', bytes: stages[1].bytes.length,
+    sha256: hash(stages[1].bytes), resource: { kind: 'session-file', sessionId: 'creator-stable', fileId: 'fixture-2' } }]);
+  const review = JSON.parse(stages[1].bytes);
+  assert.deepEqual(review.binding, record.math);
+  assert.deepEqual(review.findings, findings); assert.equal(review.verdict, 'wrong');
+  assert.deepEqual(await readChain(), before);
+  const after = await g.counts();
+  assert.equal(after.writers, baseline.writers + 1);
+  assert.equal(after.runtimeStarts, baseline.runtimeStarts, 'math review did not reread the fact graph');
+
+  const refused = async (args, code) => {
+    const reply = await g.execute({ action: 'paper_verify_math', ...args });
+    assert.equal(reply.isError, true);
+    assert.equal(reply.details.error.code, code);
+    assert.deepEqual(await g.counts(), after, 'invalid input did not create report work');
+    assert.equal(prompts.length, 1); assert.equal(stages.length, 2);
+  };
+  await refused({ ...chain, finalSectionReportId: rootId }, 'PROJECT_PAPER_STITCH_CHAIN_INVALID');
+  const tampered = Buffer.from(before[3]); tampered[tampered.indexOf('claim concerns')] ^= 1;
+  assert.notDeepEqual(tampered, before[3]);
+  await fs.writeFile(file(root, 'section.tex'), tampered);
+  await refused(chain, 'PROJECT_REPORT_ARTIFACT_INVALID');
+});
 
 test('B2 section root, explicit successor and retry branches bind the full parent and advance flagged content', { timeout: 10000 }, async t => {
   const f = await fixture(t); f.state.text = body + '[GAP: opaque]'; const root = await f.start(); await f.dispatch(root);

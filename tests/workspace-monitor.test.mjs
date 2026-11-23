@@ -8,6 +8,7 @@ const genHeader = 'x-hana-math-monitor-generation';
 const interval = 8000;
 const active = (projectId, generation = `gen-${projectId}`) => ({ state: 'active', projectId, generation });
 const snapshot = (projectId, generation = `snapshot-${projectId}`) => ({ state: 'snapshot', projectId, generation, endedAt: 1760000000123 });
+const saved = (projectId = 'project-a', generation = 'scope-a', asOf = 1795312000123) => ({ state: 'saved', projectId, generation, asOf });
 const ok = json => ({ ok: true, status: 200, json: async () => structuredClone(json) });
 const overview = (project, facts) => ({ project, facts, facts_with_predecessors: 0,
   facts_by_author: {}, channel_counts: {}, verdicts: {} });
@@ -188,6 +189,46 @@ test('malformed snapshots never reach a business GET and a valid unnamed snapsho
   assert.equal(f.UI.badge, 'A'); assert.deepEqual(f.lastStatus(), { state: 'snapshot', text: '只读快照' });
 });
 
+test('saved uses all protected tabs; a changed reading basis invalidates the in-flight body even with the same generation', async t => {
+  const first = saved(), f = fixture(t, first), monitor = f.open(); await flush();
+  assert.deepEqual(f.lastStatus(), { state: 'saved', text: '当前已保存结果（只读）' });
+  assert.deepEqual(f.commits.at(-1).scope, first);
+  monitor.select('memory', 'verification'); await flush();
+  assert.deepEqual(paths(f.requests).slice(-4), ['/current', '/api/channels', '/api/channel/verification', '/current']);
+  assert.equal(f.UI.renderedEntries[0].claim, 'verification body');
+  monitor.select('graph'); await flush();
+  assert.deepEqual(paths(f.requests).slice(-3), ['/current', '/api/factgraph', '/current']);
+  assert.deepEqual(f.commits.map(x => x.tab), ['overview', 'memory', 'graph']);
+
+  const withheld = Promise.withResolvers(), start = f.commits.length;
+  f.setResponse(call => call.sub === '/api/factgraph' ? withheld.promise : undefined);
+  await f.c.advance(interval);
+  const later = { ...first, asOf: first.asOf + 1 };
+  f.setTarget(later); f.setResponse(undefined);
+  withheld.resolve(ok(graph('outgoing-saved'))); await flush();
+  assert.deepEqual(f.commits.slice(start).map(x => x.scope), [later]);
+  assert.notEqual(f.UI.graph.nodes[0].id, 'outgoing-saved');
+  for (const replacement of [snapshot(first.projectId, first.generation), active(first.projectId, first.generation)]) {
+    f.setTarget(replacement); await f.c.advance(interval);
+    assert.deepEqual(f.commits.at(-1).scope, replacement);
+  }
+});
+
+test('saved requires exact discovery fields and a positive representable reading basis', async t => {
+  const f = fixture(t); f.open(); await flush();
+  const valid = saved(), { asOf, ...missing } = valid;
+  for (const invalid of [missing, ...[0, -1, 1.5, '1795312000123', 8640000000000001].map(asOf => ({ ...valid, asOf })),
+    { ...valid, endedAt: asOf }, { ...valid, projectId: 'not/a/project' }, { ...valid, generation: 'a,b' }]) {
+    const start = f.requests.length;
+    f.setTarget(invalid); await f.c.advance(interval);
+    assert.deepEqual(paths(f.requests.slice(start)), ['/current']);
+    assert.deepEqual(f.lastStatus(), failure('发现 GET：HTTP 200：响应无法使用'));
+  }
+  f.setTarget(valid); await f.c.advance(interval);
+  assert.equal(f.commits.length, 1);
+  assert.deepEqual(f.lastStatus(), { state: 'saved', text: '当前已保存结果（只读）' });
+});
+
 test('active tab refreshes; unchanged graph and memory body are preserved, including an explicitly selected channel', async t => {
   const f = fixture(t, active('A')), monitor = f.open(); await flush();
   f.base.set('/api/overview', () => overview('A', 2)); await f.c.advance(interval);
@@ -297,6 +338,10 @@ test('unavailable or timed-out reads withdraw all data and retry without accepti
 const failure = tail => ({ state: 'unavailable', text: `研究状态暂不可用 · ${tail}` });
 const confidential = 'synthetic-private-body https://fixture.invalid/hidden?token=synthetic';
 const rejectResponse = status => ({ ok: false, status, json() { assert.fail('must not read HTTP error bodies'); } });
+const busyBody = { state: 'unavailable', reason: 'project_busy' };
+const conflict = json => ({ ok: false, status: 409, json });
+const busy = failure('业务读取：项目正忙，看板会自动重试');
+const genericConflict = failure('业务读取：HTTP 409（读取未获确认）');
 
 test('readiness failure, 403, identical 200-unavailable, other HTTP status and no HTTP stay distinct, then idle recovers', async t => {
   const f = fixture(t);
@@ -343,6 +388,80 @@ test('refresh 409 is a business failure; final discovery has its own stage and n
   assert.doesNotMatch(JSON.stringify(f.statuses), /secret-project|secret-generation/);
   f.setResponse(undefined); await f.c.advance(interval);
   assert.deepEqual(f.lastStatus(), { state: 'active', text: '正在跟踪研究' });
+});
+
+test('project busy withdraws the old view and recovers by discovery, business and recheck at the next 8s poll', async t => {
+  const f = fixture(t, active('A'));
+  f.open(); await flush();
+  assert.equal(f.UI.overview.facts, 1);
+  const before = f.requests.length;
+  let bodies = 0;
+  f.setResponse(call => call.sub === '/api/overview' ? conflict(async () => { bodies++; return busyBody; }) : undefined);
+  await f.c.advance(interval);
+  assert.deepEqual(f.lastStatus(), busy);
+  assert.equal(bodies, 1);
+  assert.equal(f.UI.overview, null); assert.equal(f.UI.badge, null); assert.equal(f.commits.length, 1);
+  assert.deepEqual(paths(f.requests).slice(before), ['/current', '/api/overview']);
+  f.setResponse(undefined); f.base.set('/api/overview', generation => overview(generation, 2));
+  await f.c.advance(interval - 1); assert.equal(f.requests.length, before + 2);
+  await f.c.advance(1);
+  assert.deepEqual(paths(f.requests).slice(before), ['/current', '/api/overview', '/current', '/api/overview', '/current']);
+  assert.equal(f.UI.overview.facts, 2); assert.equal(f.commits.length, 2);
+  assert.deepEqual(f.lastStatus(), { state: 'active', text: '正在跟踪研究' });
+});
+
+test('only an exact 409 business error packet can report busy; the first failure survives until recovery', async t => {
+  const f = fixture(t, active('A')); f.open(); await flush();
+  for (const json of [async () => ({ ...busyBody, message: confidential }), async () => ({ ...busyBody, reason: confidential }),
+    async () => ({ state: 'unavailable' }), async () => [busyBody], async () => { throw Error(confidential); }]) {
+    f.setResponse(call => call.sub === '/api/overview' ? conflict(json) : undefined);
+    await f.c.advance(interval); assert.deepEqual(f.lastStatus(), genericConflict);
+    f.setResponse(undefined); await f.c.advance(interval); assert.equal(f.lastStatus().state, 'active');
+  }
+  f.setResponse(call => call.sub === '/api/overview' ? rejectResponse(403) : undefined);
+  await f.c.advance(interval);
+  const first = failure('业务读取：HTTP 403（请求被拒绝）');
+  assert.deepEqual(f.lastStatus(), first);
+  f.setResponse(call => call.sub === '/api/overview' ? conflict(async () => busyBody) : undefined);
+  await f.c.advance(interval); assert.deepEqual(f.lastStatus(), first);
+  f.setResponse(undefined); await f.c.advance(interval); assert.equal(f.lastStatus().state, 'active');
+
+  let bodies = 0, discovery = 0;
+  for (const stage of ['发现 GET', '最终代次复核', '业务读取']) {
+    f.setResponse(call => {
+      const isCurrent = call.sub === '/current';
+      if (stage === '发现 GET' && !isCurrent || stage === '最终代次复核' && (!isCurrent || ++discovery !== 2)
+        || stage === '业务读取' && isCurrent) return;
+      return { ok: false, status: stage === '业务读取' ? 503 : 409, json: async () => { bodies++; return busyBody; } };
+    });
+    await f.c.advance(interval);
+    assert.deepEqual(f.lastStatus(), failure(`${stage}：${stage === '业务读取' ? 'HTTP 503' : 'HTTP 409（读取未获确认）'}`));
+    f.setResponse(undefined); await f.c.advance(interval);
+  }
+  assert.equal(bodies, 0);
+  assert.doesNotMatch(JSON.stringify(f.statuses), /synthetic-private|fixture\.invalid|token/);
+});
+
+test('late busy JSON cannot replace a timed-out or suspended business read', async t => {
+  for (const cancel of ['deadline', 'pagehide']) {
+    const f = fixture(t, active('A'));
+    const pending = Promise.withResolvers(); let bodyReads = 0;
+    f.setResponse(call => call.sub === '/api/overview' ? conflict(() => { bodyReads++; return pending.promise; }) : undefined);
+    f.open(); await flush(); assert.equal(bodyReads, 1);
+    assert.equal(f.lastStatus().state, 'pending');
+    if (cancel === 'deadline') {
+      await f.c.advance(12000);
+      assert.deepEqual(f.lastStatus(), failure('业务读取：超过时限'));
+    } else f.page('pagehide');
+    assert.equal(f.requests[1].signal.aborted, true);
+    f.setResponse(undefined);
+    if (cancel === 'deadline') await f.c.advance(interval);
+    else { f.page('pageshow'); await flush(); }
+    const count = f.requests.length;
+    pending.resolve(busyBody); await flush();
+    assert.equal(f.lastStatus().state, 'active'); assert.equal(f.commits.length, 1);
+    assert.ok(!f.statuses.some(s => s.text === busy.text)); assert.equal(f.requests.length, count);
+  }
 });
 
 test('A business result followed by valid B is cleared; the immediate B discovery 403 is the first fault', async t => {

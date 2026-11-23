@@ -141,9 +141,17 @@ export function createMathBootstrap(sdk) {
   const routes = { ...sdk.routes, async register(registrar) {
     return retain(await sdk.routes.register(app => registrar(Object.fromEntries(['get', 'post'].map(method => [method,
       (path, handler) => app[method](path, async c => {
-        if (phase === 'ready') {
-          const result = await handler(c);
-          if (phase === 'ready') return result;
+        // The panel roster uses only Host list/get operations. Do not put
+        // identity display behind research recovery, or widen any other route.
+        const earlyPanel = method === 'get' && path === '/panel' && c.req?.raw?.method === 'GET';
+        const available = () => phase === 'ready' || (earlyPanel && !closed());
+        if (available()) {
+          try {
+            const result = await handler(c);
+            if (available()) return result;
+          } catch (error) {
+            if (available() || !earlyPanel) throw error;
+          }
         }
         const discovery = path === '/workspace-monitor/current';
         return Response.json(discovery ? { state: 'unavailable' } : { error: { code: code() } },

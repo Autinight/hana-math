@@ -1,3 +1,4 @@
+import { workspaceProjectBusy } from './dashboard-monitor-transport.mjs';
 import { dashboardHeaders, dashboardSelection } from './dashboard-request.mjs';
 import { validTerminalEnd, validSnapshotName } from './terminal-dashboard-read.mjs';
 import { id, livePaths, LIVE_APP } from './ui/dashboard/live-protocol.mjs';
@@ -5,6 +6,7 @@ import { id, livePaths, LIVE_APP } from './ui/dashboard/live-protocol.mjs';
 const PREFIX = '/workspace-monitor';
 const GENERATION = 'x-hana-math-monitor-generation';
 const unavailable = Object.freeze({ state: 'unavailable' });
+const busy = Object.freeze({ state: 'unavailable', reason: 'project_busy' });
 const packet = (value = unavailable, status = 200) => Response.json(value, { status, headers: dashboardHeaders });
 const generationId = value => id(value) && !value.includes(',');
 const projectId = value => typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value);
@@ -24,6 +26,10 @@ function scopedUi(stamp) {
 
 function currentPacket(result) {
   if (result?.state === 'idle' || result?.state === 'unavailable') return packet({ state: result.state });
+  // Same epoch-ms bounds as endedAt, but a saved read is not terminal evidence.
+  if (result?.state === 'saved' && projectId(result.projectId) && generationId(result.generation) && validTerminalEnd(result.asOf)) {
+    return packet({ state: 'saved', projectId: result.projectId, generation: result.generation, asOf: result.asOf });
+  }
   if ((result?.state === 'active' || result?.state === 'snapshot' && validTerminalEnd(result.endedAt))
     && projectId(result.projectId) && generationId(result.generation)) {
     return packet({ state: result.state, projectId: result.projectId, generation: result.generation,
@@ -63,6 +69,7 @@ export function registerWorkspaceDashboardRoutes(app, dashboard) {
         const result = selection ? await dashboard.read(selection, generation, guard) : await dashboard.current(guard);
         if (!guard()) return packet(unavailable, 403);
         if (!selection) return currentPacket(result);
+        if (result === workspaceProjectBusy) return packet(busy, 409);
         if (result?.state === 'unavailable') return packet(unavailable, 409);
         return matchesSelection(selection, result) ? packet(result) : packet(unavailable, 503);
       } catch {

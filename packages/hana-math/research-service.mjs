@@ -1,5 +1,5 @@
 // Bounded, host-authorized orchestration. Mathematics is text-only; no execution fallback.
-import { randomUUID, randomBytes } from 'node:crypto';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import { normalizeWorkerDispatch, validateWorkerSelection, workerDisplayTitle, DEFAULT_WORKER_DISPLAY_TITLE } from './worker-selection.mjs';
 import { ROLE_TOOL_MODES } from './profile-service.mjs';
@@ -15,6 +15,8 @@ import { NATIVE_LITERATURE_GUIDANCE } from './native-literature.mjs';
 import { upstreamKickoff } from './upstream-kickoff.mjs';
 import { resourceBlockedFlag } from './worker-stop-reconciliation.mjs';
 import { auditVerificationReads } from './verification-read-audit.mjs';
+import { validTerminalEnd } from './terminal-dashboard-read.mjs';
+import { readPriorProjectScope } from './research-prior-scope.mjs';
 import { factPageOptions, validateFactPage, FACT_PAGE_GUIDANCE, isCanonicalFact } from './fact-page.mjs';
 
 const HANDLER = 'math-research-once';
@@ -23,6 +25,8 @@ const TASK_TERMINAL = new Set(['completed', 'failed', 'canceled', 'aborted']);
 const TASK_STATES = new Set(['pending', 'running', 'paused', 'blocked', 'recovering', ...TASK_TERMINAL]);
 const taskIdValid = (id) => typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(id);
 const BASE = 'research/runs';
+const MAX_DASHBOARD_HISTORY = 4096, MAX_DASHBOARD_SCAN = 16384;
+const dashboardWriteNonce = /^mutation-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const CONTROL_MS = 10000;
 const MAX_JSON = 1 << 20;
 const ACTIVE = new Set(['queued', 'running']);
@@ -205,14 +209,64 @@ function confirmedCoreBusy(error, operation) {
   } catch { return false; }
 }
 
-export async function createResearchService(sdk, { contexts, profiles, createCore, sessions, literature, bindings: suppliedBindings, onRecoveryProgress } = {}) {
+export async function createResearchService(sdk, { contexts, profiles, createCore, sessions, literature, bindings: suppliedBindings, onRecoveryProgress, deferHistoricalWork = false } = {}) {
   check(contexts?.prepare && contexts?.prepareResearchWorkspace && profiles?.getRoleModel && typeof createCore === 'function' && sessions?.start && literature?.search, 'DEPENDENCY_MISSING');
   for (const key of ['registerHandler', 'create', 'schedule', 'unschedule', 'get', 'list', 'listSchedules', 'complete', 'fail', 'getDelivery']) check(typeof sdk.tasks?.[key] === 'function', 'TASK_CAPABILITY_MISSING');
   const store = createContextStore(sdk.dataDir);
   const runs = new Map(), nonces = new Map(), recoveryErrors = [], unconfirmedWorkers = new Set();
   const projectDashboardWrites = new Map();
+  // Project supplies its own current scope after authorization.
+  const preparedProjects = new Set(), admittedProjects = new Set(), projectPreparations = new Map();
+  let dashboardHistoryLoaded = false, dashboardHistoryUnattributed = false;
+  function projectDashboardHistorySeal(projectId, expectedRunIds) {
+    // Negative witness only. Empty history is valid only after recovery has
+    // enumerated the journals. Project may also check its exact run membership.
+    if (!(deferHistoricalWork ? preparedProjects.has(projectId) && expectedRunIds !== undefined : dashboardHistoryLoaded)
+      || dashboardHistoryUnattributed || runs.size > MAX_DASHBOARD_SCAN
+      || unconfirmedWorkers.size > MAX_DASHBOARD_SCAN) return null;
+    const writes = projectDashboardWriteState(projectId);
+    if (!writes || writes.pending) return null;
+    const rows = [];
+    for (const r of runs.values()) {
+      const m = r.meta;
+      if (m.projectId !== projectId) continue;
+      if (m.mode !== 'project-worker' || rows.length >= MAX_DASHBOARD_HISTORY || !cleanWorkerTerminal(m)
+        || coordinatorBusy(r) || r.persistenceFailed || dashboardRecoveryUnsettled(r) || r.recoveryCheck || r.unsettledMutation) return null;
+      const nonce = Object.hasOwn(m, 'dashboardSharedWriteNonce') ? m.dashboardSharedWriteNonce : null;
+      if (nonce !== null && (typeof nonce !== 'string' || !dashboardWriteNonce.test(nonce))) return null;
+      rows.push([m.runId, nonce]);
+    }
+    rows.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+    if (expectedRunIds !== undefined) {
+      if (!Array.isArray(expectedRunIds) || expectedRunIds.length !== rows.length) return null;
+      const expected = new Set(expectedRunIds);
+      if (!rows.every(([id]) => expected.has(id))) return null;
+    }
+    return createHash('sha256').update(JSON.stringify(['dashboard-worker-history-v1', projectId, rows])).digest('hex');
+  }
+  // Narrow observation for a different, explicitly followed project. This is
+  // not a clean-history/idle receipt for this project and grants no reads of it.
+  function projectDashboardHistoricalCleanup(projectId, expected) {
+    if (disposed || dataRootFailed || !dashboardHistoryLoaded || dashboardHistoryUnattributed
+      || runs.size > MAX_DASHBOARD_SCAN || unconfirmedWorkers.size > MAX_DASHBOARD_SCAN
+      || !(expected instanceof Map) || !expected.size || expected.size > MAX_DASHBOARD_HISTORY) return false;
+    const writes = projectDashboardWrites.get(projectId);
+    if (writes?.pending || writes?.unconfirmed) return false;
+    for (const key of unconfirmedWorkers) if (key.startsWith(`${projectId}/`)) return false;
+    let count = 0, cleanupUnknown = false;
+    for (const r of runs.values()) {
+      const m = r.meta;
+      if (m.projectId !== projectId) continue;
+      if (m.mode !== 'project-worker' || expected.get(m.runId) !== m.workerId || !r.dashboardRecoveredTerminal
+        || !cleanWorkerTerminal(m) || coordinatorBusy(r) || r.recoveryCheck || r.persistenceFailed || r.unsettledMutation
+        || r.pending.size || r.operations.size || r.readCores.size || r.runtimeDisposals.size || r.runtimeCleanupOwners.size) return false;
+      count++;
+      cleanupUnknown ||= r.recoveryUnsettled === true;
+    }
+    return count === expected.size && cleanupUnknown;
+  }
   function projectDashboardWriteState(projectId) {
-    if (disposed || dataRootFailed) return null;
+    if (disposed || dataRootFailed || deferHistoricalWork && !preparedProjects.has(projectId)) return null;
     try { contextId(projectId); } catch { return null; }
     const writes = projectDashboardWrites.get(projectId);
     if (writes?.unconfirmed) return null;
@@ -221,20 +275,54 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     for (const r of runs.values()) {
       const m = r.meta;
       if (r.recovered && m.mode === 'project-worker' && m.projectId === projectId
-        && (r.recoveryUnsettled || candidatePending(m) || m.indeterminate && !m.pendingMutations.length
+        && (dashboardRecoveryUnsettled(r) || candidatePending(m) || m.indeterminate && !m.pendingMutations.length
           || m.pendingMutations.some(marker => marker?.operation !== 'local_memory_append'))) return null;
     }
     return Object.freeze({ pending: (writes?.pending ?? 0) > 0, endedAt: writes?.endedAt ?? 0 });
   }
   const workerKey = (projectId, workerId) => `${contextId(projectId)}/${contextId(workerId)}`;
   let active = null, disposed = false, dataRootFailed = false, registration, configuring = false;
+  const dashboardTerminalObservers = new Set(), workerSettlementObservers = new Set();
+  function subscribe(observers, fn) {
+    check(typeof fn === 'function', 'INVALID_OBSERVER');
+    const subscription = { fn };
+    if (!disposed) observers.add(subscription);
+    return () => { observers.delete(subscription); };
+  }
+  function notifyProject(observers, projectId) {
+    // Snapshot subscriptions on the edge, with no replay; unsubscribe/dispose
+    // still wins before dispatch. Neither throws nor async observers join cleanup.
+    for (const subscription of observers) setImmediate(() => {
+      if (!observers.has(subscription)) return;
+      const { fn } = subscription;
+      try { Promise.resolve(fn(projectId)).catch(() => {}); } catch { /* advisory */ }
+    });
+  }
   const pathOf = (r, name = 'run.json') => `${BASE}/${r.meta.runId}/${name}`;
   function runtime(meta) { initializeRuntimeCleanup(meta); meta.pendingMutations ??= []; meta.coreTaskId ??= null; meta.coreTaskCreatePending ??= false; meta.coreTaskSettlementPending ??= meta.coreTaskId !== null || meta.coreTaskCreatePending === true; return { meta, runtimeCleanupInherited: meta.runtimeCleanupPending, runtimeCleanupUnowned: false, runtimeCleanupOwners: new Set(), runtimeDisposals: new Set(), coreDisposed: false, writes: Promise.resolve(), handles: [], readCores: new Set(), operations: new Set(), pending: new Set(), controller: new AbortController(), scheduleIds: new Set(meta.scheduleIds || []), current: null, core: null, finishing: null, promise: null, reportWritten: false }; }
   function coordinatorBusy(r) {
     return !!(r.admissionPending || r.pipelinePending || r.finishing
       || !r.recovered && (ACTIVE.has(r.meta.state) || r.meta.finalizing));
   }
-  function releaseCoordinator(r) { if (active === r && !coordinatorBusy(r)) active = null; }
+  function releaseCoordinator(r) {
+    if (coordinatorBusy(r)) return;
+    if (active === r) active = null;
+    const m = r.meta;
+    if (disposed || r.recovered || m.mode !== 'project-worker' || !cleanWorkerTerminal(m)) return;
+    // The last of finishing, pipelinePending and admissionPending can own this
+    // edge. A finished root-task receipt alone cannot notify while any is held.
+    if (r.monitorEndedAt !== undefined && !r.dashboardTerminalNotified
+      && projectWorkerMonitor(m.projectId, m.workerId, m.runId).terminal) {
+      r.dashboardTerminalNotified = true;
+      notifyProject(dashboardTerminalObservers, m.projectId);
+    }
+    // Keep the finished-run event distinct. Settlement wakes Goal cleanup and
+    // also lets Project check the narrow graceful-round monitor receipt.
+    if (!r.workerSettlementNotified && !workerBusy(r) && !r.persistenceFailed && !r.unsettledMutation) {
+      r.workerSettlementNotified = true;
+      notifyProject(workerSettlementObservers, m.projectId);
+    }
+  }
   function markRuntimeCleanup(r, error, core) {
     r.meta.runtimeCleanupPending = true;
     r.meta.runtimeCleanupError ||= errorInfo(error);
@@ -280,7 +368,7 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
   function ensure(r) {
     check(!r.meta.resourceBlocked, 'RESEARCH_RESOURCE_BLOCKED');
     check(!r.persistenceFailed, 'RESEARCH_PERSISTENCE_FAILED'); check(!r.meta.runtimeCleanupPending, 'RUNTIME_CLEANUP_PENDING');
-    check(!disposed && ACTIVE.has(r.meta.state) && !r.meta.finalizing && !r.controller.signal.aborted, 'RUN_INACTIVE');
+    check(!disposed && !r.deferredHistory && ACTIVE.has(r.meta.state) && !r.meta.finalizing && !r.controller.signal.aborted, 'RUN_INACTIVE');
     check(r.meta.deadlineAt === null || Date.now() < r.meta.deadlineAt, 'DEADLINE_EXCEEDED');
     check(!r.roundScope || !r.roundScope.controller.signal.aborted && Date.now() < r.roundScope.deadlineAt, 'ROUND_DEADLINE_EXCEEDED');
   }
@@ -403,6 +491,7 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
       check(!meta.coreTaskCreatePending && !meta.coreTaskSettlementPending, 'CORE_TASK_CREATE_UNCONFIRMED'); return;
     }
     const task = coreTaskReceipt(await bounded(host.tasks.get(meta.coreTaskId)), meta.runId, meta.coreTaskId);
+    let settledHere;
     if (!TASK_TERMINAL.has(task.status)) {
       const expected = success ? 'completed' : 'failed';
       meta.coreTaskSettlementPending = true; meta.coreTaskTerminalExpected = expected; await persist(r);
@@ -410,11 +499,13 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
         ? host.tasks.complete(meta.coreTaskId, { runId: meta.runId, state: 'finished' })
         : host.tasks.fail(meta.coreTaskId, taskFailure(meta, 'CORE_EXECUTION_ENDED'))), meta.runId, meta.coreTaskId);
       check(receipt.status === expected, 'CORE_TASK_RECEIPT_MISMATCH');
+      settledHere = receipt.status;
     } else if (meta.coreTaskTerminalExpected && !['canceled', 'aborted'].includes(task.status)) {
       check(task.status === meta.coreTaskTerminalExpected, 'CORE_TASK_RECEIPT_MISMATCH');
     }
     // This settles only the authorization record, never runtime or math evidence.
     meta.coreTaskSettlementPending = false; await persist(r);
+    return settledHere;
   }
   async function terminate(r, state, cause) {
     if (cause) {
@@ -426,11 +517,14 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
       return r.finishing;
     }
     if (!ACTIVE.has(r.meta.state) && !r.meta.cleanupPending && !r.meta.runtimeCleanupPending && !r.meta.taskSettlementPending && !r.meta.coreTaskCreatePending && !r.meta.coreTaskSettlementPending) return;
+    const graceful = state === 'stopped' && !cause && r.meta.stopRequested === true && !r.controller.signal.aborted
+      && r.gracefulRound?.normalBoundary === true ? r.gracefulRound : null;
     r.meta.state = state; r.meta.phase = 'finalizing'; r.meta.finalizing = true;
     if (cause) r.meta.error ||= errorInfo(cause);
     r.controller.abort(); r.roundScope?.controller.abort(); r.wakeDelay?.(); clearTimeout(r.timer); nonces.delete(r.meta.runId); bindings.closeRun(r.meta.runId);
     r.finishing = (async () => {
       const errors = [];
+      let coreSettledHere;
       try { await persist(r); } catch (e) { errors.push(errorInfo(e)); }
       if (r.recovered) { await reconcile(r); if (r.meta.cleanupPending) errors.push(errorInfo(failure('RECOVERY_CLEANUP_PENDING'))); }
       await Promise.all(r.handles.map(async ({ handle, entry }) => {
@@ -447,7 +541,7 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
         try { await disposeCore(r, core); } catch (e) { errors.push(errorInfo(e)); }
       }
       clearRuntimeCleanup(r);
-      try { await settleCoreTask(r, state === 'finished' && !errors.length && !r.meta.indeterminate && !r.meta.runtimeCleanupPending); }
+      try { coreSettledHere = await settleCoreTask(r, state === 'finished' && !errors.length && !r.meta.indeterminate && !r.meta.runtimeCleanupPending); }
       catch (e) { r.meta.coreTaskSettlementPending = true; errors.push(errorInfo(e)); }
       for (const id of [...r.scheduleIds]) { try { await unschedule(r, id); } catch (e) { errors.push(errorInfo(e)); } }
       if (r.meta.sessions.some((s) => s.state === 'creating' && !r.handles.some((h) => h.entry === s))) errors.push(errorInfo(failure('SESSION_CREATE_UNCONFIRMED')));
@@ -461,19 +555,21 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
         await persist(r);
         if (r.meta.taskId) {
           const task = rootTaskReceipt(await bounded(sdk.tasks.get(r.meta.taskId)), r.meta);
-          let completedHere = false;
+          let settledHere;
           if (!['completed', 'failed', 'canceled', 'aborted'].includes(task.status)) {
             const expected = state === 'finished' && !r.meta.cleanupPending ? 'completed' : 'failed';
             r.meta.taskTerminalExpected = expected; await persist(r);
             const receipt = rootTaskReceipt(await bounded(expected === 'completed' ? sdk.tasks.complete(r.meta.taskId, view(r))
               : sdk.tasks.fail(r.meta.taskId, taskFailure(r.meta, state.toUpperCase()))), r.meta);
             check(receipt.status === expected, 'TASK_RECEIPT_MISMATCH');
-            completedHere = receipt.status === 'completed';
+            settledHere = receipt.status;
           }
           if (r.meta.taskTerminalExpected && !['canceled', 'aborted'].includes(task.status) && ['completed', 'failed'].includes(task.status)) check(task.status === r.meta.taskTerminalExpected, 'TASK_RECEIPT_MISMATCH');
           r.meta.taskSettlementPending = false;
           await delivery(r); await persist(r);
-          if (completedHere && r.monitorStartedAt !== undefined) r.monitorEndedAt = r.meta.endedAt;
+          if (settledHere === 'completed' && r.monitorStartedAt !== undefined) r.monitorEndedAt = r.meta.endedAt;
+          if (graceful && r.gracefulRound === graceful && settledHere === 'failed' && coreSettledHere === 'failed'
+            && cleanGracefulStop(r)) r.gracefulRoundEndedAt = r.meta.endedAt;
         }
       } catch (e) { r.meta.taskSettlementPending = true; r.meta.cleanupPending = true; r.meta.cleanupErrors.push(errorInfo(e)); r.meta.cleanupErrors = r.meta.cleanupErrors.slice(-32); r.meta.delivery = { state: 'failed', delivered: false, error: errorInfo(e) }; await persist(r).catch(() => { r.meta.cleanupPending = true; }); }
       releaseCoordinator(r);
@@ -486,7 +582,10 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     ensure(r); r.meta.phase = value; await persist(r); ensure(r);
     // Record in the coordinator, not on the first viewer poll or from restored metadata.
     if (value === 'working' && r.meta.mode === 'project-worker' && !r.recovered && r.pipelinePending
-      && r.meta.stopRequested !== true && !r.meta.error) r.monitorStartedAt ??= Date.now();
+      && r.meta.stopRequested !== true && !r.meta.error) {
+      r.monitorStartedAt ??= Date.now();
+      if (r.roundScope) r.roundScope.monitorWorking = true;
+    }
   }
   function latchCapacity(r, error) {
     if (error?.code !== 'RESEARCH_RUNTIME_CAPACITY'
@@ -510,6 +609,9 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
         const callTag = `mutation-${randomUUID()}`;
         marker = { callTag, operation, requestFile: pathOf(r, `mutations/${callTag}/request.json`), receiptFile: pathOf(r, `mutations/${callTag}/receipt.json`), createdAt: Date.now() };
         r.meta.pendingMutations.push(marker);
+        // Commit the new nonce with the existing intent, before a shared write
+        // can be issued. Never undo it, even on rejection or failed readback.
+        if (writes) r.meta.dashboardSharedWriteNonce = callTag;
         r.meta.mutationReceipts = pathOf(r, 'mutations');
         // Durable intent precedes every possible Core write, including trace-only rejection.
         await persist(r); assertCandidate();
@@ -780,7 +882,7 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     const scope = { controller: new AbortController(), firstEntry: r.meta.sessions.length, firstHandle: r.handles.length,
       deadlineAt: Date.now() + r.meta.executionPolicy.workerPolicy.roundTimeoutSeconds * 1000, expired: false };
     r.roundScope = scope; r.meta.roundDeadlineAt = scope.deadlineAt;
-    let abort, timer, caught, result;
+    let abort, timer, caught, result, graceful = null;
     const interrupted = new Promise((_, reject) => {
       abort = () => reject(failure(r.controller.signal.aborted ? 'RUN_INACTIVE' : 'ROUND_DEADLINE_EXCEEDED'));
       scope.controller.signal.addEventListener('abort', abort, { once: true });
@@ -792,8 +894,11 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     // Termination must drain it too, but verifier/tool drains must not await self.
     const job = tracked(r, Promise.resolve().then(async () => { await persist(r); ensure(r); return work(); }));
     scope.job = job;
-    try { result = await Promise.race([job, interrupted]); }
-    catch (error) { caught = error; }
+    try {
+      result = await Promise.race([job, interrupted]);
+      if (r.gracefulRound?.scope === scope && !scope.expired && !scope.controller.signal.aborted
+        && !r.controller.signal.aborted && Date.now() < deadline(r)) graceful = r.gracefulRound;
+    } catch (error) { caught = error; }
     finally {
       clearTimeout(timer); closeRoundAdmission(r, scope); scope.controller.abort();
       scope.controller.signal.removeEventListener('abort', abort);
@@ -802,6 +907,8 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
       for (const { handle, entry } of r.handles.slice(scope.firstHandle)) {
         const snapshot = await bounded(Promise.resolve().then(() => handle.stop()));
         Object.assign(entry, sessionSummary(snapshot));
+        // Do not promote a tolerated cancellation/diagnostic to a clean dashboard boundary.
+        if (snapshot.state !== 'completed' || snapshot.error || snapshot.sdkError || snapshot.errors?.length) graceful = null;
         check(!snapshot.finalizing && !snapshot.cleanupPending && !snapshot.sendPending && !snapshot.setupPending && !snapshot.updateFailed
           && (snapshot.state === 'completed' || ['aborted', 'idle-confirmed'].includes(snapshot.abortOutcome)), 'ROUND_CLEANUP_UNCONFIRMED');
         // A deadline race must not hide a late setup/identity/permission failure
@@ -824,6 +931,7 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
       }
       const jobs = [job, ...r.operations, ...r.pending], settled = await bounded(Promise.allSettled(jobs));
       for (const [index, outcome] of settled.entries()) {
+        if (outcome.status === 'rejected') graceful = null;
         if (outcome.status === 'rejected' && !['RUN_INACTIVE', 'ROUND_DEADLINE_EXCEEDED', 'CALLER_UNBOUND'].includes(outcome.reason?.code)
           && !(jobs[index] === job && (modelFailureProof(r, scope, job, outcome.reason)?.cleaned
             || operationalFailure(r, scope, job, outcome.reason)))) throw outcome.reason;
@@ -855,6 +963,8 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     check(Number.isSafeInteger(r.meta.consecutiveFailures), 'ROUND_FAILURE_COUNTER_EXHAUSTED');
     r.meta.lastRoundOutcome = { round: r.meta.round, code, ...(caught ? { error: errorInfo(caught) } : {}) };
     await persist(r); ensure(r);
+    if (graceful && r.gracefulRound === graceful && r.meta.stopRequested === true && code === 0 && !caught
+      && r.meta.round === graceful.round && !r.meta.error) graceful.normalBoundary = true;
     return result;
   }
   async function researchDelay(r, seconds) {
@@ -1281,6 +1391,42 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
       try {
       contextId(id); const meta = await store.readJson(`${BASE}/${id}/run.json`);
       if (meta?.mode === 'project-worker') recoveringWorker = workerKey(meta.projectId, meta.workerId);
+      validateRecoveryRecord(meta, id);
+      const r = runtime(meta); runs.set(id, r);
+      validateRecoveryRuntime(meta);
+      if (meta.pendingMutations.length) meta.indeterminate = true;
+      // Preserve pending/malformed candidate evidence without replay or retrofitting legacy records.
+      r.unsettledMutation = candidatePending(meta);
+      r.recovered = true; bindings.closeRun(id); nonces.delete(id);
+      if (!ACTIVE.has(meta.state)) {
+        // Only a validated, already-ended journal may prove that the blocker
+        // was historical. Recovery converting active work to interrupted is
+        // not this witness, and persisted write/cleanup uncertainty stays fenced.
+        r.dashboardRecoveredTerminal = meta.mode === 'project-worker' && validTerminalEnd(meta.endedAt) && cleanWorkerTerminal(meta);
+        // Run host cleanup through the existing identity checks, but retain the
+        // terminal project's exact persisted uncertainty and business state.
+        const cleanup = runtime(copy(meta)); cleanup.recoveryReadOnly = true;
+        await reconcile(cleanup, host);
+        if (cleanup.meta.cleanupPending) { r.recoveryUnsettled = true; recoveryErrors.push({ runId: id, error: errorInfo(failure('RECOVERY_CLEANUP_PENDING')) }); }
+        continue;
+      }
+      meta.state = 'interrupted'; meta.phase = 'recovering'; meta.finalizing = true; bindings.closeRun(id);
+      await persist(r); // Never lose the mutation fence even if a later cleanup lookup fails.
+      await reconcile(r, host);
+      meta.finalizing = false; meta.phase = 'interrupted'; meta.abortOutcome = meta.cleanupPending ? 'unconfirmed' : 'confirmed';
+      await persist(r);
+      if (meta.cleanupPending || meta.runtimeCleanupPending || meta.indeterminate) recoveryErrors.push({ runId: id, error: errorInfo(failure('RECOVERY_CLEANUP_PENDING')) });
+      } catch (e) {
+        if (recoveringWorker) unconfirmedWorkers.add(recoveringWorker);
+        else dashboardHistoryUnattributed = true;
+        runs.delete(id); await damagedRecord(id, e, host);
+      }
+      finally { counters.reconciledRuns++; reportProgress(); }
+    }
+    dashboardHistoryLoaded = true;
+    if (ids.length === 0) reportProgress();
+  }
+  function validateRecoveryRecord(meta, id) {
       check(object(meta) && meta.schemaVersion === 1 && meta.runId === id && ['queued', 'running', 'finished', 'failed', 'stopped', 'interrupted'].includes(meta.state)
         && typeof meta.finalizing === 'boolean' && typeof meta.cleanupPending === 'boolean' && typeof meta.indeterminate === 'boolean'
         && Array.isArray(meta.cleanupErrors) && Array.isArray(meta.sessions) && meta.sessions.every(object) && Array.isArray(meta.submissions)
@@ -1300,35 +1446,14 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
         check(meta.mode === 'project-worker' && (meta.executionPolicy.totalTimeoutSeconds === null
           ? meta.deadlineAt === null : Number.isSafeInteger(meta.deadlineAt) && meta.deadlineAt >= 0), 'RECOVERY_RECORD_INVALID');
       }
-      const r = runtime(meta); runs.set(id, r);
-      check(Array.isArray(meta.pendingMutations) && (meta.coreTaskId === null || taskIdValid(meta.coreTaskId) && meta.coreTaskId !== meta.taskId)
-        && typeof meta.coreTaskCreatePending === 'boolean' && typeof meta.coreTaskSettlementPending === 'boolean', 'RECOVERY_RECORD_INVALID');
-      if (meta.pendingMutations.length) meta.indeterminate = true;
-      // Preserve pending/malformed candidate evidence without replay or retrofitting legacy records.
-      r.unsettledMutation = candidatePending(meta);
-      r.recovered = true; bindings.closeRun(id); nonces.delete(id);
-      if (!ACTIVE.has(meta.state)) {
-        // Run host cleanup through the existing identity checks, but retain the
-        // terminal project's exact persisted uncertainty and business state.
-        const cleanup = runtime(copy(meta)); cleanup.recoveryReadOnly = true;
-        await reconcile(cleanup, host);
-        if (cleanup.meta.cleanupPending) { r.recoveryUnsettled = true; recoveryErrors.push({ runId: id, error: errorInfo(failure('RECOVERY_CLEANUP_PENDING')) }); }
-        continue;
-      }
-      meta.state = 'interrupted'; meta.phase = 'recovering'; meta.finalizing = true; bindings.closeRun(id);
-      await persist(r); // Never lose the mutation fence even if a later cleanup lookup fails.
-      await reconcile(r, host);
-      meta.finalizing = false; meta.phase = 'interrupted'; meta.abortOutcome = meta.cleanupPending ? 'unconfirmed' : 'confirmed';
-      await persist(r);
-      if (meta.cleanupPending || meta.runtimeCleanupPending || meta.indeterminate) recoveryErrors.push({ runId: id, error: errorInfo(failure('RECOVERY_CLEANUP_PENDING')) });
-      } catch (e) { if (recoveringWorker) unconfirmedWorkers.add(recoveringWorker); runs.delete(id); await damagedRecord(id, e, host); }
-      finally { counters.reconciledRuns++; reportProgress(); }
-    }
-    if (ids.length === 0) reportProgress();
   }
-  await recover();
+  function validateRecoveryRuntime(meta) {
+    check(Array.isArray(meta.pendingMutations) && (meta.coreTaskId === null || taskIdValid(meta.coreTaskId) && meta.coreTaskId !== meta.taskId)
+      && typeof meta.coreTaskCreatePending === 'boolean' && typeof meta.coreTaskSettlementPending === 'boolean', 'RECOVERY_RECORD_INVALID');
+  }
+  if (!deferHistoricalWork) await recover();
   registration = await bounded(sdk.tasks.registerHandler(HANDLER, { run: launch, abort: async (taskId) => {
-    const r = [...runs.values()].find((r) => r.meta.taskId === taskId);
+    const r = [...runs.values()].find(r => r.meta.taskId === taskId && !r.deferredHistory);
     if (r) void terminate(r, 'stopped', failure('ROOT_TASK_CANCELLED'));
     return { status: r ? 'stopping' : 'ignored' };
   } }));
@@ -1336,6 +1461,8 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
   async function run(input, context) {
     encoded(input); fields(input, ['problem', 'operatorProfile', 'workerTask', 'timeoutSeconds'], ['problem']); text(input.problem);
     for (const key of ['operatorProfile', 'workerTask']) if (input[key] !== undefined) text(input[key]);
+    check(typeof context?.callToken === 'string' && context.callToken && typeof context.sessionPath === 'string' && context.sessionPath, 'CALLER_UNBOUND');
+    if (deferHistoricalWork) await confirmGlobalResearchIdle();
     return admit(input, context);
   }
   const workerAdmissionRejections = new WeakSet();
@@ -1428,6 +1555,7 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     check(!configuring, 'CONFIGURATION_BUSY');
     if (active) releaseCoordinator(active);
     if (projectWorker) {
+      check(!deferHistoricalWork || admittedProjects.delete(input.projectId), 'PROJECT_HISTORY_UNCONFIRMED');
       check(!unconfirmedWorkers.has(workerKey(input.projectId, input.workerId)), 'WORKER_BUSY');
       check(![...runs.values()].some(r => r.meta.mode !== 'project-worker' && r.meta.projectId === input.projectId), 'LEGACY_PROJECT_FORBIDDEN');
       check(![...runs.values()].some(r => r.meta.mode !== 'project-worker' && coordinatorBusy(r)), 'RUN_BUSY');
@@ -1487,8 +1615,128 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     } catch (e) { void terminate(r, 'failed', e); throw Object.assign(e, { runId, taskId: r.meta.taskId }); }
     finally { r.admissionPending = false; releaseCoordinator(r); }
   }
-  function owned(runId, context) { contextId(runId); const r = runs.get(runId); check(r, 'RUN_NOT_FOUND'); assertResearchOwner(r.meta, context); return r; }
-  async function status(runId, context) { return view(owned(runId, context)); }
+  function priorJournalTerminal(m, sessionSettled) {
+    return validTerminalEnd(m.endedAt) && m.phase === m.state && cleanWorkerTerminal(m)
+      && m.abortOutcome === 'confirmed' && m.taskSettlementPending === false
+      && Array.isArray(m.scheduleIds) && m.scheduleIds.length === 0
+      && m.sessions.every(s => typeof s.sessionId === 'string' && s.sessionId && typeof s.sessionPath === 'string' && s.sessionPath
+        && s.active === false && s.cleanupPending === false && s.sendPending === false && !s.setupPending && !s.finalizing
+        && ['accepted', 'not-sent', 'rejected'].includes(s.sendState) && sessionSettled(s));
+  }
+  function confirmedSessionStop(s) { return ['aborted', 'idle-confirmed'].includes(s.abortOutcome); }
+  function priorJournalSettled(m) {
+    return priorJournalTerminal(m, confirmedSessionStop);
+  }
+  function naturallyCompletedSession(s) {
+    if (s.abortOutcome !== 'not-requested' || s.state !== 'completed' || s.phase !== 'completed' || s.sendState !== 'accepted'
+      || s.setupPending !== false || s.finalizing !== false || s.modelStopReason !== 'stop'
+      || s.error !== null || s.failurePhase !== null || s.sdkError !== null) return false;
+    // Project workers use controlled turns even on the legacy execution policy.
+    if (s.role === 'worker') return Number.isSafeInteger(s.modelTurn) && s.modelTurn > 0 && s.turnEnded === true;
+    return s.role === 'verifier' && !Object.hasOwn(s, 'modelTurn') && !Object.hasOwn(s, 'turnEnded');
+  }
+  function priorJournalReadSettled(m) {
+    return priorJournalTerminal(m, s => confirmedSessionStop(s) || m.mode === 'project-worker' && naturallyCompletedSession(s));
+  }
+  function dashboardRecoveryUnsettled(r) {
+    // The persisted completion witness is for reads only. Preserve the actual
+    // recovery fence for diagnostic status and every admission path.
+    return r.recoveryUnsettled && !(r.deferredHistory && priorJournalReadSettled(r.meta));
+  }
+  async function readPriorRun(runId, authorize) {
+    contextId(runId);
+    const current = runs.get(runId);
+    if (current) { authorize(current.meta); return current; }
+    check(deferHistoricalWork, 'RUN_NOT_FOUND');
+    check(!disposed, 'RESEARCH_DISPOSED');
+    let m;
+    try { m = await store.readJson(`${BASE}/${runId}/run.json`); }
+    catch (error) { if (error.code === 'ENOENT') throw failure('RUN_NOT_FOUND'); throw failure('RECOVERY_RECORD_INVALID'); }
+    authorize(m); check(!disposed, 'RESEARCH_DISPOSED');
+    validateRecoveryRecord(m, runId);
+    // No nonce, binding, controller admission or Host mutation is restored.
+    const prior = runtime(m); validateRecoveryRuntime(m);
+    prior.deferredHistory = true;
+    prior.recovered = true;
+    prior.unsettledMutation = candidatePending(m);
+    prior.recoveryUnsettled = !priorJournalSettled(m);
+    return prior;
+  }
+  async function prepareProjectHistory(projectId, expected, guard, { fresh = false } = {}) {
+    if (!deferHistoricalWork) return;
+    contextId(projectId);
+    check(typeof guard === 'function' && typeof fresh === 'boolean', 'INVALID_INPUT');
+    const permit = {};
+    const recheck = () => { check(!disposed, 'RESEARCH_DISPOSED'); assertWorkerAdmission(guard); };
+    recheck(); projectPreparations.set(projectId, permit);
+    try {
+      const refs = await readPriorProjectScope(store, projectId, expected, recheck);
+      const rows = new Map();
+      for (const [runId, workerId] of refs) {
+        const r = await readPriorRun(runId, m => check(m?.mode === 'project-worker' && m.projectId === projectId
+          && m.workerId === workerId && m.runId === runId, 'PROJECT_WORKER_MISMATCH'));
+        recheck();
+        check(!fresh || !r.recovered, 'PROJECT_HISTORY_UNCONFIRMED');
+        rows.set(runId, r);
+      }
+      // Validate the exact scope before publishing any partial lookup result.
+      for (const r of runs.values()) if (r.meta.projectId === projectId) {
+        check(rows.get(r.meta.runId) === r, 'PROJECT_HISTORY_UNCONFIRMED');
+      }
+      for (const [id, r] of rows) { check(!runs.has(id) || runs.get(id) === r, 'PROJECT_HISTORY_UNCONFIRMED'); }
+      for (const [id, r] of rows) runs.set(id, r);
+      if (projectPreparations.get(projectId) === permit) preparedProjects.add(projectId);
+    } catch {
+      if (projectPreparations.get(projectId) === permit) preparedProjects.delete(projectId);
+      throw failure('PROJECT_HISTORY_UNCONFIRMED');
+    } finally {
+      if (projectPreparations.get(projectId) === permit) projectPreparations.delete(projectId);
+    }
+  }
+  async function confirmProjectAdmission(projectId, expected, guard, options) {
+    if (!deferHistoricalWork) return;
+    admittedProjects.delete(projectId);
+    await prepareProjectHistory(projectId, expected, guard, options);
+    assertWorkerAdmission(guard);
+    check(preparedProjects.has(projectId) && !disposed && [...runs.values()].every(r => r.meta.projectId !== projectId
+      || !r.deferredHistory || !r.recoveryUnsettled && !workerBusy(r) && r.meta.sessions.length === 0),
+    'PROJECT_HISTORY_UNCONFIRMED');
+    admittedProjects.add(projectId);
+  }
+  // Explicit standalone research uses the shared coordinator. Inspect prior
+  // intent only on that explicit call, without recovery or loading it as live.
+  async function confirmGlobalResearchIdle() {
+    check(!disposed && !dataRootFailed, 'RECOVERY_BLOCKED');
+    check(!active && ![...runs.values()].some(coordinatorBusy), 'RUN_BUSY');
+    try {
+      let ids;
+      try { ids = await store.list(BASE); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; ids = []; }
+      for (const id of ids) {
+        const r = await readPriorRun(id, () => {}), m = r.meta;
+        if (r.recovered) {
+          check(priorJournalSettled(m) && m.sessions.length === 0, 'RECOVERY_BLOCKED');
+          if (m.taskId) {
+            const task = rootTaskReceipt(await bounded(sdk.tasks.get(m.taskId)), m);
+            check(TASK_TERMINAL.has(task.status), 'RECOVERY_BLOCKED');
+          }
+          if (m.coreTaskId) {
+            const task = coreTaskReceipt(await bounded(sdk.tasks.get(m.coreTaskId)), m.runId, m.coreTaskId);
+            check(TASK_TERMINAL.has(task.status), 'RECOVERY_BLOCKED');
+          }
+        } else check(!workerBusy(r), 'RECOVERY_BLOCKED');
+      }
+    } catch { throw failure('RECOVERY_BLOCKED'); }
+  }
+  async function owned(runId, context) {
+    check(typeof context?.callToken === 'string' && context.callToken && typeof context.sessionPath === 'string' && context.sessionPath, 'CALLER_UNBOUND');
+    const r = await readPriorRun(runId, m => assertResearchOwner(m, context));
+    const installed = runs.get(runId);
+    if (installed) { assertResearchOwner(installed.meta, context); return installed; }
+    if (r.deferredHistory) runs.set(runId, r);
+    return r;
+  }
+  async function status(runId, context) { return view(await owned(runId, context)); }
   function projectWorker(projectId, runId) {
     contextId(projectId); contextId(runId);
     const r = runs.get(runId); check(r, 'RUN_NOT_FOUND');
@@ -1496,20 +1744,63 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     return r;
   }
   async function projectWorkerStatus(projectId, runId) { return view(projectWorker(projectId, runId)); }
+  // For a Project operation that has already authenticated the caller and
+  // checked one exact worker/run reference. This is not a project-wide seal.
+  async function prepareProjectWorkerHistory({ projectId, workerId, runId }, guard) {
+    if (!deferHistoricalWork) return;
+    contextId(projectId); contextId(workerId); contextId(runId);
+    check(typeof guard === 'function', 'INVALID_INPUT');
+    assertWorkerAdmission(guard);
+    const match = m => check(m?.mode === 'project-worker' && m.projectId === projectId
+      && m.workerId === workerId && m.runId === runId, 'PROJECT_WORKER_MISMATCH');
+    const r = await readPriorRun(runId, match);
+    assertWorkerAdmission(guard);
+    const installed = runs.get(runId);
+    if (installed) match(installed.meta);
+    else runs.set(runId, r);
+  }
+  function inGracefulRound(r, scope) {
+    const m = r.meta;
+    if (disposed || r.recovered || r.recoveryUnsettled || r.recoveryCheck || r.persistenceFailed || r.finishing
+      || !r.pipelinePending || m.state !== 'running' || !['working', 'verifying', 'submitting'].includes(m.phase)
+      || m.error || m.resourceBlocked || m.cleanupPending !== false || m.runtimeCleanupPending !== false
+      || m.indeterminate !== false || m.finalizing !== false || !scope || r.roundScope !== scope
+      || scope.monitorWorking !== true || scope.expired || scope.controller.signal.aborted
+      || r.controller.signal.aborted || Date.now() >= deadline(r)) return false;
+    if (!r.unsettledMutation && !candidatePending(m)) return true;
+    // Submission intentionally fences mutations until readback. An intent
+    // still owned by this live round isn't unknown, but never relax it here.
+    const owner = r.candidateOwner;
+    return m.phase === 'submitting' && r.unsettledMutation === true && owner?.r === r && owner.scope === scope
+      && owner.controller === r.controller && owner.roundController === scope.controller && owner.job === scope.job
+      && owner.round === m.round && owner.marker === m.candidateSettlement
+      && candidateProjection(m)?.valid === true;
+  }
+  function cleanGracefulStop(r) {
+    const m = r.meta;
+    return !disposed && !r.recovered && !r.persistenceFailed && !r.unsettledMutation && r.coreDisposed && cleanWorkerTerminal(m)
+      && m.state === 'stopped' && m.phase === 'stopped' && m.stopRequested === true && !m.error && !m.cleanupErrors.length
+      && m.abortOutcome === 'confirmed' && m.taskSettlementPending === false && m.taskTerminalExpected === 'failed'
+      && m.coreTaskTerminalExpected === 'failed' && m.lastRoundOutcome?.round === r.gracefulRound?.round
+      && m.lastRoundOutcome?.code === 0 && !m.lastRoundOutcome.error;
+  }
   // A scalar monitor observation, not a run read or a recovery command.
   function projectWorkerMonitor(projectId, workerId, runId) {
     const unknown = { state: 'unknown' };
     if (disposed || dataRootFailed || unconfirmedWorkers.has(workerKey(projectId, workerId))) return unknown;
     const r = projectWorker(projectId, runId), m = r.meta;
-    if (m.workerId !== workerId || m.runId !== runId || r.persistenceFailed || r.recoveryUnsettled || r.recoveryCheck) return unknown;
+    if (m.workerId !== workerId || m.runId !== runId || r.persistenceFailed || dashboardRecoveryUnsettled(r) || r.recoveryCheck) return unknown;
     if (cleanWorkerTerminal(m) && !coordinatorBusy(r)) {
-      if (r.recovered || m.state !== 'finished' || m.stopRequested === true) return { state: 'idle' };
-      const startedAt = r.monitorStartedAt, endedAt = r.monitorEndedAt;
+      const gracefulRound = r.gracefulRoundEndedAt !== undefined && cleanGracefulStop(r);
+      if (r.recovered || !gracefulRound && (m.state !== 'finished' || m.stopRequested === true)) return { state: 'idle' };
+      const startedAt = r.monitorStartedAt, endedAt = gracefulRound ? r.gracefulRoundEndedAt : r.monitorEndedAt;
       return !m.error && !r.unsettledMutation && Number.isSafeInteger(startedAt) && startedAt > 0
         && Number.isSafeInteger(endedAt) && endedAt >= startedAt && endedAt === m.endedAt
-        ? { state: 'idle', terminal: { runId, startedAt, endedAt } }
+        ? { state: 'idle', terminal: { runId, startedAt, endedAt }, ...(gracefulRound ? { gracefulRound: true } : {}) }
         : { state: 'idle', snapshotUnconfirmed: true };
     }
+    if (m.stopRequested === true && r.gracefulRound?.round === m.round && inGracefulRound(r, r.gracefulRound?.scope))
+      return { state: 'active', gracefulRound: true };
     if (r.recovered || r.controller.signal.aborted || r.unsettledMutation || m.resourceBlocked
       || m.cleanupPending !== false || m.runtimeCleanupPending !== false || m.indeterminate !== false || m.finalizing !== false) return unknown;
     if (m.stopRequested === true) return { state: 'idle', snapshotUnconfirmed: true };
@@ -1552,8 +1843,18 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     for (const id of Object.values(identity)) contextId(id);
     check(typeof options?.recheck === 'function', 'DEPENDENCY_MISSING');
     const ids = { ...identity };
-    return auditVerificationReads(sdk, { identity: ids, getMeta: () => runs.get(ids.runId)?.meta,
-      store, recheck: options.recheck, budget: options.budget });
+    let observed;
+    const recheck = !deferHistoricalWork ? options.recheck : async () => {
+      await options.recheck();
+      if (!runs.has(ids.runId) && !observed) {
+        const r = await readPriorRun(ids.runId, m => check(m?.mode === 'project-worker' && m.projectId === ids.projectId
+          && m.workerId === ids.workerId && m.runId === ids.runId, 'PROJECT_WORKER_MISMATCH'));
+        await options.recheck();
+        observed = r.meta;
+      }
+    };
+    return auditVerificationReads(sdk, { identity: ids, getMeta: () => runs.get(ids.runId)?.meta ?? observed,
+      store, recheck, budget: options.budget });
   }
   // One cleanup job shared with legacy stop. Admission belongs to each entry;
   // the first caller's guard and immutable target proof belong to the job.
@@ -1654,6 +1955,7 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     };
     callerGuard();
     const r = runs.get(runId); check(r, 'RECHECK_RUN_NOT_LOADED');
+    check(!r.deferredHistory, 'PROJECT_HISTORY_UNCONFIRMED');
     check(r.meta.mode === 'project-worker' && r.meta.projectId === projectId && r.meta.workerId === workerId && r.meta.runId === runId, 'RECHECK_RUN_MISMATCH');
     check(!ACTIVE.has(r.meta.state), 'RECHECK_RUN_ACTIVE');
     check(['finished', 'failed', 'stopped', 'interrupted'].includes(r.meta.state), 'RECHECK_RUN_NOT_TERMINAL');
@@ -1676,7 +1978,13 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
   async function stopProjectWorker(projectId, runId, options = {}) {
     fields(options, ['force'], []); if (Object.hasOwn(options, 'force')) check(typeof options.force === 'boolean', 'INVALID_INPUT');
     const r = projectWorker(projectId, runId);
+    check(!r.deferredHistory, 'PROJECT_HISTORY_UNCONFIRMED');
+    if (options.force && coordinatorBusy(r)) r.gracefulRound = null;
     if (r.meta.executionPolicy && !options.force && ACTIVE.has(r.meta.state) && !r.meta.finalizing) {
+      const scope = r.roundScope;
+      if (r.meta.stopRequested !== true && inGracefulRound(r, scope)) {
+        r.gracefulRound = { scope, round: r.meta.round, normalBoundary: false };
+      }
       r.meta.stopRequested = true; r.wakeDelay?.();
       await bounded(persist(r));
       if (!r.roundScope) void terminate(r, 'stopped', failure('EXPLICIT_STOP'));
@@ -1698,7 +2006,7 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     return status;
   }
   async function setupStatus(runId, context) {
-    const r = owned(runId, context);
+    const r = await owned(runId, context);
     const roles = [];
     for (const role of ROLES) {
       try { roles.push(await bounded(roleToolStatus(r, role))); }
@@ -1720,8 +2028,9 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     return { runId, roles, capabilities, capabilityError, sessionEffect: 'new-session-required' };
   }
   async function setToolMode(runId, role, toolMode, context) {
-    const r = owned(runId, context);
+    const r = await owned(runId, context);
     check(ROLES.includes(role) && ROLE_TOOL_MODES.includes(toolMode), 'INVALID_INPUT');
+    if (deferHistoricalWork) await confirmGlobalResearchIdle();
     check(!disposed && !configuring, 'CONFIGURATION_BUSY');
     check(!active && !recoveryErrors.length && ![...runs.values()].some((item) => ACTIVE.has(item.meta.state)
       || candidatePending(item.meta) || item.meta.finalizing || item.meta.cleanupPending || item.meta.runtimeCleanupPending || item.meta.indeterminate || item.meta.pendingMutations.length
@@ -1745,7 +2054,11 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     } finally { configuring = false; }
   }
   async function stop(runId, context) {
-    const r = owned(runId, context);
+    // Close admission for a live run without yielding to a tool continuation.
+    let r = runs.get(runId);
+    if (r) assertResearchOwner(r.meta, context);
+    else r = await owned(runId, context);
+    check(!r.deferredHistory, 'PROJECT_HISTORY_UNCONFIRMED');
     return r.meta.executionPolicy ? stopProjectWorker(r.meta.projectId, runId) : stopRun(r);
   }
   async function stopRun(r) {
@@ -1755,7 +2068,9 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     return view(r);
   }
   async function result(runId, factId, context, options = {}) {
-    const r = owned(runId, context); check(!disposed, 'DISPOSED'); check(!configuring, 'CONFIGURATION_BUSY');
+    const r = await owned(runId, context); check(!disposed, 'DISPOSED'); check(!configuring, 'CONFIGURATION_BUSY');
+    check(!r.deferredHistory || priorJournalReadSettled(r.meta), 'RUN_UNSETTLED');
+    const naturalHistoryRead = r.deferredHistory && !priorJournalSettled(r.meta);
     check(!candidatePending(r.meta) && !r.meta.runtimeCleanupPending, 'RUN_UNSETTLED');
     const list = factId === undefined || factId === null;
     options = factPageOptions(options, { factId: list ? undefined : factId, projectId: r.meta.projectId ?? undefined, code: 'INVALID_INPUT' });
@@ -1793,6 +2108,9 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
       }
     }
     clearRuntimeCleanup(r);
+    // A successful read under the natural completion witness leaves the old
+    // journal and its diagnostics intact. New uncertainty uses the existing fence.
+    if (naturalHistoryRead && !primary && !cleanupError) return result;
     const cleanup = { confirmed: !cleanupError, error: cleanupError ? errorInfo(cleanupError) : null };
     r.meta.lastResultError = primary || cleanupError ? { primary: primaryInfo, cleanup } : null;
     try { await persist(r, { preserveRunError: true }); }
@@ -1940,9 +2258,9 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     } finally { r.operations.delete(job); }
   }
   async function dispose() {
-    disposed = true; nonces.clear();
+    disposed = true; nonces.clear(); dashboardTerminalObservers.clear(); workerSettlementObservers.clear();
     await Promise.all([...runs.values()].map(async (r) => {
-      const activeAtDispose = ACTIVE.has(r.meta.state); let runtimeChanged = false;
+      const activeAtDispose = !r.deferredHistory && ACTIVE.has(r.meta.state); let runtimeChanged = false;
       if (activeAtDispose) await terminate(r, 'stopped', failure('DISPOSED'));
       else if (r.finishing) await r.finishing;
       if (!activeAtDispose && r.core && !r.coreDisposed) {
@@ -1963,7 +2281,7 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     }));
     if (typeof sessions.dispose === 'function') {
       try { await bounded(sessions.dispose()); }
-      catch (e) { for (const r of runs.values()) { r.meta.cleanupPending = true; r.meta.cleanupErrors.push(errorInfo(e)); await persist(r); } }
+      catch (e) { for (const r of runs.values()) if (!r.deferredHistory) { r.meta.cleanupPending = true; r.meta.cleanupErrors.push(errorInfo(e)); await persist(r); } }
     }
     await Promise.all([...runs.values()].map((r) => bounded(r.writes)));
     if (typeof registration?.disposeAsync === 'function') await bounded(registration.disposeAsync());
@@ -1971,5 +2289,11 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
     else if (typeof registration?.dispose === 'function') await bounded(registration.dispose());
     return { cleanupPending: recoveryErrors.length > 0 || [...runs.values()].some((r) => r.meta.cleanupPending), recoveryErrors: copy(recoveryErrors), runs: [...runs.values()].map(view) };
   }
-  return Object.freeze({ run, status, setupStatus, setToolMode, result, stop, invoke, dispose, validateWorkerDispatch, isWorkerAdmissionRejection, startWorkerRun, projectWorkerStatus, projectWorkerDiagnostic, projectWorkerMonitor, projectDashboardWriteState, projectVerificationReads, projectWorkerRecheck, stopProjectWorker, recordSubmissionInputRejection });
+  return Object.freeze({ run, status, setupStatus, setToolMode, result, stop, invoke, dispose, confirmProjectAdmission, prepareProjectHistory, prepareProjectWorkerHistory, validateWorkerDispatch, isWorkerAdmissionRejection, startWorkerRun, projectWorkerStatus, projectWorkerDiagnostic, projectWorkerMonitor, projectDashboardWriteState, projectDashboardHistorySeal, projectDashboardHistoricalCleanup, projectVerificationReads, projectWorkerRecheck, stopProjectWorker, recordSubmissionInputRejection,
+    // Synchronous refusal-only shutdown witness; includes non-Project research.
+    dashboardShutdownIdle: () => !disposed && !dataRootFailed && !configuring && unconfirmedWorkers.size === 0
+      && [...runs.values()].every(r => !workerBusy(r) && !r.recoveryCheck && !r.persistenceFailed && !r.unsettledMutation
+        && !r.pending.size && !r.operations.size),
+    subscribeProjectDashboardTerminal: fn => subscribe(dashboardTerminalObservers, fn),
+    subscribeProjectWorkerSettlement: fn => subscribe(workerSettlementObservers, fn) });
 }

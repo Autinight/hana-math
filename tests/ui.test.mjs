@@ -343,6 +343,51 @@ test('uploaded image is only a draft until save and remains present after a fail
   f.view.destroy(); assert.equal(f.document.listenerCount(), 0);
 });
 
+test('only an early panel registration miss retries once; unknown errors remain visible', async () => {
+  for (const miss of [() => new Response('Not Found', { status: 404 }),
+    () => Response.json({ error: { code: 'MATH_BOOTSTRAP_PENDING' } }, { status: 503 })]) {
+    const f = environment(), timers = [], calls = [];
+    f.document.defaultView.setTimeout = (callback) => { timers.push(callback); return callback; };
+    f.document.defaultView.clearTimeout = (callback) => { timers.splice(timers.indexOf(callback), 1); };
+    const view = f.mount(f.root, { request: async (path, init) => {
+      calls.push([path, init.method]); return calls.length === 1 ? miss() : response(panel());
+    } });
+    await turn();
+    assert.deepEqual(calls, [['/panel', 'GET']]); assert.equal(timers.length, 1);
+    timers.shift()(); await view.ready;
+    assert.deepEqual(calls, [['/panel', 'GET'], ['/panel', 'GET']]);
+    assert.ok(f.root.querySelectorAll('.member-name').some(node => node.textContent === '主助手'));
+    assert.ok(f.root.querySelectorAll('.member-name').some(node => node.textContent === 'main'));
+    view.destroy();
+  }
+  for (const miss of [() => Response.json({ error: { code: 'MATH_BOOTSTRAP_UNAVAILABLE' } }, { status: 503 }),
+    () => Response.json({ error: { code: 'UNKNOWN' } }, { status: 503 }),
+    () => { throw Object.assign(Error('unknown transport failure'), { status: 404 }); },
+    () => Response.json({ assistants: { state: 'ready' }, roles: { state: 'ready' } })]) {
+    const f = environment(); let calls = 0;
+    f.document.defaultView.setTimeout = () => assert.fail('unknown or closed route must not retry');
+    const view = f.mount(f.root, { request: async () => { calls++; return miss(); } });
+    await view.ready; assert.equal(calls, 1);
+    assert.match(f.root.textContent, /暂时无法读取助手/); assert.doesNotMatch(f.root.textContent, /暂无可显示的助手/);
+    view.destroy();
+  }
+});
+
+test('panel registration retry neither repeats indefinitely nor survives unmount', async () => {
+  for (const destroy of [false, true]) {
+    const f = environment(), timers = new Set(); let calls = 0;
+    f.document.defaultView.setTimeout = callback => { timers.add(callback); return callback; };
+    f.document.defaultView.clearTimeout = callback => timers.delete(callback);
+    const view = f.mount(f.root, { request: async () => { calls++; return new Response('Not Found', { status: 404 }); } });
+    await turn(); assert.equal(timers.size, 1);
+    if (destroy) view.destroy();
+    else { const [retry] = timers; timers.delete(retry); retry(); }
+    await view.ready;
+    assert.equal(calls, destroy ? 1 : 2); assert.equal(timers.size, 0);
+    if (!destroy) { assert.match(f.root.textContent, /暂时无法读取助手/); view.destroy(); }
+  }
+});
+
 test('empty and failed panels stay distinct; failed editor GET never exposes save or creates an Agent', async () => {
   for (const [payload, expected] of [
     [{ assistants: { state: 'ready', items: [] }, roles: { state: 'ready', items: [] } }, '暂无可显示的助手'],

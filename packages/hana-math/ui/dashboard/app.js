@@ -372,7 +372,8 @@ function clearFactDetail() {
 }
 const workspaceTabs = new Set(['overview', 'graph', 'memory']);
 const canonicalFactId = value => typeof value === 'string' && value.length === 16 && /^[0-9a-f]{16}$/.test(value);
-const sameWorkspaceScope = (a, b) => !!a && a.state === b.state && a.projectId === b.projectId && a.generation === b.generation;
+const sameWorkspaceScope = (a, b) => !!a && a.state === b.state && a.projectId === b.projectId && a.generation === b.generation
+  && (a.state !== 'saved' || a.asOf === b.asOf);
 const graphLayout = d => JSON.stringify([d.max_depth, d.nodes.map(n => [n.id, n.depth, n.author]), d.edges.map(e => [e.source, e.target])]);
 const factDetail = f => JSON.stringify([f.author, f.problem_id, f.statement, f.proof, f.intuition, f.predecessors]);
 const entryContent = e => JSON.stringify([e.author, e.verdict, e.fact_id, e.cost_usd, e.status, e.timestamp_utc, e.claim, e.evidence]);
@@ -484,6 +485,7 @@ export function mountWorkspaceDashboard(onSelect) {
     if (tab === 'graph') workspaceGraph(binding, data);
     if (tab === 'memory') workspaceMemory(binding, data, channel, entries, changes);
     if (snapshot) $('#refresh-note').textContent = `结束时间 ${new Date(scope.endedAt).toISOString()}`;
+    else if (scope.state === 'saved') $('#refresh-note').textContent = `读取基准时间 ${new Date(scope.asOf).toISOString()}`;
     connError(false);
   }, graphValidated(scope, data) {
     const target = binding;

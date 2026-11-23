@@ -2,7 +2,7 @@
 // Task completion is resource accounting, never a mathematical verdict.
 import { randomUUID, createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
-import { runtimeFailureInfo, runtimeManagedIpcRefusal, takeProjectReadScratch, projectReadScratchOptions, projectDashboardFactgraphOptions,
+import { runtimeFailureInfo, runtimeManagedIpcRefusal, takeProjectReadScratch, takeDashboardBusyFrame, projectReadScratchOptions, projectDashboardFactgraphOptions,
   projectDashboardMemoryOptions, projectDashboardViewOptions, validProjectDashboardMemorySelection,
   validProjectDashboardReadArguments } from './runtime/research-runtime.mjs';
 import { GRAPH_FACT_LIMIT, GRAPH_EDGE_LIMIT } from './project-graph.mjs';
@@ -19,6 +19,15 @@ export function acceptDashboardViewRead(access, value) {
   const proof = settledReadScratch.get(value);
   if (!proof || proof.access !== access || !proof.view) return false;
   settledReadScratch.delete(value);
+  return proof.release() === true;
+}
+// Unlike successful readbacks, these receipts carry no value. Only this exact
+// durably failed operation can rearm the frame for a later authorized call.
+const settledDashboardBusy = new WeakMap();
+export function acceptDashboardViewBusy(access, error) {
+  const proof = settledDashboardBusy.get(error);
+  if (!proof || proof.access !== access) return false;
+  settledDashboardBusy.delete(error);
   return proof.release() === true;
 }
 const reportedIpcRefusals = new WeakMap();
@@ -161,7 +170,7 @@ export function createProjectCoreAccess(sdk, { projectId, author, createCore, on
     const revision = s.meta.revision, packet = copyOperation(s.meta.operation, s.meta, 2 * MAX_JSON);
     const job = Promise.resolve().then(() => onState(packet)).then((receipt) => {
       check(receipt !== false && receipt?.ok !== false && !receipt?.error, 'PROJECT_CORE_PERSISTENCE_FAILED'); s.persisted = revision; s.persistenceError = null;
-    }).catch((cause) => { s.persistenceError = diagnostic(cause, 'PROJECT_CORE_PERSISTENCE_FAILED'); throw fail('PROJECT_CORE_PERSISTENCE_FAILED', cause); });
+    }).catch((cause) => { s.persistenceFailedOnce = true; s.persistenceError = diagnostic(cause, 'PROJECT_CORE_PERSISTENCE_FAILED'); throw fail('PROJECT_CORE_PERSISTENCE_FAILED', cause); });
     s.writing = job;
     job.finally(() => { if (s.writing === job) s.writing = null; }).catch(() => {});
     return job;
@@ -320,7 +329,7 @@ export function createProjectCoreAccess(sdk, { projectId, author, createCore, on
       pending: new Set(), persisted: -1, writing: null, controller: new AbortController(), interrupted: new Promise((resolve) => { halt = resolve; }),
       deadlineAt: Date.now() + CALL_MS, halt: () => halt(), cancelled: false, executing: true, core: null };
     active = last = s;
-    let primary, coreAttempt, rawValue, transientValue;
+    let primary, coreAttempt, rawValue, transientValue, failedWhileLive = false;
     try {
       s.meta.taskCreation = 'pending'; update(s, 'creating'); await step(s, () => publish(s));
       await step(s, () => {
@@ -374,6 +383,9 @@ export function createProjectCoreAccess(sdk, { projectId, author, createCore, on
       }, CALL_MS);
     } catch (cause) {
       primary = cause;
+      // Latch before cancel() seals the failed call for normal cleanup. A
+      // timeout, disposal or guard failure is not the Core's busy receipt.
+      failedWhileLive = !!viewGuard && !disposed && !s.cancelled && !s.meta.error && cause === s.coreError;
       if (!s.meta.error) {
         const summary = s.meta.error = diagnostic(cause, 'PROJECT_CORE_CALL_FAILED');
         if (summary.code === 'RESEARCH_RUNTIME_CAPACITY' && cause === s.coreError) {
@@ -394,7 +406,13 @@ export function createProjectCoreAccess(sdk, { projectId, author, createCore, on
       }
       return value;
     }
-    throw reported(s, primary || fail(disposed ? 'PROJECT_CORE_DISPOSED' : 'PROJECT_CORE_CLEANUP_FAILED'));
+    const error = reported(s, primary || fail(disposed ? 'PROJECT_CORE_DISPOSED' : 'PROJECT_CORE_CLEANUP_FAILED'));
+    if (failedWhileLive && !disposed && !s.persistenceFailedOnce && !unresolved(s) && s.meta.outcome.state === 'failed'
+      && s.meta.taskStatus === 'failed' && s.meta.settlement.expected === 'failed' && s.meta.settlement.confirmed && s.meta.cleanup.confirmed) {
+      const release = takeDashboardBusyFrame(s.core, coreAttempt, operation, primary);
+      if (release) settledDashboardBusy.set(error, { access, release });
+    }
+    throw error;
   }
   async function dispose() {
     disposed = true;

@@ -3,7 +3,7 @@
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { types } from 'node:util';
 import { createContextStore, contextId } from './context-service.mjs';
-import { createProjectCoreAccess, normalizeProjectCoreArguments, projectCoreManagedIpcRefusal, releaseValidatedProjectRead, acceptDashboardViewRead } from './project-core-access.mjs';
+import { createProjectCoreAccess, normalizeProjectCoreArguments, projectCoreManagedIpcRefusal, releaseValidatedProjectRead, acceptDashboardViewRead, acceptDashboardViewBusy } from './project-core-access.mjs';
 import { createProjectMainSession } from './project-main-session.mjs';
 import * as projectMainSession from './project-main-session.mjs';
 import { createMainControlService } from './main-control-service.mjs';
@@ -14,7 +14,7 @@ import { NATIVE_LITERATURE_GUIDANCE } from './native-literature.mjs';
 import { nativeExplorationGuidance } from './native-exploration.mjs';
 import { verificationReadBudget } from './verification-read-audit.mjs';
 import { factPageOptions, validateFactPage, FACT_PAGE_GUIDANCE, isCanonicalFact } from './fact-page.mjs';
-import { readManagedIpcUsage, runtimeRejectionInfo, validProjectDashboardMemorySelection } from './runtime/research-runtime.mjs';
+import { readManagedIpcUsage, runtimeRejectionInfo, supportsManagedDashboardReads, validProjectDashboardMemorySelection } from './runtime/research-runtime.mjs';
 import { DEFAULT_LANGUAGE, LANGUAGE } from './human-summary.mjs';
 import { createProjectReportService } from './project-report-service.mjs';
 import { snapshotPaperRevisionRequest } from './paper-revision-input.mjs';
@@ -29,8 +29,11 @@ import { snapshotPaperSectionRequest, snapshotPaperStitchRequest } from './paper
 import { paperSkeleton, normalizePaperSelection, capturePaperMaterial } from './paper-source.mjs';
 import { operatorFields, updateOperatorAnswers, renderOperatorProfile } from './operator-interview.mjs';
 import { observeProjectLifecycle, observeProjectSnapshot, createWorkspaceMonitorSelection, createWorkspaceDashboardSelection } from './dashboard-monitor-selection.mjs';
-import { createWorkspaceDashboard } from './dashboard-monitor-transport.mjs';
+import { createWorkspaceDashboard, workspaceProjectBusy } from './dashboard-monitor-transport.mjs';
 import { createTerminalReadFence, terminalWriteState } from './terminal-dashboard-read.mjs';
+import { createWorkspaceSnapshotArchive } from './workspace-snapshot-archive.mjs';
+import { createWorkspaceFollowConsent, workspaceFollowBinding } from './workspace-follow-consent.mjs';
+import { createSnapshotPublisher, withPublishedWorkspaceDashboard } from './workspace-snapshot-publication.mjs';
 
 // One queue per App data directory, shared by profile updates and creation snapshots.
 const operatorQueues = new Map();
@@ -116,17 +119,26 @@ function jobUnsettled(value) {
     || value.finalizing !== false || value.coreTaskCreatePending !== false || value.coreTaskSettlementPending !== false || value.recoveryUnsettled === true;
 }
 
-export async function createProjectService(sdk, { contexts, profiles, research, createCore, literature, createMainSession = createProjectMainSession, summaryWriter } = {}) {
+export async function createProjectService(sdk, { contexts, profiles, research, createCore, literature, createMainSession = createProjectMainSession, summaryWriter, deferHistoricalWork = false } = {}) {
   check(contexts?.prepare && contexts?.prepareProjectWorkspace && contexts?.assignWorkerTask && profiles && research?.startWorkerRun
     && research?.projectWorkerStatus && research?.stopProjectWorker && typeof createCore === 'function' && literature?.search
     && typeof createMainSession === 'function', 'PROJECT_DEPENDENCY_MISSING');
   const { dataDir } = sdk;
   const store = createContextStore(dataDir), projects = new Map(), damaged = new Set();
-  let disposed = false, disposeScopeObservation = false;
+  let closing = false, disposed = false, disposal, disposeComplete = false, disposeScopeObservation = false;
+  let drainingPublication = false, goalActions = 0;
+  const publicationGuards = new WeakSet();
   let monitorActivation = 0;
   const nextMonitorActivation = () => ++monitorActivation;
   const monitorWorkerStarts = new WeakMap();
+  // Process-specific ownership. Restoring a Project journal never makes this
+  // instance the owner of its setup task or of its previous worker's stop.
+  const freshProjects = new WeakSet(), workerRunsStartedHere = new WeakMap();
   const dashboardSetupProofs = new WeakMap(), workspaceDashboardGrants = new WeakMap();
+  let savedFollowChoice = null, savedFollowReader = null; // nomination is not a live grant or a terminal archive
+  const archive = createWorkspaceSnapshotArchive(store);
+  let archiveHealthy = true, publisher, offTerminal, offWorkerSettlement;
+  try { await archive.load(); } catch { archiveHealthy = false; } // A damaged publication cannot prevent Research startup.
   const workspaceCoreWrites = new WeakMap(); // only App-managed shared mutations, not reads / polling
   // Only a confirmed create receipt in this process can own cancellation.
   // Restoring project metadata never restores a setup abort permit.
@@ -147,11 +159,36 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     coreQueue: [], coreWaiting: new Set(), coreDraining: false,
     control: false, coreBusy: false, persistenceFailed: false, coreBlocked: false, jobs: new Set(), scheduleCleanups: new Map(), nonce: null, setup: null, setupPermit: false,
     targets: new Map(), targetWrites: Promise.resolve(), targetControl: Promise.resolve() });
-  function save(p) {
-    p.meta.revision++; const packet = json(p.meta);
-    const writing = p.writes.catch(() => {}).then(() => store.write(location(p), packet, true));
-    p.writes = writing; writing.catch(() => { p.persistenceFailed = true; }); return writing;
+  function save(p, followUpdate, followGuard, followRecheck) {
+    p.meta.revision++;
+    const { workspaceFollow: _consent, ...snapshot } = p.meta, packet = json(snapshot);
+    let admissionRefused = false;
+    const guard = () => {
+      try { followGuard(); } catch (error) { admissionRefused = true; throw error; }
+    };
+    const recheck = async () => {
+      try { await followRecheck(); } catch (error) { admissionRefused = true; throw error; }
+    };
+    const writing = p.writes.catch(() => {}).then(async () => {
+      // Snapshot regular metadata on admission, but select the confirmed policy
+      // at the serialized write. Other saves neither copy a failed opt-in nor
+      // overwrite an opt-in/revocation that settled ahead of them.
+      if (followUpdate) guard();
+      const follow = followUpdate ?? p.meta.workspaceFollow;
+      const state = follow === undefined ? packet : `${packet.slice(0, -2)},"workspaceFollow":${JSON.stringify(follow)}}\n`;
+      check(Buffer.byteLength(state) - 1 <= 2 * 1024 * 1024, 'PROJECT_RECORD_TOO_LARGE');
+      if (followUpdate) {
+        await store.writeGuarded(location(p), state, { guard, recheck });
+        p.meta.workspaceFollow = followUpdate;
+      } else await store.write(location(p), state, true);
+    });
+    p.writes = writing; writing.catch(() => { if (!admissionRefused) p.persistenceFailed = true; }); return writing;
   }
+  const followConsent = createWorkspaceFollowConsent({
+    binding: (p, enabled) => workspaceFollowBinding(p.meta, enabled ? DASHBOARD_MAIN_IDENTITY : []), authorize: authorizeDashboardFollow, save,
+    changed: (p, enabled) => followPolicyChanged(p, enabled),
+  });
+  const getFollowState = followConsent.getState, getFollowStamp = followConsent.getStamp, getFollowArchiveStamp = followConsent.getArchiveStamp;
   function track(p, job) { p.jobs.add(job); job.finally(() => p.jobs.delete(job)).catch(() => {}); return job; }
   function targetExclusive(p, action) {
     const job = p.targetControl.catch(() => {}).then(action);
@@ -179,9 +216,13 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     }));
     return cleanup.promise;
   }
-  function live(p) { check(!disposed, 'PROJECT_DISPOSED'); check(!p.persistenceFailed, 'PROJECT_PERSISTENCE_FAILED'); }
-  function ready(p) { live(p); check(p.meta.state === 'ready' && p.meta.main?.state === 'ready' && p.meta.main.identityConfirmed === true, 'PROJECT_NOT_READY'); }
-  function coreGate(p) { check(!p.coreBlocked && ![...p.records.values()].some(coreUnsettled) && !p.core?.snapshot().pending, 'PROJECT_CORE_UNSETTLED'); }
+  function openForBusiness() { check(!closing, 'PROJECT_DISPOSED'); }
+  function live(p, publication = false) {
+    if (!(publication && drainingPublication && !disposed)) openForBusiness();
+    check(!p.persistenceFailed, 'PROJECT_PERSISTENCE_FAILED');
+  }
+  function ready(p, publication = false) { live(p, publication); check(p.meta.state === 'ready' && p.meta.main?.state === 'ready' && p.meta.main.identityConfirmed === true, 'PROJECT_NOT_READY'); }
+  function coreGate(p) { check(!p.detailsDeferred && !p.coreBlocked && ![...p.records.values()].some(coreUnsettled) && !p.core?.snapshot().pending, 'PROJECT_CORE_UNSETTLED'); }
   function get(id) { contextId(id); check(!damaged.has(id), 'PROJECT_RECORD_INVALID'); const p = projects.get(id); check(p, 'PROJECT_NOT_FOUND'); return p; }
   function assignmentProjection(value) {
     const unavailable = history => ({ available: false, history, coverage: history, recordingComplete: false });
@@ -220,7 +261,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       } : null,
       assignmentHistory,
       targets: [...p.targets.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, target]) => target),
-      coreUnsettled: p.coreBlocked || [...p.records.values()].some(coreUnsettled) || !!p.core?.snapshot().pending,
+      coreUnsettled: !!p.detailsDeferred || p.coreBlocked || [...p.records.values()].some(coreUnsettled) || !!p.core?.snapshot().pending,
       coreOperations: [...p.records.values()].map(r => ({ operationId: r.operationId, revision: r.revision, operation: r.operation,
         pending: r.pending, outcome: r.outcome?.state, indeterminate: mathematicalUnsettled(r) || r.outcome?.failure?.runtime?.indeterminate === true, mathematicalUnsettled: mathematicalUnsettled(r) })),
       ...(policy ? { workerPolicy: policy } : {}), workerBridge: policy ? 'configured-research-rounds' : 'bounded-three-mathematical-rounds', theoremEstablished: false });
@@ -237,7 +278,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
   }
   function orderedOperator(action) {
     const next = (operatorQueues.get(dataDir) ?? Promise.resolve()).catch(() => {}).then(() => {
-      check(!disposed, 'PROJECT_DISPOSED'); return action();
+      openForBusiness(); return action();
     });
     operatorQueues.set(dataDir, next);
     next.finally(() => { if (operatorQueues.get(dataDir) === next) operatorQueues.delete(dataDir); }).catch(() => {});
@@ -264,14 +305,14 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     // Use the Host-injected invocation and its exact path only to exclude
     // App-owned roles. Invalid or unavailable ownership listings deny access.
     const own = await ownSessions();
-    check(!disposed && !own.some(row => row.path === sessionPath), 'PROJECT_OPERATOR_DENIED');
+    check(!closing && !own.some(row => row.path === sessionPath), 'PROJECT_OPERATOR_DENIED');
   }
   async function operatorRead(ctx) {
     const sessionPath = operatorSessionPath(ctx);
     return orderedOperator(async () => {
       await assertExternalOperator(sessionPath);
       const answers = await readOperatorAnswers();
-      check(!disposed, 'PROJECT_DISPOSED');
+      openForBusiness();
       return operatorView(answers);
     });
   }
@@ -288,14 +329,16 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     return orderedOperator(async () => {
       await assertExternalOperator(sessionPath);
       const next = updateOperatorAnswers(await readOperatorAnswers(), updates);
-      check(!disposed, 'PROJECT_DISPOSED');
+      openForBusiness();
       try { await store.write(OPERATOR_PATH, json({ schemaVersion: 1, answers: next }), true); }
       catch { throw failure('PROJECT_OPERATOR_PROFILE_UNAVAILABLE'); }
       return operatorView(next);
     });
   }
-  async function authorize(p, ctx, mainOnly = false, assertAdmission = () => {}, { readOnly = false } = {}) {
+  async function authorize(p, ctx, mainOnly = false, admission = () => {}, { readOnly = false, finalStatus = false } = {}) {
     invocation(ctx);
+    const assertAdmission = () => { admission(); if (!(readOnly && finalStatus && disposeComplete)) openForBusiness(); };
+    assertAdmission();
     // Read-only evidence cannot authorize against an in-place changed binding.
     // Capture scalar values before even the initial asynchronous own-session list.
     const captured = readOnly ? p.meta.main : null, projectState = p.meta.state;
@@ -325,6 +368,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
         // locator; reading evidence neither migrates it in memory nor saves it.
       }
       if (!readOnly && binding.sessionPath !== info.path) { binding.sessionPath = info.path; await save(p); assertAdmission(); }
+      if (p.detailsDeferred && !finalStatus) { await ensureProjectDetails(p); assertAdmission(); }
       return 'main';
     }
     // Like legacy owner checks, this uses the Host-stamped creator locator and
@@ -332,6 +376,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     check(!mainOnly && !p.meta.creatorRejected && typeof p.meta.creator?.sessionId === 'string' && p.meta.creator.sessionId
       && p.meta.creator.sessionPath === ctx.sessionPath
       && !own.some(row => row.path === ctx.sessionPath || row.sessionId === p.meta.creator.sessionId), 'PROJECT_OWNER_DENIED');
+    if (p.detailsDeferred && !finalStatus) { await ensureProjectDetails(p); assertAdmission(); }
     return 'creator';
   }
   async function boundMain(ctx, { readOnly = false } = {}) {
@@ -365,12 +410,12 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     check(status?.mode === 'project-worker' && status.projectId === p.meta.projectId && status.workerId === worker.workerId && status.runId === runId,
       'PROJECT_WORKER_MISMATCH'); return copy(status);
   }
-  async function refreshWorker(p, worker, stop = false, { force = worker.stopForce === true } = {}) {
+  async function refreshWorker(p, worker, stop = false, { force = worker.stopForce === true, guard } = {}) {
     if (['pending', 'unknown'].includes(worker.start.state) && !worker.start.runId) return null;
     if (!worker.lastRun) return null;
     const runId = worker.lastRun;
     const status = jobStatus(p, worker, await bounded(stop ? research.stopProjectWorker(p.meta.projectId, runId, { force }) : research.projectWorkerStatus(p.meta.projectId, runId)), runId);
-    worker.status = status;
+    guard?.(); worker.status = status;
     if (!jobUnsettled(status)) worker.start.state = 'settled';
     await save(p); return status;
   }
@@ -476,7 +521,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     // New projects always use Danus research rounds; omission means the Danus defaults. Projects persisted
     // without workerPolicy keep their recorded legacy bridge and are never upgraded.
     const workerPolicy = normalizeResearchWorkerPolicy(Object.hasOwn(input, 'workerPolicy') ? input.workerPolicy : {});
-    invocation(ctx); check(!disposed, 'PROJECT_DISPOSED');
+    invocation(ctx); openForBusiness();
     const ownBefore = await ownSessions();
     check(!ownBefore.some(row => row.path === ctx.sessionPath), 'PROJECT_CREATOR_DENIED');
     const projectId = `project-${randomUUID()}`;
@@ -487,7 +532,9 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       worker: blank(WORKER), ...(workers > 1 ? { extraWorkers: Array.from({ length: workers - 1 }, (_, i) => blank(`worker-${i + 2}`)) } : {}) });
     projects.set(projectId, p);
     try {
-      await store.mkdir(`${BASE}/${projectId}`, true); await store.write(location(p, 'input.json'), json(input)); await save(p);
+      await store.mkdir(`${BASE}/${projectId}`, true); // exclusive creation, not a lookup of an older project
+      freshProjects.add(p);
+      await store.write(location(p, 'input.json'), json(input)); await save(p);
       p.meta.taskCreation = 'pending'; await save(p);
       const creating = track(p, Promise.resolve().then(() => {
         live(p); return sdk.tasks.create({ scope: 'session', callToken: ctx.callToken, delivery: 'next-step', handlerKey: HANDLER,
@@ -498,13 +545,13 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
           && task.parentSessionPath === ctx.sessionPath, 'PROJECT_CREATOR_UNCONFIRMED');
         p.meta.creator = { sessionId: task.parentSessionId, sessionPath: task.parentSessionPath };
         p.meta.taskId = task.taskId; p.meta.taskCreation = 'confirmed';
-        if (!disposed && p.meta.state === 'queued') setupAbortOwners.set(task.taskId, { project: p, checking: null });
+        if (!closing && p.meta.state === 'queued') setupAbortOwners.set(task.taskId, { project: p, checking: null });
         await save(p);
         const ownAfter = await ownSessions();
         if ([...ownBefore, ...ownAfter].some(row => row.path === ctx.sessionPath || row.sessionId === task.parentSessionId)) {
           p.meta.creatorRejected = true; await save(p); throw failure('PROJECT_CREATOR_DENIED');
         }
-        if (disposed || p.meta.state !== 'queued') await settle(p, false);
+        if (closing || p.meta.state !== 'queued') await settle(p, false);
         return task;
       }));
       const creatorReceipt = await bounded(creating); live(p); check(p.meta.state === 'queued', 'PROJECT_SETUP_INTERRUPTED');
@@ -527,7 +574,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
         check(schedule?.pluginId === APP && schedule.scope === 'app' && schedule.handlerKey === HANDLER && typeof schedule.scheduleId === 'string' && schedule.scheduleId.length > 0, 'PROJECT_SCHEDULE_UNCONFIRMED');
         // A handler may already have removed it before schedule() acknowledged.
         if (!p.scheduleCleanups.get(schedule.scheduleId)?.removed) { p.meta.scheduleId = schedule.scheduleId; await save(p); }
-        if (disposed || p.setup || p.meta.state !== 'queued') await bounded(unschedule(p, schedule.scheduleId));
+        if (closing || p.setup || p.meta.state !== 'queued') await bounded(unschedule(p, schedule.scheduleId));
         return schedule;
       }));
       await bounded(scheduling); live(p); return { state: 'queued', projectId, taskId: p.meta.taskId };
@@ -543,17 +590,54 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       throw Object.assign(error, { projectId, taskId: p.meta.taskId });
     }
   }
+  const waitingForPublication = new WeakSet(), workerStopVersion = new WeakMap();
+  function priorPublication(p, worker, ctx, assertAdmission) {
+    const prior = publisher?.waitForProject(p.meta.projectId);
+    if (!prior) return null;
+    // Wait only for this Project's existing background read. Never wait out an
+    // unrelated Core operation, blocked persistence, or historic unsettled record.
+    const active = p.coreBusy && dashboardViewAdmissions.get(p.coreSlot?.creatorAdmission)?.publication === true
+      ? p.core?.snapshot().current : null;
+    if (!active || p.coreBlocked || [...p.records.values()].some(record => record.operationId !== active.operationId && coreUnsettled(record))) coreGate(p);
+    const stopVersion = workerStopVersion.get(worker);
+    let waiting = true;
+    const recheck = () => {
+      check(waiting, 'PROJECT_CONTROL_TIMEOUT');
+      assertAdmission(); ready(p);
+      check(workerStopVersion.get(worker) === stopVersion, 'PROJECT_WORKER_UNSETTLED');
+    };
+    waitingForPublication.add(p); // Existing captures can finish, new ones cannot join this wait.
+    return bounded(prior.then(async () => {
+      recheck(); await authorize(p, ctx, true, recheck, { readOnly: true }); recheck();
+    })).finally(() => { waiting = false; waitingForPublication.delete(p); });
+  }
+  function historicalRunRefs(p) {
+    return workersOf(p.meta).flatMap(w => w.runs.map(runId => ({workerId:w.workerId, runId})));
+  }
+  async function prepareWorkerAdmission(p, guard) {
+    if (!deferHistoricalWork) return;
+    const fresh = freshProjects.has(p);
+    const checkScope = () => { live(p); guard(); check(projects.get(p.meta.projectId) === p, 'PROJECT_HISTORY_UNCONFIRMED'); return true; };
+    checkScope();
+    await research.confirmProjectAdmission(p.meta.projectId, historicalRunRefs(p), checkScope, {fresh});
+    checkScope();
+  }
   async function assign(args, ctx) {
     fields(args, ['task', 'workerId', 'model', 'thinkingLevel', 'displayTitle'], ['task']); text(args.task); workerOf(args);
     const hasDisplayTitle = Object.hasOwn(args, 'displayTitle');
     check(!hasDisplayTitle || typeof args.displayTitle === 'string', 'PROJECT_INVALID_INPUT');
     const displayTitle = hasDisplayTitle ? workerDisplayTitle(args.displayTitle) : undefined;
     const p = await boundMain(ctx); live(p); const worker = workerFor(p, args), workerId = worker.workerId, multi = workersOf(p.meta).length > 1;
+    if (deferHistoricalWork) { await goals.prepareProject(p.meta.projectId); live(p); }
     const ticket = goals.admit(p.meta.projectId);
     let admissionError;
     const assertAdmission = () => { try { return goals.assertAdmission(ticket); } catch (error) { admissionError = error; throw error; } };
     return control(p, async () => {
+      assertAdmission();
+      const publication = priorPublication(p, worker, ctx, assertAdmission);
+      if (publication) await publication;
       assertAdmission(); coreGate(p);
+      await prepareWorkerAdmission(p, assertAdmission); assertAdmission(); coreGate(p);
       const requested = Object.fromEntries(['model', 'thinkingLevel'].filter(key => Object.hasOwn(args, key)).map(key => [key, args[key]]));
       const explicit = Object.keys(requested).length > 0;
       let dispatch;
@@ -594,10 +678,15 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     fields(args, ['projectId', 'workerId', 'timeoutSeconds', 'model', 'thinkingLevel'], ['projectId']); workerOf(args);
     if (args.timeoutSeconds !== undefined) check(Number.isInteger(args.timeoutSeconds) && args.timeoutSeconds >= 60 && args.timeoutSeconds <= 900, 'INVALID_TIMEOUT');
     const p = get(args.projectId); await authorize(p, ctx, true); live(p); const worker = workerFor(p, args);
+    if (deferHistoricalWork) { await goals.prepareProject(p.meta.projectId); live(p); }
     const ticket = goals.admit(p.meta.projectId); let admissionError;
     const assertAdmission = () => { try { return goals.assertAdmission(ticket); } catch (error) { admissionError = error; throw error; } };
     return control(p, async () => {
+      assertAdmission();
+      const publication = priorPublication(p, worker, ctx, assertAdmission);
+      if (publication) await publication;
       assertAdmission(); coreGate(p); check(worker.assignment.state === 'assigned', 'PROJECT_TASK_UNASSIGNED');
+      await prepareWorkerAdmission(p, assertAdmission); assertAdmission(); coreGate(p);
       const displayTitle = workerDisplayTitle(worker.assignment.displayTitle);
       const previous = await refreshWorker(p, worker); assertAdmission();
       check(!['pending', 'unknown'].includes(worker.start.state) && (!previous || !jobUnsettled(previous)), 'PROJECT_WORKER_UNSETTLED');
@@ -620,14 +709,22 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
           catch (error) { backendRejection = error; throw error; }
         }).then(async result => {
           contextId(result?.runId); jobStatus(p, worker, result, result.runId);
+          workerRunsStartedHere.set(worker, result.runId);
           worker.lastRun = result.runId; if (!worker.runs.includes(result.runId)) worker.runs.push(result.runId);
           worker.start.runId = result.runId; worker.status = copy(result); await save(p);
-          if (disposed || worker.stopRequested) return await refreshWorker(p, worker, true, disposed ? { force: true } : undefined);
+          if (closing || worker.stopRequested) return await refreshWorker(p, worker, true, closing ? { force: true } : undefined);
           return result;
         }));
         const result = await bounded(job); worker.start = { state: jobUnsettled(result) ? 'started' : 'settled', runId: result.runId }; await save(p);
-        if (!disposed && !worker.stopRequested && worker.start.runId === result.runId && goals.monitorLifecycle(p.meta.projectId) === null) {
-          monitorWorkerStarts.set(worker, { runId: result.runId, order: nextMonitorActivation() });
+        if (!closing && worker.start.runId === result.runId && admissionCanFollow(p, worker, result.runId)) {
+          const goal = goals.monitorLifecycle(p.meta.projectId);
+          if (goal === null) monitorWorkerStarts.set(worker, { runId: result.runId, order: nextMonitorActivation() });
+          // A main/worker admission can activate existing explicit consent; it cannot create consent.
+          // In particular a project row from a previous version is not a grant.
+          if ((goal === null || goal?.state === 'active') && getFollowState(p) === 'enabled' && !lookupWorkspaceGrant(p)) {
+            await renewFollowAfterStart(p, worker, result.runId, goal?.activation?.order ?? null);
+          }
+          if (goal === null) publisher?.notify(p.meta.projectId); // A very short run can settle before admission returns.
         }
         return copy(result);
       } catch (error) {
@@ -637,12 +734,12 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
           worker.stopRequested = worker.stopRequested || priorStopRequested || false;
           worker.stopForce = worker.stopForce || priorStopForce || false;
           await save(p);
-          if (worker.lastRun && (disposed || worker.stopRequested)) await refreshWorker(p, worker, true, disposed ? { force: true } : undefined).catch(() => {});
+          if (worker.lastRun && (closing || worker.stopRequested)) await refreshWorker(p, worker, true, closing ? { force: true } : undefined).catch(() => {});
           throw error;
         }
         if (typeof error.runId === 'string') { contextId(error.runId); worker.lastRun = error.runId; worker.start.runId = error.runId; if (!worker.runs.includes(error.runId)) worker.runs.push(error.runId); }
         worker.start.state = 'unknown'; worker.start.error = code(error); await save(p).catch(() => {});
-        if (worker.start.runId && (disposed || worker.stopRequested)) await refreshWorker(p, worker, true, disposed ? { force: true } : undefined).catch(() => {});
+        if (worker.start.runId && (closing || worker.stopRequested)) await refreshWorker(p, worker, true, closing ? { force: true } : undefined).catch(() => {});
         throw error;
       }
     });
@@ -651,7 +748,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     fields(args, ['projectId', 'runId', 'submissionId']);
     const ids = Object.fromEntries(['projectId', 'runId', 'submissionId'].map(key => [key, contextId(args[key])]));
     const p = get(ids.projectId), budget = verificationReadBudget();
-    const guard = () => { budget.guard(); check(!disposed, 'PROJECT_DISPOSED'); check(get(ids.projectId) === p, 'PROJECT_NOT_FOUND'); };
+    const guard = () => { budget.guard(); openForBusiness(); check(get(ids.projectId) === p, 'PROJECT_NOT_FOUND'); };
     await budget.step(() => authorize(p, ctx, false, guard, { readOnly: true }));
     let workerId;
     const membership = () => {
@@ -678,7 +775,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     const creatorId = creator?.sessionId, creatorPath = creator?.sessionPath, rejected = meta.creatorRejected, callerPath = ctx?.sessionPath;
     let worker, members;
     const guard = () => {
-      check(!disposed, 'PROJECT_DISPOSED');
+      openForBusiness();
       check(projects.get(ids.projectId) === p && p.meta === meta && meta.projectId === ids.projectId
         && meta.creator === creator && creator?.sessionId === creatorId && creator?.sessionPath === creatorPath
         && meta.creatorRejected === rejected && ctx?.sessionPath === callerPath, 'PROJECT_RECHECK_CHANGED');
@@ -717,8 +814,19 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     return usage;
   }
   async function status(projectId, ctx) {
-    const p = get(projectId); await authorize(p, ctx);
-    for (const worker of workersOf(p.meta)) { try { await refreshWorker(p, worker); } catch (error) { worker.statusError = code(error); } }
+    const p = get(projectId);
+    if (disposeComplete) {
+      // Preserve the closed service's authorized cleanup observation without
+      // admitting live work, refreshing runs, or changing ownership records.
+      await authorize(p, ctx, false, undefined, { readOnly: true, finalStatus: true });
+      return view(p);
+    }
+    await authorize(p, ctx); openForBusiness();
+    for (const worker of workersOf(p.meta)) {
+      try { await refreshWorker(p, worker, false, { guard: openForBusiness }); }
+      catch (error) { openForBusiness(); worker.statusError = code(error); }
+      openForBusiness();
+    }
     return view(p);
   }
   // Same all-worker set used by stop/complete; no Host reads or record writes.
@@ -726,7 +834,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     const p = get(projectId), meta = p.meta, workers = workersOf(meta);
     const stamp = () => json({ meta: p.meta, control: p.control, jobs: p.jobs.size, failed: p.persistenceFailed });
     const before = stamp();
-    check(!disposed && p.meta.projectId === projectId && workers.length >= 1 && workers.length <= MAX_WORKERS
+    check(!closing && p.meta.projectId === projectId && workers.length >= 1 && workers.length <= MAX_WORKERS
       && (!Object.hasOwn(p.meta, 'extraWorkers') || Array.isArray(p.meta.extraWorkers))
       && workers.every((worker, i) => workerRecordValid(worker, `worker-${i + 1}`)), 'PROJECT_STOP_SCOPE_INVALID');
     const runId = value => typeof value === 'string' && /^run-[a-z0-9][a-z0-9-]{0,59}$/.test(value);
@@ -749,7 +857,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     const p = get(projectId), meta = p.meta, binding = meta.main;
     const stamp = () => json({ meta: p.meta, control: p.control, jobs: p.jobs.size, failed: p.persistenceFailed });
     const before = stamp();
-    const guard = () => check((!disposed || disposeScopeObservation && disposeCheck === true) && !p.persistenceFailed && get(projectId) === p && p.meta === meta && meta.projectId === projectId
+    const guard = () => check((!closing || disposeScopeObservation && disposeCheck === true) && !p.persistenceFailed && get(projectId) === p && p.meta === meta && meta.projectId === projectId
       && meta.main === binding && ['sessionId', 'sessionPath', 'agentId', 'cwd', 'kind'].every(key => binding?.[key] === main?.[key])
       && before === stamp(), 'WORKER_STOP_PROJECT_CHANGED');
     guard();
@@ -786,10 +894,11 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
   async function stop(args, ctx) {
     fields(args, ['projectId', 'workerId', 'force'], ['projectId']); workerOf(args);
     check(!Object.hasOwn(args, 'force') || typeof args.force === 'boolean', 'PROJECT_INVALID_INPUT');
-    const p = get(args.projectId); await authorize(p, ctx);
+    const p = get(args.projectId); await authorize(p, ctx); openForBusiness();
     // Omitted workerId stops every worker (Danus `stop <project>`); Goal stop/complete rely on this.
     const targets = args.workerId === undefined ? workersOf(p.meta) : [workerFor(p, args)];
     for (const worker of targets) {
+      workerStopVersion.set(worker, {});
       worker.stopRequested = true;
       worker.stopForce = worker.stopForce === true || args.force === true;
     }
@@ -816,8 +925,8 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     invocation(ctx); admission.guard();
   }
   function queueCore(p, operation, args, ctx, mainOnly, reportAuthority = null, creatorAdmission = null, releaseScratch = false) {
-    live(p);
     const view = dashboardViewAdmissions.get(creatorAdmission);
+    live(p, view?.publication === true);
     if (view) {
       check(ctx === null && !mainOnly && !reportAuthority && !releaseScratch && view.project === p && view.operation === operation,
         'PROJECT_CORE_ADMISSION_DENIED');
@@ -844,7 +953,9 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       } };
     slot.timer = setTimeout(() => slot.invalidate(failure('PROJECT_CORE_QUEUE_TIMEOUT')), CORE_QUEUE_WAIT_MS);
     p.coreWaiting.add(slot); p.coreQueue.push(slot);
-    if (!p.coreDraining) track(p, drainCore(p));
+    if (!p.coreDraining) {
+      p.corePump = track(p, drainCore(p));
+    }
     return promise;
   }
   async function drainCore(p) {
@@ -852,13 +963,14 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     try {
       while (p.coreQueue.length) {
         const slot = p.coreQueue.shift();
+        p.coreSlot = slot;
         try {
           // Keep one tracked pump even if authorization outlives cancellation.
           // Caller timeout is immediate; no second authorization is started behind
           // an unresolved one, and the late return cannot dispatch Core work.
           const view = dashboardViewAdmissions.get(slot.creatorAdmission);
           const assertAdmission = () => {
-            check(slot.valid, 'PROJECT_CORE_QUEUE_CANCELLED'); live(p);
+            check(slot.valid, 'PROJECT_CORE_QUEUE_CANCELLED'); live(p, view?.publication === true);
             slot.reportAuthority?.assertActive();
             if (view) view.guard(); else slot.creatorAdmission?.guard();
             check(Date.now() < slot.expiresAt, 'PROJECT_CORE_QUEUE_TIMEOUT');
@@ -873,14 +985,25 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
           assertAdmission();
           if (!slot.valid) continue;
           if (Date.now() >= slot.expiresAt) { slot.invalidate(failure('PROJECT_CORE_QUEUE_TIMEOUT')); continue; }
-          ready(p); coreGate(p);
+          ready(p, view?.publication === true); coreGate(p);
           // No await between final admission checks and CoreAccess.call inside coreCall.
           slot.valid = false; clearTimeout(slot.timer); p.coreWaiting.delete(slot);
           let value;
           try {
             value = await coreCall(p, slot.operation, slot.args, slot.ipcObserver, slot.releaseScratch,
               dashboardAdmissions.has(slot.creatorAdmission), dashboardMemoryAdmissions.has(slot.creatorAdmission), view);
-          } catch (error) { view?.guard(); throw error; }
+          } catch (error) {
+            if (view) {
+              // Transport reuse, like the successful path below, conveys no
+              // content authority. Never convert failed task accounting to success.
+              view.assertProjectOwned();
+              if (!p.coreBlocked && !p.persistenceFailed && acceptDashboardViewBusy(p.core, error) && view.workspace) {
+                await view.recheck(); view.guard(); throw workspaceProjectBusy;
+              }
+              view.guard();
+            }
+            throw error;
+          }
           if (view) {
             // Accept only the exact validated, durably settled App operation.
             // Rearming transport does not grant the view delivery authority.
@@ -891,12 +1014,12 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
           slot.resolve(value);
         } catch (error) {
           if (slot.valid) slot.invalidate(error); else slot.reject(error);
-        }
+        } finally { p.coreSlot = null; }
       }
     } finally { p.coreDraining = false; }
   }
   async function coreCall(p, operation, args, ipcObserver, releaseScratch, dashboard = false, memory = false, view) {
-    ready(p); coreGate(p); check(!p.coreBusy, 'PROJECT_CORE_BUSY'); p.coreBusy = true;
+    ready(p, view?.publication === true); coreGate(p); check(!p.coreBusy, 'PROJECT_CORE_BUSY'); p.coreBusy = true;
     const writesShared = CORE_MUTATIONS.has(operation);
     if (writesShared) workspaceCoreWrites.set(p, { pending:true, endedAt:0 });
     try {
@@ -940,7 +1063,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       dto = { projectId, fact: copy(value) };
     }
     // No new await between the original guard, validation, optional release and return.
-    if (releaseScratch && !disposed && !p.persistenceFailed && !p.coreBlocked && projects.get(projectId) === p) releaseValidatedProjectRead(p.core, value);
+    if (releaseScratch && !closing && !p.persistenceFailed && !p.coreBlocked && projects.get(projectId) === p) releaseValidatedProjectRead(p.core, value);
     return dto;
   }
   async function result(args, ctx, creatorAdmission = null, releaseScratch = false) {
@@ -996,7 +1119,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       coreWaiting: p.coreWaiting.size, coreQueue: p.coreQueue.length, coreDraining: p.coreDraining });
     const before = memory(), writes = [p.writes, p.coreWrites, p.targetWrites];
     const guard = () => {
-      check(!disposed, 'PROJECT_DISPOSED'); check(get(projectId) === p && p.meta.main === main && p.core === core
+      openForBusiness(); check(get(projectId) === p && p.meta.main === main && p.core === core
         && keys.every(key => main?.[key] === identity[key]), 'PROJECT_MAIN_DENIED');
       check(memory() === before && writes[0] === p.writes && writes[1] === p.coreWrites && writes[2] === p.targetWrites, 'PROJECT_DOCTOR_CHANGED');
     };
@@ -1293,6 +1416,49 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     };
     return guard;
   }
+  function changeDashboardFollow(args, ctx, enabled) {
+    const value = !types.isProxy(args) && object(args) && Reflect.ownKeys(args).length === 1
+      ? Object.getOwnPropertyDescriptor(args, 'projectId') : null;
+    check(value?.enumerable && Object.hasOwn(value, 'value'), 'PROJECT_INVALID_INPUT');
+    const p = get(contextId(value.value));
+    invocation(ctx); openForBusiness();
+    check(ctx.sessionPath === p.meta.creator?.sessionPath && ctx.document == null && ctx.principal?.kind !== 'app', 'PROJECT_OWNER_DENIED');
+    return track(p, followConsent.set(p, enabled, ctx));
+  }
+  async function dashboardFollow(args, ctx) { return changeDashboardFollow(args, ctx, true); }
+  async function dashboardUnfollow(args, ctx) { return changeDashboardFollow(args, ctx, false); }
+  async function authorizeDashboardFollow(p, ctx, enabled) {
+    const meta = p.meta, { projectId, creator, taskId } = meta;
+    const { sessionId, sessionPath, callToken } = ctx, creatorId = creator?.sessionId, creatorPath = creator?.sessionPath;
+    const stable = enabled ? paperCreatorGuard(p, ctx, 'PROJECT_DASHBOARD_FOLLOW_CHANGED') : null;
+    const guard = () => {
+      live(p);
+      check(projects.get(projectId) === p && p.meta === meta && meta.projectId === projectId && meta.creator === creator
+        && creatorId && creator?.sessionId === creatorId && creator?.sessionPath === creatorPath && !meta.creatorRejected,
+      'PROJECT_DASHBOARD_FOLLOW_CHANGED');
+      check(typeof taskId === 'string' && TASK_ID.test(taskId) && meta.taskId === taskId && meta.taskCreation === 'confirmed'
+        && meta.taskSettlement === 'confirmed' && !meta.taskError, 'PROJECT_DASHBOARD_FOLLOW_UNAVAILABLE');
+      check(ctx.sessionId === sessionId && (sessionId === undefined || sessionId === creatorId) && ctx.sessionPath === sessionPath
+        && sessionPath === creatorPath && ctx.callToken === callToken && ctx.document == null && ctx.principal?.kind !== 'app', 'PROJECT_OWNER_DENIED');
+      if (enabled) {
+        stable();
+        check(dashboardProjectReliable(p), 'PROJECT_DASHBOARD_FOLLOW_UNAVAILABLE');
+      }
+    };
+    const recheck = async () => {
+      check(await authorize(p, ctx, false, guard, { readOnly: true }) === 'creator', 'PROJECT_OWNER_DENIED');
+      if (enabled) await verifyPublicationOwner(p, guard);
+      else {
+        // Revocation needs the original creator/setup witness, not a still-
+        // readable main session or role. It never grants display authority.
+        const receipt = taskReceipt(p, await bounded(sdk.tasks.get(taskId))); guard();
+        check(receipt.status === 'completed', 'PROJECT_OWNER_DENIED');
+      }
+      guard();
+    };
+    await recheck();
+    return { guard, recheck };
+  }
   async function readCreatorPaperFacts(p, ctx, guard, target, selectedFactIds = [], ipcObserver) {
     const projectId = p.meta.projectId, active = () => { guard(); assertPaperTargetRecord(p, target); };
     const admission = Object.freeze({ requiredActor: 'creator', guard: active });
@@ -1502,30 +1668,29 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
   }
   // Separate lexical scope: no invocation, token, document binding or Host
   // access supplied at mint time can be retained or replayed by this reader.
-  function makeDashboardViewReader(p, terminalOnly = false) {
-    const fence = terminalOnly && createTerminalReadFence(() => terminalWriteState(workspaceCoreWrites.get(p) ?? null,
+  function makeDashboardViewReader(p, mode = 'document', recordRevision, followStamp = null) {
+    const fence = mode === 'snapshot' && createTerminalReadFence(() => terminalWriteState(workspaceCoreWrites.get(p) ?? null,
       research.projectDashboardWriteState(p.meta.projectId)));
     const meta = p.meta, projectId = meta.projectId, creator = meta.creator, main = meta.main;
     const { sessionId: creatorId, sessionPath: creatorPath } = creator;
     const identity = Object.freeze(Object.fromEntries(DASHBOARD_MAIN_IDENTITY.map(k => [k, main[k]])));
-    const assertProjectOwned = () => {
-      check(projects.get(projectId) === p && p.meta === meta && meta.projectId === projectId && meta.main === main
-        && Object.entries(identity).every(([k,v]) => main[k] === v), 'PROJECT_DASHBOARD_VIEW_CHANGED');
-      ready(p);
-    };
-    const unchanged = () => {
-      assertProjectOwned();
-      check(meta.creator === creator && creator.sessionId === creatorId && creator.sessionPath === creatorPath
-        && !meta.creatorRejected, 'PROJECT_DASHBOARD_VIEW_CHANGED');
-    };
     return Object.freeze(async (selection, viewGuard, endedAt) => {
+      const publication = mode === 'snapshot' && publicationGuards.has(viewGuard);
+      live(p, publication);
+      const assertProjectOwned = () => {
+        check(projects.get(projectId) === p && p.meta === meta && meta.projectId === projectId && meta.main === main
+          && Object.entries(identity).every(([k,v]) => main[k] === v), 'PROJECT_DASHBOARD_VIEW_CHANGED');
+        ready(p, publication);
+      };
       const terminal = fence && fence.begin(endedAt);
       check(typeof viewGuard === 'function' && !types.isAsyncFunction(viewGuard), 'PROJECT_DASHBOARD_VIEW_GUARD_REQUIRED');
       const guard = () => {
         const allowed = viewGuard();
         if (types.isPromise(allowed)) Promise.prototype.then.call(allowed, undefined, () => {});
         check(allowed === undefined || allowed === true, 'PROJECT_DASHBOARD_VIEW_DENIED');
-        unchanged();
+        assertProjectOwned();
+        check(meta.creator === creator && creator.sessionId === creatorId && creator.sessionPath === creatorPath
+          && !meta.creatorRejected, 'PROJECT_DASHBOARD_VIEW_CHANGED');
         if (terminal) fence.assert(terminal);
       };
       const input = snapshotPlanData(selection, 'PROJECT_INVALID_INPUT');
@@ -1533,6 +1698,10 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       check(graph || object(input) && validProjectDashboardMemorySelection(input), 'PROJECT_INVALID_INPUT');
       const recheck = async (active = guard) => {
         active();
+        if (followStamp !== null) {
+          check(getFollowState(p) === 'enabled' && getFollowStamp(p) === followStamp, 'PROJECT_DASHBOARD_VIEW_DENIED');
+          await verifyPublicationOwner(p, active); active(); return;
+        }
         const own = await ownSessions();
         active();
         check(!own.some(row => row.path === creatorPath || row.sessionId === creatorId), 'PROJECT_OWNER_DENIED');
@@ -1540,11 +1709,16 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       await recheck(); guard();
       const operation = graph ? 'dashboard_factgraph' : 'dashboard_memory';
       const admission = Object.freeze({});
-      dashboardViewAdmissions.set(admission, Object.freeze({ project: p, operation, guard, recheck, assertProjectOwned }));
+      dashboardViewAdmissions.set(admission, Object.freeze({ project: p, operation, guard, recheck, assertProjectOwned, publication, workspace: mode !== 'document' }));
       const args = graph ? {} : input;
       const result = await queueCore(p, operation, terminal ? {...args, terminal:true} : args, null, false, null, admission);
       guard();
-      return terminal ? fence.project(terminal, input, result) : graph ? result.graph : result.data;
+      if (terminal) {
+        const data = fence.project(terminal, input, result);
+        recordRevision?.(endedAt, result.inventoryRevision);
+        return data;
+      }
+      return graph ? result.graph : result.data;
     });
   }
   async function paperStitch(args, ctx) {
@@ -1553,7 +1727,8 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     const authorizeStitch = async () => {
       guard(); check(await authorize(p, ctx, false, guard, { readOnly: true }) === 'creator', 'PROJECT_SUMMARY_DENIED'); guard();
     };
-    return reports.stitch(p, args, authorizeStitch, guard);
+    const { bytes, summary, sessionId, checkDelivery } = await reports.stitch(p, args, authorizeStitch, guard);
+    return { bytes, summary, sessionId, checkDelivery };
   }
   async function paperSectionStatus(args, ctx) { args = snapshotPaperSectionRequest(args, { read: true }); return reports.status(get(contextId(args.projectId)), args, ctx, { kind: 'paper-section' }); }
   async function paperSectionResult(args, ctx) { args = snapshotPaperSectionRequest(args, { read: true }); return reports.result(get(contextId(args.projectId)), args, ctx, { kind: 'paper-section' }); }
@@ -1595,10 +1770,53 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
   async function paperVerifyStatus(args, ctx) { fields(args, ['projectId', 'reportId'], ['projectId', 'reportId']); return reports.status(get(contextId(args.projectId)), args, ctx, { kind: 'reference-verification' }); }
   async function paperVerifyResult(args, ctx) { fields(args, ['projectId', 'reportId'], ['projectId', 'reportId']); return reports.result(get(contextId(args.projectId)), args, ctx, { kind: 'reference-verification' }); }
   async function paperVerifyStop(args, ctx) { fields(args, ['projectId', 'reportId'], ['projectId', 'reportId']); return reports.stop(get(contextId(args.projectId)), args, ctx, { kind: 'reference-verification' }); }
+  const paperMathKind = Object.freeze({ kind: 'paper-math-verification' });
+  async function paperVerifyMath(args, ctx) {
+    args = snapshotPlanData(args);
+    const source = args && Object.hasOwn(args, 'reportId');
+    args = source ? snapshotPaperSectionRequest(args, { read: true }) : snapshotPaperStitchRequest(args);
+    const p = get(contextId(args.projectId));
+    const math = source ? { sourceReportId: args.reportId }
+      : { planReportId: args.planReportId, finalSectionReportId: args.finalSectionReportId };
+    check(await authorize(p, ctx) === 'creator', 'PROJECT_SUMMARY_DENIED'); live(p);
+    return reports.start(p, { ...paperMathKind, language: 'English', math }, ctx);
+  }
+  async function paperVerifyMathStatus(args, ctx) {
+    args = snapshotPaperSectionRequest(args, { read: true });
+    return reports.status(get(contextId(args.projectId)), args, ctx, paperMathKind);
+  }
+  async function paperVerifyMathResult(args, ctx) {
+    args = snapshotPaperSectionRequest(args, { read: true });
+    const p = get(contextId(args.projectId)), owner = p.meta.creator?.sessionId;
+    const value = await reports.result(p, args, ctx, paperMathKind);
+    check(value?.projectId === args.projectId && value.reportId === args.reportId && value.kind === paperMathKind.kind,
+      'PROJECT_REPORT_ARTIFACT_INVALID');
+    const files = value.files;
+    check((files === undefined && value.readError || Array.isArray(files) && files.length <= 1), 'PROJECT_REPORT_ARTIFACT_INVALID');
+    const file = files?.[0], resource = file?.resource;
+    if (files?.length) {
+      check(file?.role === 'review' && file.name === 'MATH_REVIEW.json', 'PROJECT_REPORT_ARTIFACT_INVALID');
+      if (value.status === 'delivery-failed') {
+        fields(file, ['role', 'name', 'error']);
+      } else {
+        fields(file, ['role', 'name', 'bytes', 'sha256', 'resource']);
+        fields(resource, ['kind', 'fileId', 'sessionId']);
+        check(value.state === 'completed' && Number.isSafeInteger(file.bytes) && file.bytes > 0 && typeof file.sha256 === 'string' && SHA256.test(file.sha256)
+          && resource.kind === 'session-file' && typeof resource.fileId === 'string' && resource.fileId
+          && typeof owner === 'string' && owner && p.meta.creator?.sessionId === owner && resource.sessionId === owner, 'PROJECT_REPORT_STAGE_INVALID');
+      }
+    }
+    check(value.state !== 'completed' || value.readError || value.status === 'delivery-failed' || resource, 'PROJECT_REPORT_ARTIFACT_INVALID');
+    return value;
+  }
+  async function paperVerifyMathStop(args, ctx) {
+    args = snapshotPaperSectionRequest(args, { read: true });
+    return reports.stop(get(contextId(args.projectId)), args, ctx, paperMathKind);
+  }
   async function invoke(name, args, ctx) {
     check(MAIN_TOOLS.has(name), 'PROJECT_TOOL_DENIED');
     if (await reports.handlesLiterature(ctx)) {
-      check(name === 'search_arxiv_theorems', 'PROJECT_TOOL_DENIED');
+      openForBusiness(); check(name === 'search_arxiv_theorems', 'PROJECT_TOOL_DENIED');
       return reports.invokeLiterature(name, args, ctx);
     }
     if (name !== 'search_arxiv_theorems') args = normalizeProjectCoreArguments(name, args);
@@ -1614,6 +1832,37 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     invocation(ctx); await ownSessions(); const result = [];
     for (const p of projects.values()) { try { await authorize(p, ctx); result.push(view(p)); } catch (error) { if (!['PROJECT_OWNER_DENIED', 'PROJECT_MAIN_DENIED'].includes(error.code)) throw error; } }
     return { projects: result };
+  }
+  // Load a project's Core journal and paper targets only when an authorized
+  // caller actually requests this project. Empty maps before this read are
+  // not evidence of a clean Core or an empty archive.
+  async function loadProjectDetails(p) {
+    const meta = p.meta, projectId = meta.projectId;
+    try {
+      let files; try { files = await store.list(location(p, 'core')); } catch (error) { if (error.code === 'ENOENT') files = []; else throw error; }
+      for (const file of files) {
+        check(file.endsWith('.json'), 'PROJECT_CORE_RECORD_INVALID'); const id = contextId(file.slice(0, -5));
+        const record = await store.readJson(location(p, `core/${id}.json`));
+        check(record?.operationId === id && record.projectId === projectId && record.author === meta.main?.agentId && record.role === 'main'
+          && Number.isSafeInteger(record.revision), 'PROJECT_CORE_RECORD_INVALID'); p.records.set(id, record);
+      }
+    } catch { p.coreBlocked = true; }
+    try {
+      let files; try { files = await store.list(location(p, 'targets')); } catch (error) { if (error.code === 'ENOENT') files = []; else throw error; }
+      for (const file of files) {
+        if (file.endsWith('.tmp')) continue; // Leftover atomic-write temporary, never a record.
+        const paperId = file.endsWith('.json') && PAPER_ID.test(file.slice(0, -5)) ? file.slice(0, -5) : null;
+        let record = null;
+        if (paperId) { try { record = await store.readJson(location(p, `targets/${paperId}.json`)); } catch { record = null; } }
+        p.targets.set(paperId ?? file, paperId && targetRecordValid(record, projectId, paperId)
+          ? { ...record, valid: true } : { paperId, valid: false, error: 'PROJECT_TARGET_RECORD_INVALID' });
+      }
+    } catch { p.targets.set('', { paperId: null, valid: false, error: 'PROJECT_TARGET_RECORD_INVALID' }); }
+  }
+  async function ensureProjectDetails(p) {
+    if (!p.detailsDeferred) return;
+    if (!p.detailsLoad) p.detailsLoad = loadProjectDetails(p).then(() => { p.detailsDeferred = false; });
+    await p.detailsLoad;
   }
   await store.mkdir(BASE);
   for (const projectId of await store.list(BASE)) {
@@ -1639,36 +1888,19 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
         && typeof meta.main.sessionId === 'string' && typeof meta.main.agentId === 'string', 'PROJECT_RECORD_INVALID');
       else { meta.error ||= 'PROJECT_SETUP_INTERRUPTED'; }
       const p = wrap(meta); projects.set(projectId, p);
-      try {
-        let files; try { files = await store.list(location(p, 'core')); } catch (error) { if (error.code === 'ENOENT') files = []; else throw error; }
-        for (const file of files) {
-          check(file.endsWith('.json'), 'PROJECT_CORE_RECORD_INVALID'); const id = contextId(file.slice(0, -5));
-          const record = await store.readJson(location(p, `core/${id}.json`));
-          check(record?.operationId === id && record.projectId === projectId && record.author === meta.main?.agentId && record.role === 'main'
-            && Number.isSafeInteger(record.revision), 'PROJECT_CORE_RECORD_INVALID'); p.records.set(id, record);
-        }
-      } catch { p.coreBlocked = true; }
-      try {
-        let files; try { files = await store.list(location(p, 'targets')); } catch (error) { if (error.code === 'ENOENT') files = []; else throw error; }
-        for (const file of files) {
-          if (file.endsWith('.tmp')) continue; // Leftover atomic-write temporary, never a record.
-          const paperId = file.endsWith('.json') && PAPER_ID.test(file.slice(0, -5)) ? file.slice(0, -5) : null;
-          let record = null;
-          if (paperId) { try { record = await store.readJson(location(p, `targets/${paperId}.json`)); } catch { record = null; } }
-          p.targets.set(paperId ?? file, paperId && targetRecordValid(record, projectId, paperId)
-            ? { ...record, valid: true } : { paperId, valid: false, error: 'PROJECT_TARGET_RECORD_INVALID' });
-        }
-      } catch { p.targets.set('', { paperId: null, valid: false, error: 'PROJECT_TARGET_RECORD_INVALID' }); }
+      p.detailsDeferred = deferHistoricalWork;
+      if (!deferHistoricalWork) await loadProjectDetails(p);
     } catch { damaged.add(projectId); }
   }
-  reports = await createProjectReportService({ sdk, store, summaryWriter,
+  reports = await createProjectReportService({ sdk, store, summaryWriter, deferHistoricalWork,
+    isFreshProject: p => freshProjects.has(p),
     authorizeCreator: async (p, ctx) => { check(await authorize(p, ctx) === 'creator', 'PROJECT_SUMMARY_DENIED'); },
     projects: () => projects.values(), getProject: get, assertLive: live, gatherFacts: gatherSummaryFacts, withReportPublication,
     gatherPaperFacts, withPaperPublication, paperRunnerIpcScope, assertPaperTarget, withPaperTarget,
     readInput: p => store.readJson(location(p, 'input.json')), track, projectLocation: p => `${BASE}/${p.meta.projectId}`, literature });
   const registration = await bounded(sdk.tasks.registerHandler(HANDLER, { run: async event => {
     const p = projects.get(event?.input?.projectId);
-    if (disposed || event?.kind !== 'schedule' || !p || !p.nonce || p.nonce !== event.input.nonce || p.setup || p.meta.state !== 'queued') return { status: 'ignored' };
+    if (closing || event?.kind !== 'schedule' || !p || !p.nonce || p.nonce !== event.input.nonce || p.setup || p.meta.state !== 'queued') return { status: 'ignored' };
     p.nonce = null;
     p.setup = track(p, (async () => { try { if (event.scheduleId) await bounded(unschedule(p, event.scheduleId)); await setup(p); }
       catch (error) { p.meta.state = 'unconfirmed'; p.meta.error ||= code(error); await save(p).catch(() => {}); await settle(p, false).catch(() => {}); } })());
@@ -1676,7 +1908,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
   }, abort: async taskId => {
     const ignored = { status: 'ignored' };
     const owner = setupAbortOwners.get(taskId), p = owner?.project;
-    const cancellable = () => p && !disposed && !p.persistenceFailed && setupAbortOwners.get(taskId) === owner
+    const cancellable = () => p && !closing && !p.persistenceFailed && setupAbortOwners.get(taskId) === owner
       && p.meta.taskId === taskId && p.meta.taskSettlement === 'pending'
       && (['queued', 'preparing'].includes(p.meta.state) || (p.meta.state === 'ready' && p.setupPermit));
     if (!cancellable() || owner.checking) return ignored;
@@ -1697,9 +1929,45 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     return owner.checking;
   } }));
   if (registration?.ready) await bounded(registration.ready);
-  async function dispose() {
-    disposed = true;
+  function publicationSlot(slot) { return dashboardViewAdmissions.get(slot?.creatorAdmission)?.publication === true; }
+  function canDrainPublication() {
+    try {
+      if (!archiveHealthy || !publisher || damaged.size || goalActions || operatorQueues.has(dataDir)
+        || research.dashboardShutdownIdle?.() !== true || reports.dashboardShutdownIdle() !== true) return false;
+      return [...projects.values()].every(p => {
+        if (!dashboardProjectReliable(p) || p.control || p.meta.scheduleId || p.setupPermit || p.nonce
+          || [...p.jobs].some(job => job !== p.corePump) || [...p.coreWaiting].some(slot => !publicationSlot(slot))
+          || (p.coreDraining || p.coreBusy) && !publicationSlot(p.coreSlot)) return false;
+        const goal = goals.monitorLifecycle(p.meta.projectId);
+        return (goal === null || ['paused', 'stopped', 'completed'].includes(goal.state) && !goal.snapshotUnconfirmed)
+          && workersOf(p.meta).every(worker => {
+            const state = monitorWorker(p.meta.projectId, worker);
+            return state.state === 'idle' && !state.snapshotUnconfirmed;
+          });
+      });
+    } catch { return false; }
+  }
+  function dispose() {
+    if (disposal) return disposal;
+    // Close external admission in this same turn. Only an existing private
+    // publisher read may keep its dependencies while the drain is bounded.
+    closing = true;
+    disposal = disposeInternal();
+    return disposal;
+  }
+  async function disposeInternal() {
+    offTerminal?.(); offWorkerSettlement?.();
     setupAbortOwners.clear();
+    try {
+      if (canDrainPublication()) {
+        drainingPublication = true;
+        // Do not rely on a settlement observer's deferred callback running
+        // before shutdown. notify performs the original capture checks now.
+        for (const p of projects.values()) publisher.notify(p.meta.projectId);
+        if (publisher.pending) await bounded(publisher.drain());
+      }
+    } catch { /* Timed out or refused publication does not hold shutdown open. */ }
+    finally { drainingPublication = false; disposed = true; publisher?.close(); }
     for (const p of projects.values()) for (const slot of p.coreWaiting) slot.invalidate(failure('PROJECT_CORE_QUEUE_CANCELLED'));
     const errors = []; let mainControlCleanupPending = true, summaryWriterCleanupPending = false;
     // This window authorizes only the trusted synchronous observer, and only
@@ -1714,16 +1982,21 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     } catch (error) { summaryWriterCleanupPending = true; errors.push({ code: code(error) }); }
     for (const p of projects.values()) {
       p.setupPermit = false; p.nonce = null;
-      if (p.meta.state !== 'ready') { p.meta.state = 'unconfirmed'; p.meta.error ||= 'PROJECT_SETUP_INTERRUPTED'; }
-      try { if (p.meta.scheduleId) await bounded(unschedule(p, p.meta.scheduleId)); } catch (e) { errors.push({ projectId: p.meta.projectId, code: code(e) }); }
+      const ownsSetup = !deferHistoricalWork || freshProjects.has(p);
+      if (ownsSetup && p.meta.state !== 'ready') { p.meta.state = 'unconfirmed'; p.meta.error ||= 'PROJECT_SETUP_INTERRUPTED'; }
+      try { if (ownsSetup && p.meta.scheduleId) await bounded(unschedule(p, p.meta.scheduleId)); } catch (e) { errors.push({ projectId: p.meta.projectId, code: code(e) }); }
       try { if (p.core) await p.core.dispose(); } catch (e) { errors.push({ projectId: p.meta.projectId, code: code(e) }); }
-      for (const worker of workersOf(p.meta)) { try { await refreshWorker(p, worker, true, { force: true }); } catch (e) { errors.push({ projectId: p.meta.projectId, code: code(e) }); } }
+      for (const worker of workersOf(p.meta)) {
+        if (deferHistoricalWork && (!worker.lastRun || workerRunsStartedHere.get(worker) !== worker.lastRun)) continue;
+        try { await refreshWorker(p, worker, true, { force: true }); } catch (e) { errors.push({ projectId: p.meta.projectId, code: code(e) }); }
+      }
       try { await bounded(Promise.allSettled([...p.jobs])); await p.writes; await p.coreWrites; await p.targetWrites.catch(() => {});
-        if (p.meta.taskSettlement !== 'confirmed') await settle(p, false);
+        if (ownsSetup && p.meta.taskSettlement !== 'confirmed') await settle(p, false);
       } catch (e) { errors.push({ projectId: p.meta.projectId, code: code(e) }); }
     }
     if (registration?.disposeAsync) await registration.disposeAsync(); else if (typeof registration === 'function') registration();
     const pending = [...projects.values()];
+    disposeComplete = true;
     return { disposed: true, errors, mainControlCleanupPending, summaryWriterCleanupPending,
       cleanupPending: mainControlCleanupPending || summaryWriterCleanupPending || errors.length > 0 || pending.some(p => p.jobs.size || p.coreBlocked || [...p.records.values()].some(resourceUnsettled) || p.core?.snapshot().pending
       || workersOf(p.meta).some(w => ['pending', 'unknown'].includes(w.start.state) || w.status && jobUnsettled(w.status))
@@ -1780,14 +2053,14 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     return { ready: true };
   }
   const goals = await createMainControlService(sdk, {
-    nextMonitorActivation, recoveryReadiness,
+    deferHistoricalWork, nextMonitorActivation, recoveryReadiness, onDashboardTerminal: id => publisher?.notify(id),
     captureWorkerStopScope, observeWorkerStopScope,
     authorize: (ctx, { projectId, action }) => authorize(get(projectId), ctx, false, undefined, { readOnly: action === 'status' }),
     getMainBinding: async (ctx, { projectId }) => {
       const p = get(projectId); await authorize(p, ctx); ready(p);
       check(typeof projectMainSession.ensureProjectMainGoalTools === 'function', 'MAIN_CONTROL_DEPENDENCY_MISSING');
       const tools = await projectMainSession.ensureProjectMainGoalTools(sdk, { profiles, binding: p.meta.main });
-      check(['ready', 'pending'].includes(tools?.state) && object(tools.selection), 'MAIN_CONTROL_TOOLS_UNCONFIRMED');
+      live(p); check(['ready', 'pending'].includes(tools?.state) && object(tools.selection), 'MAIN_CONTROL_TOOLS_UNCONFIRMED');
       p.meta.main.toolSelection = copy(tools.selection); p.meta.main.explorer = copy(tools.explorer); await save(p);
       await authorize(p, ctx); ready(p);
       check(tools?.state === 'ready', tools?.state === 'pending' ? 'MAIN_CONTROL_TOOLS_PENDING' : 'MAIN_CONTROL_TOOLS_UNCONFIRMED');
@@ -1804,24 +2077,37 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
         || workers.some(worker => worker.statusError || ['pending', 'unknown'].includes(worker.start.state) || worker.lastRun && (!worker.status || jobUnsettled(worker.status)))) };
     },
   });
-  function monitorWorker(projectId, worker) {
+  // A Project stop flag, by itself, cannot tell whether a mathematical round
+  // is still running. Only Research can witness that exact round and its exit.
+  function admissionCanFollow(p, worker, runId) {
+    if (!worker.stopRequested) return true;
+    if (worker.stopForce !== false || worker.lastRun !== runId) return false;
+    try {
+      const obs = research.projectWorkerMonitor(p.meta.projectId, worker.workerId, runId);
+      return obs.gracefulRound === true && (obs.state === 'active' || obs.state === 'idle' && obs.terminal?.runId === runId);
+    } catch { return false; }
+  }
+  function monitorWorker(projectId, worker, forDashboard = false) {
     if (!worker.lastRun) return { state: worker.start.state === 'idle' && !worker.start.runId ? 'idle' : 'unknown' };
     if (!['started', 'settled'].includes(worker.start.state) || worker.start.runId !== worker.lastRun
       || worker.runs.filter(id => id === worker.lastRun).length !== 1) return { state: 'unknown' };
     try {
-      const { state, terminal, snapshotUnconfirmed } = research.projectWorkerMonitor(projectId, worker.workerId, worker.lastRun);
+      const { state, terminal, snapshotUnconfirmed, gracefulRound } = research.projectWorkerMonitor(projectId, worker.workerId, worker.lastRun);
+      const graceful = forDashboard && gracefulRound === true && worker.stopRequested === true && worker.stopForce === false;
       const stamp = monitorWorkerStarts.get(worker);
       const activation = stamp?.runId === worker.lastRun ? { order: stamp.order } : null;
       if (state === 'idle') {
         if (snapshotUnconfirmed === true) return { state, snapshotUnconfirmed: true };
-        if (worker.stopRequested || terminal === undefined) return { state };
+        if ((worker.stopRequested && !graceful) || terminal === undefined) return { state };
         if (terminal?.runId !== worker.lastRun) return { state, snapshotUnconfirmed: true };
         // Same logical worker, exact lastRun, and a project admission stamped in
-        // this process. Research independently proves it reached working and finished.
-        return activation ? { state, terminal: { ...activation, startedAt: terminal.startedAt, endedAt: terminal.endedAt } } : { state };
+        // this process. Research independently witnessed normal completion or
+        // the clean end of the exact in-flight round requested to stop.
+        return activation ? { state, terminal: { ...activation, startedAt: terminal.startedAt, endedAt: terminal.endedAt },
+          ...(graceful && { gracefulRound: true }) } : { state };
       }
       if (state !== 'active') return { state: 'unknown' };
-      if (worker.stopRequested) return { state: 'idle', snapshotUnconfirmed: true };
+      if (worker.stopRequested && !graceful) return { state: 'idle', snapshotUnconfirmed: true };
       if (worker.start.state !== 'started') return { state: 'unknown' };
       return { state, activation };
     } catch { return { state: 'unknown' }; }
@@ -1832,12 +2118,12 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       && m.state === 'ready' && !m.error && !m.creatorRejected && m.main?.state === 'ready' && m.main.identityConfirmed === true
       && m.startup?.state === 'accepted' && m.taskSettlement === 'confirmed';
   }
-  function observeWorkspaceProjects() {
-    if (disposed) return [{ lifecycle: 'unknown' }];
+  function observeWorkspaceProjects(forDashboard = false) {
+    if (closing) return [{ lifecycle: 'unknown' }];
     const rows = [...projects].map(([projectId, p]) => {
       const reliable = dashboardProjectReliable(p);
       const goal = reliable ? goals.monitorLifecycle(projectId) : null;
-      const workers = reliable ? workersOf(p.meta).map(worker => monitorWorker(projectId, worker)) : [];
+      const workers = reliable ? workersOf(p.meta).map(worker => monitorWorker(projectId, worker, forDashboard)) : [];
       const lifecycle = observeProjectLifecycle({ reliable, goal, workers });
       return { project: p, projectId, ...lifecycle,
         snapshot: lifecycle.lifecycle === 'active' || lifecycle.lifecycle === 'unknown' ? undefined : observeProjectSnapshot(goal, workers) };
@@ -1846,10 +2132,13 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     return rows;
   }
   function grantWorkspaceDashboard(p, goalOrder = null) {
-    // Only setup settlement and a genuine successful creator Goal start/resume
-    // call here. This observation cannot change their result or lifecycle.
+    // A fresh creator setup/Goal or a current creator opt-in can issue a reader.
+    // Across boots a genuine new worker admission may reuse that exact scoped opt-in only.
     try {
-      if (!dashboardProjectReliable(p)) return;
+      const policy = getFollowState(p);
+      if (!dashboardProjectReliable(p) || !['absent','enabled'].includes(policy)) return;
+      const followStamp = policy === 'enabled' ? getFollowStamp(p) : null;
+      if (policy === 'enabled' && !followStamp) return;
       const { meta } = p, { creator, main, projectId } = meta;
       const creatorId = creator?.sessionId, creatorPath = creator?.sessionPath;
       if (typeof creatorId !== 'string' || !creatorId || typeof creatorPath !== 'string' || !creatorPath) return;
@@ -1857,14 +2146,21 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       const sameIdentity = () => projects.get(projectId) === p && p.meta === meta && meta.projectId === projectId
         && meta.creator === creator && creator.sessionId === creatorId && creator.sessionPath === creatorPath && !meta.creatorRejected
         && meta.main === main && DASHBOARD_MAIN_IDENTITY.every((k, i) => main[k] === identity[i]);
-      const grant = Object.freeze({ projectId, read: makeDashboardViewReader(p), readSnapshot: makeDashboardViewReader(p, true) });
-      workspaceDashboardGrants.set(p, { grant, sameIdentity, goalOrder });
+      let witnessedAt, revision;
+      const grant = Object.freeze({ projectId, read: makeDashboardViewReader(p, 'active', undefined, followStamp),
+        readSnapshot: makeDashboardViewReader(p, 'snapshot', (at,rev)=>{ witnessedAt=at; revision=rev; }, followStamp),
+        snapshotRevision: at => at === witnessedAt ? revision : null });
+      workspaceDashboardGrants.set(p, { grant, sameIdentity, goalOrder, followStamp });
     } catch { /* no display grant on incomplete evidence */ }
   }
   function lookupWorkspaceGrant(p) {
     const record = workspaceDashboardGrants.get(p);
     if (!record) return;
-    if (disposed || !record.sameIdentity()) { workspaceDashboardGrants.delete(p); return; }
+    const policy = getFollowState(p);
+    if (disposed || !record.sameIdentity() || !['absent','enabled'].includes(policy)
+      || (policy === 'enabled' ? getFollowStamp(p) !== record.followStamp : record.followStamp !== null)) {
+      workspaceDashboardGrants.delete(p); return;
+    }
     if (record.goalOrder !== null) {
       const goal = goals.monitorLifecycle(record.grant.projectId);
       if (!(goal?.state === 'active' && goal.activation?.order === record.goalOrder
@@ -1872,13 +2168,337 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     }
     return record.grant;
   }
+  async function renewFollowAfterStart(p, worker, runId, order) {
+    // The worker already has its own admission. A denial/timeout during this
+    // read-only check must neither fail that admission nor nominate a candidate.
+    try {
+      const stamp=getFollowStamp(p), meta=p.meta, main=meta.main, creator=meta.creator;
+      const guard=()=>{
+        live(p);
+        const g=goals.monitorLifecycle(meta.projectId);
+        check(dashboardProjectReliable(p) && projects.get(meta.projectId)===p && p.meta===meta && meta.main===main && meta.creator===creator
+          && getFollowState(p)==='enabled' && getFollowStamp(p)===stamp && worker.start.runId===runId && worker.lastRun===runId && admissionCanFollow(p, worker, runId)
+          && (order===null ? g===null : g?.state==='active' && g.activation?.order===order), 'PROJECT_DASHBOARD_VIEW_DENIED');
+        return true;
+      };
+      await bounded(verifyPublicationOwner(p,guard)); guard();
+      if (!lookupWorkspaceGrant(p)) grantWorkspaceDashboard(p,order);
+    } catch { /* No display grant and no change to the accepted worker run. */ }
+  }
+  function followPolicyChanged(p, enabled) {
+    if (!enabled || closing || getFollowState(p) !== 'enabled') {
+      if (savedFollowChoice?.project === p) { savedFollowChoice = null; savedFollowReader = null; }
+      workspaceDashboardGrants.delete(p); return; // Pending/revoked: retire before any regrant.
+    }
+    // Nominate the exact consent even if the worker is still stopping. Do not
+    // capture a reading basis or infer quiescence from the follow receipt.
+    const stamp = getFollowStamp(p);
+    if (savedFollowChoice?.project !== p || savedFollowChoice.stamp !== stamp) {
+      savedFollowChoice = { project: p, stamp }; savedFollowReader = null;
+    }
+    const goal = goals.monitorLifecycle(p.meta.projectId);
+    if (goal !== null && !['active','completed'].includes(goal?.state)) return;
+    const goalOrder = goal?.activation?.order ?? goal?.terminal?.order ?? null;
+    if (goal && !Number.isSafeInteger(goalOrder)) return;
+    if (!lookupWorkspaceGrant(p)) grantWorkspaceDashboard(p, goalOrder);
+    publisher?.notify(p.meta.projectId); // May publish only an independently witnessed current-process terminal.
+  }
+  function restoreSavedFollowChoice() {
+    let choice = null;
+    for (const p of projects.values()) {
+      if (getFollowState(p) !== 'enabled') continue;
+      if (choice) return null; // Two affirmative consents are not a target selection.
+      choice = { project: p, stamp: getFollowStamp(p) };
+    }
+    return choice;
+  }
+  function savedFollowScope(p) {
+    const m = p.meta, id = m.projectId, workers = workersOf(m);
+    if (p.detailsDeferred || projects.get(id) !== p || !dashboardProjectReliable(p) || m.taskCreation !== 'confirmed' || m.taskError
+      || p.control || waitingForPublication.has(p)) return null;
+    const goal = goals.monitorLifecycle(id);
+    if (goal !== null && (goal.snapshotUnconfirmed || !['stopped', 'completed'].includes(goal.state))) return null;
+    const goalState = goal === null ? null : goals.diagnostic(id);
+    if (goal !== null && (goalState?.state !== goal.state || goalState.cleanupPending !== false || goalState.error)) return null;
+    const completion = goal?.state === 'completed' ? goals.dashboardCompletionSeal(id) : null;
+    if (goal?.state === 'completed' && (typeof completion !== 'string' || !SHA256.test(completion))) return null;
+    for (const worker of workers) {
+      const state = monitorWorker(id, worker);
+      if (state.state !== 'idle' || state.snapshotUnconfirmed) return null;
+    }
+    const runIds = workers.flatMap(worker => worker.runs);
+    if ((!runIds.length && !completion) || new Set(runIds).size !== runIds.length) return null;
+    const history = research.projectDashboardHistorySeal?.(id, runIds);
+    if (typeof history !== 'string' || !SHA256.test(history)) return null;
+    const mutations = [...p.records.values()].filter(r => CORE_MUTATIONS.has(r.operation));
+    if (mutations.some(coreUnsettled)) return null;
+    return json([workers.map(w => [w.workerId, w.lastRun, w.runs]), history, completion,
+      goalState && [goalState.state, goalState.generation],
+      mutations.map(r => [r.operationId, r.revision, r.outcome.state]).sort((a,b) => a[0].localeCompare(b[0]))]);
+  }
+  function getSaved() {
+    const choice = savedFollowChoice, clear = () => { savedFollowReader = null; return null; };
+    if (!choice || !choice.stamp || closing) return clear();
+    const { project: p, stamp } = choice, { projectId, creator, main } = p.meta;
+    try {
+      if (getFollowState(p) !== 'enabled' || getFollowStamp(p) !== stamp) return clear();
+      const seal = savedFollowScope(p);
+      if (seal === null) return clear();
+      const writes = terminalWriteState(workspaceCoreWrites.get(p) ?? null, research.projectDashboardWriteState(projectId));
+      if (writes.pending) return clear();
+      if (savedFollowReader?.choice === choice && savedFollowReader.seal === seal && savedFollowReader.creator === creator
+        && savedFollowReader.main === main && writes.endedAt < savedFollowReader.asOf) return savedFollowReader;
+      const asOf = Date.now(); // Reading basis for current saved bytes; never a run's end time.
+      if (!Number.isSafeInteger(asOf) || asOf <= writes.endedAt || asOf > 8640000000000000) return clear();
+      savedFollowReader = Object.freeze({ choice, seal, creator, main, projectId, asOf,
+        authorize: guard => verifyPublicationOwner(p, guard), read: makeDashboardViewReader(p, 'snapshot', undefined, stamp) });
+      return savedFollowReader;
+    } catch { return clear(); }
+  }
+  function historicalCleanupOnly(p) {
+    const id = p.meta.projectId, goal = goals.monitorLifecycle(id);
+    // Unknown Goal/start records are not historical Worker cleanup evidence.
+    if (goal !== null) {
+      if (!['stopped', 'completed'].includes(goal.state) || goal.snapshotUnconfirmed || goal.terminal) return false;
+      const diagnostic = goals.diagnostic(id);
+      if (diagnostic?.state !== goal.state || diagnostic.cleanupPending !== false || diagnostic.error) return false;
+    }
+    const expected = new Map();
+    for (const worker of workersOf(p.meta)) {
+      if (worker.lastRun ? !['started', 'settled'].includes(worker.start.state) || worker.start.runId !== worker.lastRun
+        || !worker.runs.includes(worker.lastRun) : worker.start.state !== 'idle' || worker.start.runId || worker.runs.length) return false;
+      for (const id of worker.runs) {
+        if (expected.has(id)) return false;
+        expected.set(id, worker.workerId);
+      }
+    }
+    return research.projectDashboardHistoricalCleanup?.(id, expected) === true;
+  }
+  function historicalFollowChoice(ticket) {
+    const choice = savedFollowChoice;
+    if (!choice?.stamp || !archiveHealthy || closing || goalActions) return null;
+    const p = choice.project;
+    if (getFollowState(p) !== 'enabled' || getFollowStamp(p) !== choice.stamp
+      || (ticket && ticket.projectId !== p.meta.projectId)) return null;
+    let historical = false;
+    for (const row of observeWorkspaceProjects(true)) {
+      const p = row.project;
+      if (!p || !dashboardProjectReliable(p) || p.control || waitingForPublication.has(p)
+        || p.meta.taskCreation !== 'confirmed' || p.meta.taskError || workspaceCoreWrites.get(p)?.pending
+        || [...p.records.values()].some(r => CORE_MUTATIONS.has(r.operation) && coreUnsettled(r))) return null;
+      if (row.lifecycle === 'active') return null;
+      if (row.snapshot?.lifecycle === 'snapshot') {
+        // The only terminal this branch may select is A's existing exact
+        // publication. After restart the archive scope is the durable witness.
+        if (!ticket || p !== choice.project || row.snapshot.endedAt !== ticket.endedAt || !lookupWorkspaceGrant(p)) return null;
+      } else if (row.lifecycle === 'unknown' || row.snapshot?.lifecycle === 'unknown') {
+        if (p === choice.project || !historicalCleanupOnly(p)) return null;
+        historical = true;
+      } else if (row.snapshot?.lifecycle !== 'idle' || !['idle', 'paused', 'completed'].includes(row.lifecycle)
+        || terminalWriteState(null, research.projectDashboardWriteState(row.projectId)).pending) return null;
+    }
+    return historical ? choice : null;
+  }
+  // A restored project with no current-process activity can remain parked.
+  // This witnesses only the local deferral policy, never settlement of its old work.
+  const parkedDashboardRevisions = new WeakMap();
+  if (deferHistoricalWork) for (const p of projects.values()) parkedDashboardRevisions.set(p, p.meta.revision);
+  function parkedForDashboard(p) {
+    if (parkedDashboardRevisions.get(p) !== p.meta.revision || freshProjects.has(p) || p.control
+      || waitingForPublication.has(p) || workspaceCoreWrites.has(p) || lookupWorkspaceGrant(p)
+      || workersOf(p.meta).some(w => workerRunsStartedHere.has(w))) return false;
+    const id = p.meta.projectId, goal = goals.monitorLifecycle(id);
+    return goal === null || goal.state === 'unknown' && (goal.historicalDeferred === true
+      || goals.diagnostic(id)?.error?.code === 'MAIN_CONTROL_HISTORY_DEFERRED');
+  }
+  function deferredDashboardNominee(ticket) {
+    if (!archiveHealthy || closing || goalActions) return null;
+    const follow = savedFollowChoice, barrier = archive.barrier();
+    const p = ticket ? projects.get(ticket.projectId) : follow?.project;
+    if (!p || !dashboardProjectReliable(p) || p.meta.taskCreation !== 'confirmed' || p.meta.taskError
+      || p.control || waitingForPublication.has(p) || workspaceCoreWrites.get(p)?.pending
+      || [...p.records.values()].some(r => CORE_MUTATIONS.has(r.operation) && coreUnsettled(r))) return null;
+    const policy = getFollowState(p), stamp = getFollowStamp(p);
+    if (ticket ? archive.latest() !== ticket || barrier?.state !== 'published' || barrier.endedAt !== ticket.endedAt
+      || !(policy === 'absent' || policy === 'enabled' && stamp)
+      : barrier || archive.latest() || !follow?.stamp || policy !== 'enabled' || stamp !== follow.stamp) return null;
+    return p;
+  }
+  function deferredDashboardChoice(ticket) {
+    const p = deferredDashboardNominee(ticket);
+    if (!p) return null;
+    // Use only synchronous, in-process observations of other projects. A live
+    // competitor (including an ungranted one) is not parked legacy history.
+    for (const row of observeWorkspaceProjects(true)) {
+      if (row.lifecycle === 'active' || !row.project) return null;
+      if (row.project === p) {
+        if (row.snapshot?.lifecycle === 'snapshot' && (!ticket || row.snapshot.endedAt !== ticket.endedAt)) return null;
+        continue;
+      }
+      if (parkedForDashboard(row.project)) continue;
+      if (!['idle', 'paused', 'completed'].includes(row.lifecycle) || row.snapshot?.lifecycle !== 'idle') return null;
+    }
+    return p;
+  }
+  const getHistoricalSaved = () => (deferHistoricalWork ? deferredDashboardChoice() : historicalFollowChoice()) ? getSaved() : null;
+  function getHistoricalPublication(ticket) {
+    if (deferHistoricalWork) {
+      const p = deferredDashboardChoice(ticket);
+      return p && savedFollowScope(p) !== null ? ticket : null;
+    }
+    const choice = historicalFollowChoice(ticket);
+    // In addition to the archive's scope/write checks, demand the followed
+    // project's own clean lifecycle, exact history and settled mutations.
+    return choice && savedFollowScope(choice.project) !== null ? choice : null;
+  }
   const workspaceMonitor = createWorkspaceMonitorSelection(observeWorkspaceProjects, () => monitorActivation);
-  const workspaceDashboard = createWorkspaceDashboard({
-    workspaceMonitor: createWorkspaceDashboardSelection(observeWorkspaceProjects, () => monitorActivation, lookupWorkspaceGrant),
+  const liveDashboard = createWorkspaceDashboard({
+    workspaceMonitor: createWorkspaceDashboardSelection(() => observeWorkspaceProjects(true), () => monitorActivation, lookupWorkspaceGrant),
     lookupReader: id => lookupWorkspaceGrant(projects.get(id)),
   });
+  // Negative witness only: persisted project/run rows alone never create an
+  // archive, grant access to Core, or authorize retrospective publication.
+  function archiveScope(p) {
+    const m = p.meta, owner = m.creator, main = m.main;
+    check(!p.detailsDeferred && dashboardProjectReliable(p) && m.taskCreation === 'confirmed' && owner?.sessionId && owner.sessionPath && m.taskId, 'PROJECT_DASHBOARD_VIEW_CHANGED');
+    const goal = goals.monitorLifecycle(m.projectId);
+    const workerSet = workersOf(m).map(w => [w.workerId,w.lastRun,w.runs]);
+    const history=research.projectDashboardHistorySeal?.(m.projectId,workersOf(m).flatMap(w=>w.runs));
+    const completion=goal === null ? null : goals.dashboardCompletionSeal(m.projectId);
+    check(typeof history === 'string' && SHA256.test(history) && (goal === null || typeof completion === 'string' && SHA256.test(completion)), 'PROJECT_DASHBOARD_SNAPSHOT_CHANGED');
+    const mutations = [...p.records.values()].filter(r=>CORE_MUTATIONS.has(r.operation)).map(r=>[r.operationId,r.revision,r.phase,r.outcome?.state]).sort((a,b)=>a[0].localeCompare(b[0]));
+    const policy = getFollowState(p);
+    check(policy === 'absent' || policy === 'enabled' && getFollowStamp(p), 'PROJECT_DASHBOARD_VIEW_DENIED');
+    // Byte-identical pre-opt-in scope for 0.36.3 publications; once a project
+    // opts in, its new consent epoch prevents resurrection after revocation.
+    return createHash('sha256').update(JSON.stringify(['workspace-publication-v1',m.projectId,m.taskId,owner.sessionId,owner.sessionPath,
+      DASHBOARD_MAIN_IDENTITY.map(k=>main[k]),workerSet,mutations,history,completion,
+      ...(policy === 'enabled' && getFollowArchiveStamp(p) ? ['persistent-follow',getFollowArchiveStamp(p)] : [])])).digest('hex');
+  }
+  function terminalOf(p) {
+    if (!p || !dashboardProjectReliable(p)) return null;
+    const id=p.meta.projectId, goal=goals.monitorLifecycle(id), workers=workersOf(p.meta).map(w=>monitorWorker(id,w,true));
+    const row=observeProjectSnapshot(goal,workers);
+    return row.lifecycle === 'snapshot' ? row : null;
+  }
+  function capture(id) {
+    if (!archiveHealthy || disposed || !supportsManagedDashboardReads(createCore)) return null;
+    const p=projects.get(id);
+    if (waitingForPublication.has(p)) return null;
+    const terminal=terminalOf(p), grant=terminal && lookupWorkspaceGrant(p);
+    if (!grant) return null;
+    const {endedAt,source,activation}=terminal, scopeSeal=archiveScope(p);
+    const guard=()=>{
+      if (disposed || lookupWorkspaceGrant(p)!==grant || archiveScope(p)!==scopeSeal) return false;
+      const latest=terminalOf(p);
+      if (!latest || latest.endedAt!==endedAt || latest.source!==source || latest.activation.order!==activation.order) return false;
+      const writes=terminalWriteState(workspaceCoreWrites.get(p) ?? null,research.projectDashboardWriteState(id));
+      return !writes.pending && writes.endedAt < endedAt;
+    };
+    return {endedAt,scopeSeal,guard,authorize:check=>verifyPublicationOwner(p,check),
+      getRevision:()=>grant.snapshotRevision(endedAt),read:grant.readSnapshot};
+  }
+  function publishedAllowed(ticket) {
+    if (!archiveHealthy || disposed || archive.latest()!==ticket) return false;
+    const p=projects.get(ticket.projectId);
+    if (!p || archiveScope(p)!==ticket.scopeSeal) return false;
+    const writes=terminalWriteState(workspaceCoreWrites.get(p) ?? null,research.projectDashboardWriteState(ticket.projectId));
+    return !writes.pending && writes.endedAt < ticket.endedAt;
+  }
+  async function verifyPublicationOwner(p,guard) {
+    guard();
+    const {creator,main}=p.meta;
+    const receipt=taskReceipt(p,await bounded(sdk.tasks.get(p.meta.taskId))); guard();
+    check(receipt.status==='completed' && !(await ownSessions()).some(s=>s.sessionId===creator.sessionId || s.path===creator.sessionPath),'PROJECT_OWNER_DENIED'); guard();
+    const info=await readResearchSessionInfo(sdk,{sessionId:main.sessionId},{namespace:'home'}); guard();
+    check(info.lifecycle==='active' && info.path===main.sessionPath && ['sessionId','agentId','cwd','kind','namespace','visibility','ownerPluginId'].every(k=>info[k]===main[k]),'PROJECT_MAIN_DENIED');
+    const roster=await bounded(sdk.agents.list({lifecycle:'all'})); guard();
+    const roles=roster?.ok!==false && !roster?.error && Array.isArray(roster?.agents) ? roster.agents.filter(a=>a.id===main.agentId) : [];
+    check(roles.length===1 && roles[0].deletedAt==null && roles[0].state==='active' && roles[0].ownerPluginId===APP && roles[0].plugin?.ownerPluginId===APP
+      && ['private','plugin_private'].includes(roles[0].visibility) && ['private','plugin_private'].includes(roles[0].plugin?.visibility)
+      && roles[0].plugin.kind==='role' && roles[0].plugin.roleId==='main','PROJECT_MAIN_DENIED');
+  }
+  const authorizePublished=(ticket,guard)=>verifyPublicationOwner(projects.get(ticket.projectId),guard);
+  publisher=createSnapshotPublisher({archive,capture: id => {
+    const candidate = capture(id);
+    if (!candidate) return null;
+    return { ...candidate,
+      guard: () => (!closing || drainingPublication && !disposed && canDrainPublication()) && candidate.guard(),
+      read(selection, guard, endedAt) {
+        // Only the publisher can mark its read capability. A route, document or
+        // stale caller can never present this guard to the Project Core queue.
+        const internal = () => guard();
+        publicationGuards.add(internal);
+        return candidate.read(selection, internal, endedAt);
+      } };
+  }});
+  if (archiveHealthy && typeof research.subscribeProjectDashboardTerminal==='function') offTerminal=research.subscribeProjectDashboardTerminal(publisher.notify);
+  if (archiveHealthy && typeof research.subscribeProjectWorkerSettlement==='function') offWorkerSettlement=research.subscribeProjectWorkerSettlement(id=>{
+    goals.refreshDashboardTerminal(id);
+    // Stopping never emits a normal finished-run event. Only a witnessed,
+    // clean round boundary can wake the unmanaged project's publisher here.
+    const p = projects.get(id);
+    if (p && dashboardProjectReliable(p) && goals.monitorLifecycle(id) === null
+      && workersOf(p.meta).some(worker => monitorWorker(id, worker, true).gracefulRound === true)) publisher.notify(id);
+  });
+  savedFollowChoice = restoreSavedFollowChoice(); // No live grant or Core read on restore.
+  const publishedDashboard=withPublishedWorkspaceDashboard({live:liveDashboard,archive,allowed:publishedAllowed,authorize:authorizePublished,epoch:()=>monitorActivation,
+    getSaved, getHistoricalSaved, getHistoricalPublication,
+    liveOwnerCheck(cur) {
+      if (cur?.state !== 'active' && cur?.state !== 'snapshot') return null;
+      const p = projects.get(cur.projectId), record = workspaceDashboardGrants.get(p);
+      return record?.followStamp ? guard => verifyPublicationOwner(p, guard) : null;
+    }});
+  const dashboardHistoryPreparations = new WeakMap();
+  async function prepareDashboardCurrent(guard) {
+    if (guard() !== true) return;
+    const ticket = archive.latest(), p = deferredDashboardChoice(ticket);
+    if (!p || savedFollowScope(p) !== null) return;
+    const { projectId } = p.meta, expected = historicalRunRefs(p), key = json(expected);
+    const stamp = getFollowStamp(p), epoch = monitorActivation, revision = p.meta.revision;
+    const exact = () => {
+      check(guard() === true && monitorActivation === epoch && p.meta.revision === revision && getFollowStamp(p) === stamp
+        && deferredDashboardNominee(ticket) === p && json(historicalRunRefs(p)) === key, 'PROJECT_DASHBOARD_VIEW_CHANGED');
+      return true;
+    };
+    let entry = dashboardHistoryPreparations.get(p);
+    if (entry?.key === key) { await entry.job; return; }
+    await verifyPublicationOwner(p, exact); exact();
+    entry = dashboardHistoryPreparations.get(p);
+    if (entry?.key === key) { await entry.job; return; }
+    if (entry?.pending) return; // A changed scope never joins or replaces an in-flight preparation.
+    entry = { key, pending: true, job: null };
+    dashboardHistoryPreparations.set(p, entry);
+    entry.job = Promise.resolve().then(async () => {
+      exact();
+      await ensureProjectDetails(p);
+      exact();
+      await goals.prepareProject(projectId); // Local scoped load only; never runs alarm recovery.
+      exact();
+      await research.prepareProjectHistory(projectId, expected, exact, { fresh: freshProjects.has(p) });
+      exact();
+    }).catch(() => {
+      // A stable denial is not work for every poll to repeat. A cancelled or
+      // superseded request, on the other hand, cannot consume the new scope.
+      try { exact(); } catch { dashboardHistoryPreparations.delete(p); }
+    }).finally(() => { entry.pending = false; });
+    await entry.job;
+  }
+  const workspaceDashboard = deferHistoricalWork ? Object.freeze({
+    async current(guard) {
+      try { await prepareDashboardCurrent(guard); }
+      catch { return { state: 'unavailable' }; }
+      return publishedDashboard.current(guard);
+    },
+    read: publishedDashboard.read, // A business request never loads absent historical scope.
+  }) : publishedDashboard;
+  async function runGoalAction(action) {
+    openForBusiness(); goalActions++;
+    try { return await action(); } finally { goalActions--; }
+  }
   async function goal(action, args, ctx) {
-    const result = await goals.invoke(action, args, ctx);
+    const result = await runGoalAction(() => goals.invoke(action, args, ctx));
+    openForBusiness();
     // MainControl itself requires 'creator' for these two actions, including
     // the existing Project authorize and bound-main readiness checks. Never
     // infer a creator from worker start, restore, or a viewer request.
@@ -1897,12 +2517,14 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     check(['status', 'acknowledge', 'wait', 'continue_work', 'pause', 'stop', 'complete'].includes(action), 'PROJECT_TOOL_DENIED');
     // Internal tool permission is not authority. The genuine caller must match
     // the full currently bound main identity, never the creator or a worker.
-    const p = await boundMain(ctx, { readOnly: action === 'status' }); check(args?.projectId === p.meta.projectId, 'PROJECT_MAIN_DENIED');
-    return goals.invoke(action, args, ctx);
+    const p = await boundMain(ctx, { readOnly: action === 'status' }); openForBusiness(); check(args?.projectId === p.meta.projectId, 'PROJECT_MAIN_DENIED');
+    return runGoalAction(() => goals.invoke(action, args, ctx));
   }
   return Object.freeze({ create, operatorRead, operatorSave, list, status, ipcUsage, assign, start, stop, result: (args, ctx) => result(args, ctx, null, true), graph, dashboardSnapshot, workerModels, finalize, summary, summaryStatus, summaryResult, summaryStop, paperSubgraph, paper, paperStatus, paperResult, paperStop,
     paperAudit, paperAuditStatus, paperAuditResult, paperAuditStop, paperVerify, paperVerifyStatus, paperVerifyResult, paperVerifyStop,
+    paperVerifyMath, paperVerifyMathStatus, paperVerifyMathResult, paperVerifyMathStop,
     paperPlan, paperPlanStatus, paperPlanResult, paperPlanStop, paperSection, paperSectionStatus, paperSectionResult, paperSectionStop, paperStitch, paperStartIpcRefusal,
-    paperRevise, paperRevisionStatus, paperRevisionResult, paperRevisionStop, dashboardOverview, readDashboard, authorizeDashboardView,
-    verificationReads, recheck, doctor, invoke, handles, goal, mainGoal, workspaceMonitor, workspaceDashboard, activateRestarts: () => goals.activateRestarts(), dispose });
+    paperRevise, paperRevisionStatus, paperRevisionResult, paperRevisionStop, dashboardOverview, readDashboard, authorizeDashboardView, dashboardFollow, dashboardUnfollow,
+    verificationReads, recheck, doctor, invoke, handles, goal, mainGoal, workspaceMonitor, workspaceDashboard,
+    activateRestarts: () => runGoalAction(() => goals.activateRestarts()), dispose });
 }

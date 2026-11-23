@@ -18,7 +18,7 @@ const projectId = 'fixture-project', generation = 'fixture-generation';
 const currentPath = '/workspace-monitor/current', overviewPath = '/workspace-monitor/api/overview';
 let instance = 0;
 
-async function fixture(t, { ready, themeRead, themeSubscribe, initiallyHidden = false, facts } = {}) {
+async function fixture(t, { ready, themeRead, themeSubscribe, initiallyHidden = false, facts, discovery } = {}) {
   const elements = new Map(), window = new EventTarget(), document = new EventTarget();
   const node = () => ({ dataset: {}, textContent: '', children: [], style: {},
     appendChild(child) { this.children.push(child); }, replaceChildren(...children) { this.textContent = ''; this.children = children; }, remove() {} });
@@ -44,7 +44,7 @@ async function fixture(t, { ready, themeRead, themeSubscribe, initiallyHidden = 
       assert.equal(options.method, 'GET'); assert.equal(signal.aborted, false);
       if (url === currentPath) {
         assert.equal(options.headers, undefined);
-        return Response.json(facts ? { state: 'active', projectId, generation } : { state: 'idle' });
+        return Response.json(discovery?.() ?? (facts ? { state: 'active', projectId, generation } : { state: 'idle' }));
       }
       assert.equal(url, overviewPath); assert.equal(typeof facts, 'function');
       assert.deepEqual(options.headers, { 'x-hana-math-monitor-generation': generation });
@@ -67,6 +67,21 @@ function expect(row, counts, text) {
   assert.deepEqual([row.ready, row.get], counts, row.label);
   if (text !== undefined) assert.equal(row.text, text, row.label);
 }
+
+test('saved workspace overview labels the reading basis instead of an end time', async t => {
+  const asOf = Date.parse('2026-01-02T03:04:05.678Z');
+  let target = { state: 'saved', projectId, generation, asOf };
+  const f = await fixture(t, { facts: () => 1, discovery: () => target });
+  await f.start(); await flush();
+  assert.equal(f.measure('saved').state, 'saved');
+  assert.equal(f.document.querySelector('#landing-state').textContent, '当前已保存结果（只读）');
+  assert.equal(f.document.querySelector('#refresh-note').textContent, '读取基准时间 2026-01-02T03:04:05.678Z');
+  assert.deepEqual(f.requests.map(row => row.url), [currentPath, overviewPath, currentPath]);
+  target = { state: 'active', projectId, generation };
+  await f.advance(interval);
+  assert.equal(f.measure('active').state, 'active');
+  assert.doesNotMatch(f.document.querySelector('#refresh-note').textContent, /读取基准时间|结束时间/);
+});
 
 test('healthy mount and genuine visibility edge do not duplicate ready or GET; close stops them', async t => {
   const f = await fixture(t); await f.start(); await flush();

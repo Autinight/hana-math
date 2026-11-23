@@ -166,6 +166,54 @@ test('ProjectService observes only formally started fixture workers and never ca
   } finally { f.research.projectWorkerStatus = original; }
 });
 
+test('Σ joins a round-boundary stop only with matching Research evidence; force never qualifies', async t => {
+  const f = await fixture(t), p = await f.create(), guard = () => true;
+  let observation = { state:'active' };
+  f.research.projectWorkerMonitor = () => observation;
+  f.research.stopProjectWorker = (id,runId) => f.research.projectWorkerStatus(id,runId); // keep the run held through the request
+  await f.service.assign({task:'Round-boundary fixture'},p.context);
+  const {runId} = await f.service.start({projectId:p.projectId},p.context);
+  const current = () => f.service.workspaceDashboard.current(guard);
+  const active = await current(); assert.equal(active.state,'active');
+  await f.service.stop({projectId:p.projectId,force:false},p.context);
+  assert.deepEqual(await current(),{state:'unavailable'},'Project stop intent alone is not a running round');
+  observation = {state:'active',gracefulRound:true};
+  assert.equal((await current()).state,'active');
+  assert.deepEqual(f.service.workspaceMonitor.current(),{status:'idle'},'legacy monitor contract unchanged');
+  observation = {state:'idle',gracefulRound:true,terminal:{runId:'wrong-run',startedAt:111,endedAt:222}};
+  assert.deepEqual(await current(),{state:'unavailable'});
+  observation.terminal.runId = runId;
+  const terminal = await current(); assert.equal(terminal.state,'snapshot'); assert.equal(terminal.endedAt,222);
+  await f.service.stop({projectId:p.projectId,force:true},p.context);
+  assert.notEqual((await current()).state,'snapshot');
+  observation = {state:'active',gracefulRound:true};
+  assert.deepEqual(await current(),{state:'unavailable'},'force escalation blocks a stale graceful witness');
+  assert.deepEqual(f.calls.core,[]);
+});
+
+test('a graceful boundary at admission return keeps the verified run activation; mere stop intent does not', async t => {
+  for (const witnessed of [false,true]) {
+    const f = await fixture(t), p = await f.create(), gate = f.behavior.startGate = defer(), entered = defer();
+    f.behavior.onAdmission = () => entered.resolve();
+    let observation = {state:'idle',snapshotUnconfirmed:true};
+    f.research.projectWorkerMonitor = () => observation;
+    const stop = f.research.stopProjectWorker;
+    f.research.stopProjectWorker = async (id,runId,options) => {
+      const value = await stop(id,runId,options);
+      observation = {state:'idle',gracefulRound:witnessed,terminal:{runId,startedAt:10,endedAt:20}};
+      return value;
+    };
+    await f.service.assign({task:'admission-race fixture'},p.context);
+    const starting = f.service.start({projectId:p.projectId},p.context);
+    await entered.promise;
+    try { await f.service.stop({projectId:p.projectId},p.context); } finally { gate.resolve(); }
+    await starting;
+    const terminal = await f.service.workspaceDashboard.current(() => true);
+    assert.equal(terminal.state,witnessed ? 'snapshot' : 'idle');
+    assert.equal(f.calls.starts.length,1);
+  }
+});
+
 test('ProjectService selects a worker that ended without a viewer, invalidates on same-project admission and grant revocation', async t => {
   const f = await fixture(t), guard = () => true;
   let record;

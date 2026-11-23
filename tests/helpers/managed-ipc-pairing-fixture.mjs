@@ -19,7 +19,7 @@ async function registered(t, f, projects = f.service) {
   const registration = await registerMathResearch(sdk, research, projects); t.after(() => registration.dispose());
   return input => tool.execute({ ...input, context: origin });
 }
-export async function pairingFixture(t, { plannerOutput = planner, sectionOutput = () => '\\section{Opaque}\\label{sec:opaque}\nOpaque.\n' } = {}) {
+export async function pairingFixture(t, { plannerOutput = planner, sectionOutput = () => '\\section{Opaque}\\label{sec:opaque}\nOpaque.\n', mathOutput, stage } = {}) {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'managed-ipc-test-install-')));
   t.after(() => fs.rm(base, { recursive: true, force: true }));
   for (const [rel, content] of Object.entries({ 'dependencies/python/bin/python3': 'not executed', 'runtime/research_entry.py': '# fixture',
@@ -30,14 +30,19 @@ export async function pairingFixture(t, { plannerOutput = planner, sectionOutput
   let f;
   f = await fixture(t, { multiWorker: true, createCore: options => createResearchRuntime(f.sdk, { ...options, packageRoot: base, platform: 'darwin', arch: 'arm64' }),
     summaryWriter: { async start(input) {
-      assert.ok(['paper-plan', 'paper-section'].includes(input.kind)); const section = input.kind === 'paper-section'; writers.push(input.reportId);
+      const section = input.kind === 'paper-section', math = input.kind === 'paper-math-verification';
+      assert.ok(input.kind === 'paper-plan' || section || math && typeof mathOutput === 'function'); writers.push(input.reportId);
       const model = { provider: 'fixture', id: 'fixture-verifier' };
-      const binding = { role: 'report-writer', agentId: `math-paper-${section ? 'section-writer' : 'planner'}-01234567-89ab-cdef-0123-456789abcdef`,
+      const agentKind = math ? 'paper-math-verifier' : 'math-report-writer';
+      const prefix = math ? agentKind : section ? 'math-paper-section-writer' : 'math-paper-planner';
+      const binding = { role: 'report-writer', agentId: `${prefix}-01234567-89ab-cdef-0123-456789abcdef`,
         sessionId: 'fixture-plan-' + writers.length, sessionPath: '/fixture/' + input.reportId + '.jsonl', cwd: input.cwd, kind: `math-${input.kind}:${input.projectId}:${input.reportId}`, model, sendState: 'accepted', sendPending: false };
       f.host.set(binding.sessionPath, { ...binding, path: binding.sessionPath, ownerPluginId: 'hana-math', namespace: 'app', visibility: 'plugin_private', lifecycle: 'active' });
-      if (!f.agents.some(a => a.id === binding.agentId)) f.agents.push({ id: binding.agentId, state: 'active', deletedAt: null, ownerPluginId: 'hana-math', visibility: 'plugin_private', plugin: { ownerPluginId: 'hana-math', visibility: 'plugin_private', kind: 'math-report-writer' } });
+      if (!f.agents.some(a => a.id === binding.agentId)) f.agents.push({ id: binding.agentId, state: 'active', deletedAt: null, ownerPluginId: 'hana-math', visibility: 'plugin_private', plugin: { ownerPluginId: 'hana-math', visibility: 'plugin_private', kind: agentKind } });
       await input.onBound(binding);
-      const terminal = { ...binding, state: 'completed', modelStopReason: 'stop', cleanupPending: false, finalText: section ? sectionOutput(input) : plannerOutput, toolSelection: { requested: [], resolved: [], effective: 'current', pendingToolNames: null } };
+      const terminal = { ...binding, state: 'completed', modelStopReason: 'stop', cleanupPending: false,
+        finalText: math ? mathOutput(input) : section ? sectionOutput(input) : plannerOutput,
+        toolSelection: { requested: [], resolved: [], effective: 'current', pendingToolNames: null } };
       const done = Promise.resolve().then(async () => { await state.onDone?.(input); return terminal; });
       done.catch(() => {}); // A writer handle may settle while the caller is still checking its binding.
       return { done, async stop() { stops.push(input.reportId); return terminal; } };
@@ -55,6 +60,7 @@ export async function pairingFixture(t, { plannerOutput = planner, sectionOutput
   async watch() { assert.fail('No watch for exited runtime'); }, async stop() { assert.fail('No stop for exited runtime'); } };
   const p = await f.create(), projectId = p.projectId;
   await f.service.finalize({ projectId, factIds: [factId] }, origin);
+  if (stage) f.sdk.resources = { stage };
   const plan = { projectId, brief: 'Opaque brief' }, execute = await registered(t, f);
   async function parent() {
     const q = await f.service.paperPlan(plan, origin);
@@ -62,7 +68,7 @@ export async function pairingFixture(t, { plannerOutput = planner, sectionOutput
     await f.handlers.get('math-project-report').run({ kind: 'schedule', scheduleId: event.scheduleId, input: event.payload });
     assert.equal((await f.service.paperPlanStatus({ projectId, reportId: q.reportId }, origin)).publicationStatus, 'reviewable-plan'); return q;
   }
-  f.sdk.resources = { async stage() { assert.fail('No stage in failed-report read/stop'); } };
+  if (!stage) f.sdk.resources = { async stage() { assert.fail('No stage in failed-report read/stop'); } };
   const reports = path.join(f.dataDir, 'research/projects', projectId, 'reports'), history = path.join(f.dataDir, 'research/core-calls', 'retained-fixture');
   await fs.mkdir(history, { recursive: true });
   const markerPath = path.join(history, '.complete'), unsafe = path.join(history, 'unsafe');

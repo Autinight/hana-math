@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fixture, origin, defer } from './helpers/project-service-fixture.mjs';
 import { createAppResearchCore } from '../packages/hana-math/runtime/research-runtime.mjs';
-import { createWorkspaceDashboard, createWorkspaceMonitorTransport } from '../packages/hana-math/dashboard-monitor-transport.mjs';
+import { createWorkspaceDashboard, createWorkspaceMonitorTransport, workspaceProjectBusy } from '../packages/hana-math/dashboard-monitor-transport.mjs';
 import { dashboardSelection } from '../packages/hana-math/dashboard-request.mjs';
 import { createWorkspaceMonitor } from '../packages/hana-math/ui/dashboard/workspace-monitor.mjs';
 import { liveChannels } from '../packages/hana-math/ui/dashboard/live-protocol.mjs';
@@ -126,6 +126,22 @@ test('there is no default channel or grant; discovery and leaked generations can
   await running.ready();
   assert.equal((await running.fetch(prefix + '/api/overview', { ...GET, headers:{ [header]:'guessed' } })).status, 403);
   assert.equal(readCalls, 0);
+});
+
+test('busy is a scoped failure, never a data packet; copied errors and revoked late notices stay generic', async () => {
+  const projectId = 'synthetic-busy', selection = dashboardSelection('/api/overview');
+  const ticket = { status:'selected', selection:{}, generation:Symbol() };
+  const monitor = { current:()=>ticket, read:()=>({status:'ok',lifecycle:'active',projectId}) };
+  let failure = workspaceProjectBusy, pause;
+  let grant = {projectId, async read() { if (pause) await pause.promise; throw failure; }};
+  const dashboard = createWorkspaceDashboard({workspaceMonitor:monitor,lookupReader:()=>grant});
+  const token = {}, transport = createWorkspaceMonitorTransport(dashboard,{current:()=>token});
+  await transport.ready(); const {generation} = dashboard.current(()=>true);
+  const get = () => transport.fetch(prefix+'/api/overview',{...GET,headers:{[header]:generation}});
+  const busy = await get(); assert.equal(busy.status,409); assert.deepEqual(await busy.json(),workspaceProjectBusy);
+  failure = {...workspaceProjectBusy}; assert.deepEqual(await dashboard.read(selection,generation,()=>true),expected);
+  failure=workspaceProjectBusy; pause=defer(); const late=dashboard.read(selection,generation,()=>true);
+  grant=null; pause.resolve(); assert.deepEqual(await late,expected); transport.dispose();
 });
 
 test('closing the trusted channel suppresses a late reader and retires the public generation', async () => {

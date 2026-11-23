@@ -1,5 +1,6 @@
 import * as fs from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { constants, lstatSync, realpathSync, renameSync, unlinkSync } from 'node:fs';
+import { types } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
@@ -57,11 +58,12 @@ async function withReadFile(absolute, root, read) {
   } finally { await file.close(); }
 }
 const readFile = (absolute, root) => withReadFile(absolute, root, file => file.readFile());
-async function readIdentity(file) {
-  const s = await file.stat({ bigint: true });
+function regularIdentity(s) {
   if (!s.isFile() || s.nlink !== 1n || s.size > BigInt(MAX_FILE)) fail('INVALID_FILE', 'Unsafe archival file identity');
   return { size: Number(s.size), identity: [s.dev, s.ino, s.mode, s.size, s.mtimeNs, s.ctimeNs].join(':') };
 }
+async function readIdentity(file) { return regularIdentity(await file.stat({ bigint: true })); }
+const sameInode = (a, b) => a.dev === b.dev && a.ino === b.ino;
 // Shared by the probe service. All writes stay below App dataDir; never follows links.
 export function createContextStore(dataDir) {
   if (typeof dataDir !== 'string' || !path.isAbsolute(dataDir) || path.normalize(dataDir) !== dataDir) fail('UNSAFE_PATH', 'dataDir must be a canonical absolute path');
@@ -106,6 +108,45 @@ export function createContextStore(dataDir) {
         await checkedPath(path.dirname(target), false, dataDir);
         try { await checkedPath(target, false, dataDir); } catch (error) { if (error.code !== 'ENOENT') throw error; }
         await fs.rename(temporary, target);
+      }
+    },
+    // Existing file only. Caller serializes writes and supplies a synchronous
+    // local guard and optional late async authority check. No async boundary
+    // between the final local guard and the atomic rename.
+    async writeGuarded(name, bytes, { guard, recheck } = {}) {
+      if (typeof guard !== 'function' || types.isAsyncFunction(guard) || recheck !== undefined && typeof recheck !== 'function')
+        fail('INVALID_INPUT', 'Guarded commit requires a synchronous guard');
+      if (Buffer.byteLength(bytes) > MAX_FILE) fail('INVALID_FILE', 'Guarded material exceeds 2 MiB');
+      const target = absolute(name), parent = path.dirname(target), temporary = `${target}.${randomUUID()}.tmp`;
+      await checkedPath(target, false, dataDir);
+      const parentBefore = lstatSync(parent, { bigint: true });
+      const parentPinned = () => parentBefore.isDirectory() && realpathSync(parent) === parent
+        && sameInode(parentBefore, lstatSync(parent, { bigint: true }));
+      const identity = file => regularIdentity(lstatSync(file, { bigint: true })).identity;
+      if (!parentPinned()) fail('UNSAFE_PATH', 'Guarded material parent changed');
+      const before = identity(target);
+      let created, staged, committed = false;
+      try {
+        const file = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+        try {
+          created = await file.stat({ bigint: true });
+          await file.writeFile(bytes);
+          staged = (await readIdentity(file)).identity;
+        } finally { await file.close(); }
+        await checkedPath(target, false, dataDir);
+        await recheck?.();
+        if (!parentPinned() || identity(target) !== before || identity(temporary) !== staged) fail('INVALID_FILE', 'Guarded material changed before commit');
+        const allowed = guard();
+        if (types.isPromise(allowed)) Promise.prototype.then.call(allowed, undefined, () => {});
+        if (allowed !== undefined && allowed !== true) fail('INVALID_INPUT', 'Guarded commit was not authorized');
+        renameSync(temporary, target);
+        committed = true;
+      } finally {
+        if (created && !committed) {
+          // Best effort only for the original private staging file. Preserve the
+          // original refusal and never remove another file or a followed path.
+          try { if (parentPinned() && sameInode(created, lstatSync(temporary, { bigint: true }))) unlinkSync(temporary); } catch {}
+        }
       }
     },
     async remove(name) {

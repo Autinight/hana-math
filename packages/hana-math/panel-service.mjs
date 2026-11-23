@@ -2,7 +2,7 @@ import { ROLE_IDS, profileService, publicAssistant, registerEditors } from './pr
 import { registerWorkspaceDashboardRoutes } from './workspace-dashboard-routes.mjs';
 
 export function projectAssistants(result) {
-  if (!Array.isArray(result?.agents)) throw new Error('Invalid assistant list');
+  if (result?.ok === false || result?.error || !Array.isArray(result?.agents)) throw new Error('Invalid assistant list');
   const seen = new Set();
   return result.agents.filter((agent) => {
     if (!publicAssistant(agent)) return false;
@@ -19,7 +19,7 @@ export function projectAssistants(result) {
 }
 
 export function projectRoles(result) {
-  if (!Array.isArray(result?.roles)) throw new Error('Invalid role list');
+  if (result?.ok === false || result?.error || !Array.isArray(result?.roles)) throw new Error('Invalid role list');
   return ROLE_IDS.map((id) => {
     const matches = result.roles.filter((role) => role?.roleId === id && role.appId === 'hana-math');
     if (matches.length !== 1 || typeof matches[0].agent?.name !== 'string' || !matches[0].agent.name.trim()) throw new Error('Missing or ambiguous role');
@@ -34,6 +34,8 @@ async function readSection(load) {
 }
 
 export async function loadPanel(sdk) {
+  // This roster is available during bootstrap: avatar and role binding
+  // resolution only read storage and lists, and never persist a recovered role.
   const profiles = profileService(sdk);
   const [assistants, roles] = await Promise.all([
     readSection(async () => Promise.all(projectAssistants(await sdk.agents.list({ scope: 'all', lifecycle: 'active' }))

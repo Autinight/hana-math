@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { capturePlanMaterial } from '../packages/hana-math/paper-plan.mjs';
+import { PAPER_MATH_PINS } from '../packages/hana-math/paper-math-verification.mjs';
 import { resolveReportKind, reportKindSpec, validReportStart, validReportPayload,
   reportTaskFields, matchesReportTaskFields } from '../packages/hana-math/project-report-kinds.mjs';
 
@@ -38,6 +39,62 @@ test('M05 integration plan kind has explicit admission, persisted hash binding a
   bound.target.factIds.push('b'.repeat(16)); assert.deepEqual(meta.plan.target.factIds, [factId], 'record owns its nested snapshot');
   assert.deepEqual(spec.artifactNames, { response: 'raw-response.txt', blocks: 'PLANNER_BLOCKS.json', plan: 'SECTION_PLAN.json', ledger: 'REFERENCE_LEDGER.md' });
   assert.deepEqual(spec.deliveredRoles, ['blocks', 'plan', 'ledger']); assert.deepEqual(reportKindSpec().recordFields(bound), {});
+});
+
+const mathKind = 'paper-math-verification';
+const mathSelectors = [{ sourceReportId: reportId }, { planReportId: reportId, finalSectionReportId: revision.verificationReportId }];
+const mathHashes = { mainSha256: 'a'.repeat(64), ledgerSha256: 'b'.repeat(64), ...PAPER_MATH_PINS, promptSha256: 'c'.repeat(64) };
+
+test('math admission accepts precisely a source selector or a complete stitched selector', () => {
+  const args = { kind: mathKind, language: 'English' };
+  for (const math of mathSelectors) assert.equal(validReportStart({ ...args, projectId, math }, projectId), true);
+  for (const math of [null, {}, [], { planReportId: reportId }, { finalSectionReportId: reportId },
+    { ...mathSelectors[0], ...mathSelectors[1] }, { ...mathSelectors[0], ...mathHashes },
+    { sourceReportId: [reportId] }, { sourceReportId: reportId, paperId: 'main' },
+    { ...mathSelectors[1], finalSectionReportId: 'foreign' }, Object.create(mathSelectors[0]),
+    { ...mathSelectors[0], [Symbol('hidden')]: true }, Object.defineProperty({}, 'sourceReportId', { value: reportId }),
+    { get sourceReportId() { assert.fail('do not read selector accessors'); } }]) {
+    assert.equal(validReportStart({ ...args, math }, projectId), false);
+  }
+  assert.equal(validReportStart({ ...args, language: 'French', math: mathSelectors[0] }, projectId), false);
+  assert.equal(validReportStart({ ...args, mathVerification: mathSelectors[0] }, projectId), false);
+  assert.equal(validReportStart({ ...args, math: mathSelectors[0], revision }, projectId), false);
+});
+
+test('math report binds each selector and five hashes to scalar-only task metadata', () => {
+  const spec = reportKindSpec(mathKind);
+  for (const selector of mathSelectors) {
+    const binding = { ...selector, ...mathHashes };
+    const record = spec.recordFields(binding);
+    assert.deepEqual(record, { kind: mathKind, math: binding });
+    assert.notStrictEqual(record.math, binding);
+    const meta = { projectId, reportId, language: 'English', state: 'queued', ...record };
+    assert.equal(validReportPayload(meta, projectId), true);
+    assert.equal(validReportPayload(meta, 'project-other'), false);
+    const fields = reportTaskFields(meta);
+    assert.deepEqual(fields, { projectId, reportId, kind: mathKind, ...binding });
+    assert.ok(Object.values(fields).every(value => typeof value === 'string'));
+    assert.equal(matchesReportTaskFields(meta, { ...fields, hostField: 'extra' }), true);
+    for (const key of Object.keys(fields)) assert.equal(matchesReportTaskFields(meta, { ...fields, [key]: 'foreign' }), false, key);
+    for (const key of Object.keys(binding)) {
+      const missing = { ...binding }; delete missing[key];
+      assert.equal(validReportPayload({ ...meta, math: missing }, projectId), false, key);
+      assert.equal(validReportPayload({ ...meta, math: { ...binding, [key]: [binding[key]] } }, projectId), false, key);
+    }
+    for (const extra of [{ ledger: 'private text' }, { mathVerdict: 'correct' }, { citationStatus: 'verified' }]) {
+      assert.equal(validReportPayload({ ...meta, math: { ...binding, ...extra } }, projectId), false);
+      assert.throws(() => spec.recordFields({ ...binding, ...extra }), { code: 'PROJECT_INVALID_INPUT' });
+    }
+    for (const key of Object.keys(PAPER_MATH_PINS)) assert.equal(validReportPayload({ ...meta,
+      math: { ...binding, [key]: 'f'.repeat(64) } }, projectId), false);
+    for (const state of ['queued', 'running', 'failed', 'stopped']) {
+      assert.equal(validReportPayload({ ...meta, state, mathVerdict: 'correct' }, projectId), false);
+    }
+    for (const mathVerdict of ['correct', 'wrong']) assert.equal(validReportPayload({ ...meta, state: 'completed', mathVerdict }, projectId), true);
+    for (const mathVerdict of [undefined, null, 'verified', ['correct']]) assert.equal(validReportPayload({ ...meta, state: 'completed', mathVerdict }, projectId), false);
+  }
+  assert.deepEqual(spec.artifactNames, { response: 'raw-response.txt', review: 'MATH_REVIEW.json' });
+  assert.deepEqual(spec.deliveredRoles, ['review']);
 });
 
 test('kind resolution defaults only omission and accepts explicit summary', () => {

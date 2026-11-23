@@ -5,6 +5,7 @@ import { validPlan, planHash } from './paper-plan.mjs';
 import { snapshotPaperSectionStart } from './paper-section-input.mjs';
 import { validSectionBinding } from './paper-section-binding.mjs';
 import { snapshotPlanData } from './paper-plan-input.mjs';
+import { PAPER_MATH_PINS } from './paper-math-verification.mjs';
 export const REPORT_ID = /^report-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const paperId = v => /^[a-z0-9][a-z0-9-]{0,63}$/.test(v);
@@ -18,6 +19,28 @@ const revisionHashes = ['mainSha256', 'verdictsSha256', 'ledgerSha256', 'origina
 const revisionKeys = ['verificationReportId', 'sourceReportId', 'paperId', 'citationStatus', 'sourceStatus', ...revisionHashes];
 const notesHashes = ['mainSha256', 'ledgerSha256', 'provenanceSha256', 'notesSha256', 'contractSha256', 'reviserPromptSha256', 'styleSha256', 'promptSha256'];
 const notesKeys = ['mode', 'sourceReportId', 'paperId', 'sourceStatus', 'notesBytes', ...notesHashes];
+const mathSelectors = [['sourceReportId'], ['planReportId', 'finalSectionReportId']];
+const mathHashes = ['mainSha256', 'ledgerSha256', 'contractSha256', 'verifierPromptSha256', 'promptSha256'];
+function mathShape(value, bound = false) {
+  if (!object(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) return null;
+  const keys = Reflect.ownKeys(value);
+  return mathSelectors.map(selector => bound ? [...selector, ...mathHashes] : selector).find(fields => keys.length === fields.length
+    && fields.every(key => {
+      const field = Object.getOwnPropertyDescriptor(value, key);
+      return field?.enumerable === true && typeof field.value === 'string'
+        && (mathHashes.includes(key) ? sha256(field.value) : REPORT_ID.test(field.value));
+    })) ?? null;
+}
+function mathBinding(value) {
+  const fields = mathShape(value, true);
+  return fields && value.contractSha256 === PAPER_MATH_PINS.contractSha256
+    && value.verifierPromptSha256 === PAPER_MATH_PINS.verifierPromptSha256 ? fields : null;
+}
+function copyMathBinding(value) {
+  const fields = mathBinding(value);
+  if (!fields) throw Object.assign(new Error('PROJECT_INVALID_INPUT'), { code: 'PROJECT_INVALID_INPUT' });
+  return Object.fromEntries(fields.map(key => [key, value[key]]));
+}
 function validNotesRevision(meta) {
   const r = meta.revision;
   return Object.keys(r).length === notesKeys.length && notesKeys.every(key => Object.hasOwn(r, key))
@@ -48,6 +71,18 @@ function validRevisionOutcomeRecord(meta) {
     && meta.taskCreating === false && meta.scheduleCreating === false);
 }
 const specs = Object.freeze({
+  'paper-math-verification': Object.freeze({
+    label: 'Whole-paper mathematical review',
+    startValid: args => args.language === 'English' && Object.hasOwn(args, 'math')
+      && Reflect.ownKeys(args).every(key => ['kind', 'projectId', 'language', 'math'].includes(key)) && Boolean(mathShape(args.math)),
+    persistedValid: (meta, projectId) => meta.language === 'English' && meta.projectId === projectId && Boolean(mathBinding(meta.math))
+      && (meta.state === 'completed' ? ['correct', 'wrong'].includes(meta.mathVerdict)
+        : !Object.hasOwn(meta, 'mathVerdict') || meta.mathVerdict === null),
+    recordFields: binding => ({ kind: 'paper-math-verification', math: copyMathBinding(binding) }),
+    taskFields: meta => ({ kind: 'paper-math-verification', ...copyMathBinding(meta.math) }),
+    artifactNames: Object.freeze({ response: 'raw-response.txt', review: 'MATH_REVIEW.json' }),
+    deliveredRoles: Object.freeze(['review']),
+  }),
   'paper-section': Object.freeze({
     label: 'Math paper section fragment',
     startValid: (args, projectId) => { const input = snapshotPaperSectionStart(args); return input.projectId === undefined || input.projectId === projectId; },

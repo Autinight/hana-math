@@ -777,6 +777,106 @@ for (const force of [false, true]) test(`configured unlimited worker stop force=
   assert.equal(status.state, 'stopped'); assert.equal(status.round, 1); assert.equal(f.calls.starts.length, 1);
 });
 
+for (const scenario of ['working', 'verifying', 'submitting', 'force', 'force-settling', 'bad-cleanup', 'round-timeout', 'run-timeout', 'bad-core-receipt', 'pre-settled-root']) {
+  test(`graceful round dashboard witness: ${scenario}`, { timeout: 15000 }, async t => {
+    const timeout = scenario.endsWith('timeout');
+    if (timeout) t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 2000000000000 });
+    const entered = deferred(), release = deferred(), settling = deferred(), finish = deferred(), notified = [], settlements = [];
+    t.after(() => { release.resolve(); finish.resolve(); });
+    const hold = async () => { entered.resolve(); await release.promise; };
+    const candidateRound = ['verifying', 'submitting'].includes(scenario);
+    const f = await fixture(t, { realContexts: true,
+      ...(scenario === 'bad-core-receipt' ? { coreTaskFailReceipt: { status: 'completed' } } : {}),
+      ...(scenario === 'bad-cleanup' ? { onSessionStop: state => { state.cleanupPending = true; } } : {}),
+      beforeCore: async ({ operation }) => { if (scenario === 'submitting' && operation === 'fact_submit') await hold(); },
+      turn: async event => {
+        if (event.input.role === 'verifier') {
+          if (scenario === 'verifying') await hold();
+          await event.invoke('math_verification_report', GOOD); return JSON.stringify(GOOD);
+        }
+        if (candidateRound && event.modelTurn === 1) await event.invoke('fact_submit', candidate);
+        if (!candidateRound) await hold();
+        return 'opaque normal end of model turn';
+      },
+    });
+    const projectId = 'project-graceful-round', workerId = 'worker-1';
+    f.service.subscribeProjectDashboardTerminal(id => notified.push(id));
+    f.service.subscribeProjectWorkerSettlement(id => settlements.push({ id, view: monitor() }));
+    await f.prepareWorker(projectId, workerId);
+    const job = await f.service.startWorkerRun({ projectId, workerId, ...(scenario === 'run-timeout' ? { timeoutSeconds: 60 } : {}),
+      workerPolicy: { maxRounds: 2, roundDelaySeconds: 0, roundTimeoutSeconds: scenario === 'round-timeout' ? 1 : 120 } }, origin);
+    const monitor = () => f.service.projectWorkerMonitor(projectId, workerId, job.runId);
+    await f.dispatch(); await entered.promise;
+    assert.equal((await f.service.status(job.runId, origin)).phase, candidateRound ? scenario : 'working');
+    assert.deepEqual(monitor(), { state: scenario === 'submitting' ? 'unknown' : 'active' });
+    const first = await f.service.stopProjectWorker(projectId, job.runId, { force: false });
+    assert.equal(first.state, 'running'); assert.equal(first.stopping, true);
+    assert.deepEqual(monitor(), { state: 'active', gracefulRound: true });
+    assert.deepEqual(notified, []); assert.deepEqual(settlements, []);
+    if (scenario === 'pre-settled-root') f.tasks.get(job.taskId).status = 'failed';
+    if (scenario === 'force') {
+      await f.service.stopProjectWorker(projectId, job.runId, { force: true });
+      assert.notEqual(monitor().gracefulRound, true);
+    } else if (scenario === 'force-settling') {
+      const fail = f.sdk.tasks.fail;
+      f.sdk.tasks.fail = async (id, error) => {
+        if (id === job.taskId) { settling.resolve(); await finish.promise; }
+        return fail(id, error);
+      };
+      release.resolve(); await settling.promise;
+      assert.equal(monitor().terminal, undefined);
+      const forced = f.service.stopProjectWorker(projectId, job.runId, { force: true });
+      finish.resolve(); await forced;
+    } else if (timeout) {
+      t.mock.timers.tick(scenario === 'round-timeout' ? 1000 : 60000);
+      assert.notEqual(monitor().gracefulRound, true);
+    }
+    release.resolve();
+    // The fixture's normal waitIdle uses setTimeout; under a mocked clock,
+    // cross the same coordinator fence without waiting on another clock tick.
+    let final = timeout ? await f.wait(job.runId) : await f.waitIdle(job.runId);
+    for (let i = 0; timeout && final.coordinatorActive && i < 2000; i++) { await tick(); final = await f.service.status(job.runId, origin); }
+    assert.equal(final.coordinatorActive, false);
+    const result = monitor();
+    await tick();
+    if (['working', 'verifying', 'submitting'].includes(scenario)) {
+      assert.equal(final.state, 'stopped'); assert.equal(final.error, null);
+      assert.deepEqual(final.lastRoundOutcome, { round: 1, code: 0 });
+      assert.equal(f.tasks.get(job.taskId).status, 'failed');
+      for (const task of f.tasks.values()) if (task.scope === 'app') assert.equal(task.status, 'failed');
+      assert.ok(result.terminal.startedAt <= result.terminal.endedAt);
+      const file = `research/runs/${job.runId}/run.json`, meta = await f.store.readJson(file);
+      assert.deepEqual(result, { state: 'idle', terminal: { runId: job.runId, startedAt: result.terminal.startedAt, endedAt: meta.endedAt }, gracefulRound: true });
+      assert.deepEqual(settlements, [{ id: projectId, view: result }]);
+      assert.equal(Object.keys(meta).some(k => /gracefulRound|monitor(Start|End)/.test(k)), false);
+      if (scenario === 'working') {
+        const bytes = await f.store.read(file);
+        await f.service.dispose();
+        const reopened = await fixture(t, { tasks: f.tasks, schedules: f.schedules, hostSessions: f.hostSessions }, f.dataDir);
+        assert.deepEqual(reopened.service.projectWorkerMonitor(projectId, workerId, job.runId), { state: 'idle' });
+        assert.deepEqual(await reopened.store.read(file), bytes);
+      }
+    } else {
+      assert.equal(result.terminal, undefined, JSON.stringify(final));
+      assert.equal(result.gracefulRound, undefined);
+      assert.ok(settlements.every(({ view }) => !view.terminal && !view.gracefulRound));
+    }
+    assert.deepEqual(notified, [], 'graceful or interrupted stops do not use the legacy finished-run event');
+    assert.equal(f.calls.starts.filter(item => item.role === 'worker').length, 1);
+  });
+}
+
+test('graceful round dashboard witness: queued stop cannot qualify', async t => {
+  const f = await fixture(t, { realContexts: true }), projectId = 'project-graceful-queued', workerId = 'worker-1', notified = [];
+  f.service.subscribeProjectDashboardTerminal(id => notified.push(id));
+  await f.prepareWorker(projectId, workerId);
+  const job = await f.service.startWorkerRun({ projectId, workerId, workerPolicy: { maxRounds: 2 } }, origin);
+  await f.service.stopProjectWorker(projectId, job.runId, { force: false });
+  assert.equal((await f.waitIdle(job.runId)).state, 'stopped');
+  assert.deepEqual(f.service.projectWorkerMonitor(projectId, workerId, job.runId), { state: 'idle' });
+  await tick(); assert.deepEqual(notified, []); assert.equal(f.calls.starts.length, 0);
+});
+
 test('configured timeout resets confirmed MODEL_TURN_FAILED consecutive failures, closes stale credentials and advances only after cleanup', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 2000000000000 });
   const timed = deferred(), release = deferred(), third = deferred(), releaseThird = deferred();
@@ -3745,6 +3845,230 @@ test('worker dispatch snapshots survive later catalog changes and verifier keeps
   assert.equal(Object.hasOwn(status.sessions.find(s => s.role === 'verifier'), 'thinkingLevel'), false);
   behavior.catalog = { models: [] };
   assert.deepEqual((await f.service.projectWorkerStatus('dispatch-snapshot', job.runId)).selections.worker, job.selections.worker);
+});
+
+for (const history of [60, 600]) test(`deferred Research does zero historical I/O on cold construction and a fresh Project start (${history})`, async t => {
+  const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'research-deferred-')));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const store = createContextStore(dir);
+  const projectId = 'fixture-project', workerId = 'worker-1';
+  const runBase = store.absolute('research/runs');
+  await Promise.all(Array.from({length: history}, async (_, i) => {
+    await store.mkdir(`research/runs/run-prior-${i}`);
+    await store.write(`research/runs/run-prior-${i}/run.json`, '{"opaque":true}');
+  }));
+  await store.mkdir(`research/projects/${projectId}`, true);
+  await store.write(`research/projects/${projectId}/project.json`, JSON.stringify({ schemaVersion: 1, projectId,
+    worker: { workerId, runs: [], lastRun: null, start: {state: 'idle'} } }));
+  const originalRead = fs.open, originalList = fs.readdir, progress = [], historical = [], host = [];
+  fs.open = (file, ...args) => {
+    if (typeof file === 'string' && file.startsWith(`${runBase}/run-prior-`)) historical.push('open');
+    return originalRead(file, ...args);
+  };
+  fs.readdir = (file, ...args) => {
+    if (file === runBase) historical.push('list');
+    return originalList(file, ...args);
+  };
+  try {
+    const f = await fixture(t, { realContexts: true, async createService(sdk, options) {
+      for (const [domain, names] of [['tasks', ['get', 'list', 'listSchedules', 'getDelivery', 'unschedule']], ['sessions', ['get','list','context','abort']]]) {
+        for (const name of names) {
+          const fn = sdk[domain][name]; sdk[domain][name] = (...args) => { host.push(`${domain}.${name}`); return fn(...args); };
+        }
+      }
+      return createResearchService(sdk, { ...options, deferHistoricalWork: true, onRecoveryProgress: row => progress.push(row) });
+    } }, dir);
+    assert.equal(f.service.projectDashboardHistorySeal(projectId, []), null);
+    await f.prepareWorker(projectId, workerId);
+    await f.service.confirmProjectAdmission(projectId, [], () => true, { fresh: true });
+    const emptySeal = f.service.projectDashboardHistorySeal(projectId, []);
+    assert.match(emptySeal, /^[a-f0-9]{64}$/);
+    assert.equal(f.service.projectDashboardHistorySeal('another-project', []), null);
+    // The read path may run after admission confirmation without taking it away.
+    await f.service.prepareProjectHistory(projectId, [], () => true, { fresh: true });
+    const run = await f.service.startWorkerRun({projectId, workerId}, origin);
+    assert.equal(run.state, 'queued'); assert.equal(f.calls.taskCreate.length, 1); assert.equal(f.calls.schedule.length, 1);
+    assert.equal(f.service.projectDashboardHistorySeal(projectId, []), null);
+    await tick();
+    assert.deepEqual({ historical, host, progress }, { historical: [], host: [], progress: [] });
+    t.diagnostic(JSON.stringify({history, historicalJournalReads: historical.length, historicalHostCalls: host.length}));
+    await f.service.dispose();
+  } finally { fs.open = originalRead; fs.readdir = originalList; }
+});
+
+test('deferred standalone admission works on an empty install and keeps its coordinator exclusive', async t => {
+  const f = await fixture(t, { createService: (sdk, options) => createResearchService(sdk, { ...options, deferHistoricalWork: true }) });
+  const run = await f.service.run({problem: 'standalone fixture'}, origin);
+  assert.equal(run.state, 'queued');
+  await assert.rejects(f.service.run({problem: 'another standalone fixture'}, origin), {code: 'RUN_BUSY'});
+  assert.equal(f.calls.taskCreate.length, 1); assert.equal(f.calls.schedule.length, 1);
+});
+
+test('deferred history honors exact Project references and origin, never rewrites or replays a parked run', async t => {
+  const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'research-deferred-prior-')));
+  t.after(() => fs.rm(dir, {recursive: true, force: true}));
+  const store = createContextStore(dir);
+  const projectId = 'fixture-project', workerId = 'worker-1', runId = 'run-old', taskId = 'task-old';
+  const owner = {sessionId: 'owner-stable-id', sessionPath: origin.sessionPath};
+  const prior = { schemaVersion: 1, runId, projectId, workerId, taskId, owner, mode: 'project-worker',
+    state: 'running', phase: 'working', finalizing: false, cleanupPending: false, indeterminate: false,
+    cleanupErrors: [], sessions: [], submissions: [], verifiedFactIds: [], pendingMutations: [], scheduleIds: [],
+    taskCreatePending: false, schedulePending: false, taskSettlementPending: true, coreTaskId: null,
+    coreTaskCreatePending: false, coreTaskSettlementPending: false, runtimeCleanupPending: false, runtimeCleanupError: null };
+  await store.mkdir(`research/runs/${runId}`);
+  const journal = `research/runs/${runId}/run.json`, bytes = JSON.stringify(prior);
+  await store.write(journal, bytes);
+  await store.mkdir(`research/projects/${projectId}`, true);
+  await store.write(`research/projects/${projectId}/project.json`, JSON.stringify({ schemaVersion: 1, projectId,
+    worker: { workerId, runs: [runId], lastRun: runId, start: { state: 'started', runId } } }));
+  const ref = `context/projects/${projectId}/workers/${workerId}/run-ref.json`;
+  await store.mkdir(path.dirname(ref));
+  await store.write(ref, JSON.stringify({ schemaVersion: 1, projectId, workerId, runId }));
+  const f = await fixture(t, { createService: (sdk, options) => createResearchService(sdk, { ...options, deferHistoricalWork: true }) }, dir);
+  await assert.rejects(f.service.status(runId, {...origin, sessionPath: '/foreign.jsonl'}), {code: 'OWNER_DENIED'});
+  await assert.rejects(f.service.projectWorkerStatus(projectId, runId), {code: 'RUN_NOT_FOUND'});
+  const refs = [{workerId, runId}];
+  await assert.rejects(f.service.prepareProjectHistory(projectId, [], () => true, {fresh: false}), {code: 'PROJECT_HISTORY_UNCONFIRMED'});
+  await assert.rejects(f.service.prepareProjectHistory(projectId, refs, () => true, {fresh: true}), {code: 'PROJECT_HISTORY_UNCONFIRMED'});
+  await f.service.prepareProjectHistory(projectId, refs, () => true, {fresh: false});
+  const status = await f.service.status(runId, origin);
+  assert.equal(status.state, 'running'); assert.equal(status.coordinatorActive, false); assert.equal(status.recoveryUnsettled, true);
+  assert.equal(f.service.projectDashboardHistorySeal(projectId, [runId]), null);
+  await assert.rejects(f.service.confirmProjectAdmission(projectId, refs, () => true), {code: 'PROJECT_HISTORY_UNCONFIRMED'});
+  await assert.rejects(f.service.result(runId, fid, origin), {code: 'RUN_UNSETTLED'});
+  await assert.rejects(f.service.stop(runId, origin), {code: 'PROJECT_HISTORY_UNCONFIRMED'});
+  await assert.rejects(f.service.run({problem: 'global fixture'}, origin), {code: 'RECOVERY_BLOCKED'});
+  const handler = f.handlers.get('math-research-once');
+  assert.deepEqual(await handler.abort(taskId), {status: 'ignored'});
+  assert.deepEqual(await handler.run({kind: 'schedule', input: {runId, nonce: 'old'}}), {status: 'ignored'});
+  await f.service.dispose();
+  assert.equal((await store.read(journal)).toString(), bytes);
+  assert.deepEqual({abort: f.calls.abort, tasks: f.calls.taskCreate, core: f.calls.core, schedule: f.calls.schedule}, {abort: [], tasks: [], core: [], schedule: []});
+
+  // Independent checkpoint with a confirmed, already-ended child and no
+  // pending writes. Archived bytes are eligible for the existing scope hash;
+  // that eligibility does not confer a new writer's permit.
+  const done = { ...prior, state: 'finished', phase: 'finished', endedAt: 42, taskSettlementPending: false, abortOutcome: 'confirmed',
+    verifiedFactIds: [fid], sessions: [{ role: 'worker', sessionId: 'fixture-child', sessionPath: '/fixture/child.jsonl',
+      active: false, cwd: store.absolute(`context/projects/${projectId}/workers/${workerId}`), cleanupPending: false,
+      sendPending: false, sendState: 'accepted', abortOutcome: 'idle-confirmed' }] };
+  await store.write(journal, JSON.stringify(done), true);
+  const g = await fixture(t, { createService: (sdk, options) => createResearchService(sdk, { ...options, deferHistoricalWork: true }) }, dir);
+  assert.equal(g.service.projectDashboardHistorySeal(projectId, [runId]), null);
+  await g.service.prepareProjectHistory(projectId, refs, () => true);
+  assert.match(g.service.projectDashboardHistorySeal(projectId, [runId]), /^[a-f0-9]{64}$/);
+  assert.equal(g.service.projectDashboardHistorySeal(projectId, []), null);
+  assert.deepEqual(g.service.projectWorkerMonitor(projectId, workerId, runId), { state: 'idle' });
+  await assert.rejects(g.service.confirmProjectAdmission(projectId, refs, () => true), {code: 'PROJECT_HISTORY_UNCONFIRMED'});
+  assert.deepEqual(g.calls.abort, []);
+  assert.equal((await store.read(journal)).toString(), JSON.stringify(done));
+  assert.equal((await g.service.result(runId, fid, origin)).fact.markdown, 'existing fixture fact');
+  await g.service.dispose();
+});
+
+test('deferred natural completion witnesses authorize historical reads only', async t => {
+  const projectId = 'fixture-project', workerId = 'worker-1', runId = 'run-natural', taskId = 'task-natural';
+  const natural = { state: 'completed', phase: 'completed', abortOutcome: 'not-requested', sendState: 'accepted',
+    active: false, sendPending: false, cleanupPending: false, setupPending: false, finalizing: false,
+    modelStopReason: 'stop', error: null, failurePhase: null, sdkError: null };
+  const refs = [{ workerId, runId }], guard = () => true;
+  const cases = [
+    ['controlled Worker and noncontrolled Verifier', true, true],
+    ['aborted Worker and naturally completed Verifier', true, true, m => {
+      m.state = m.phase = 'stopped';
+      Object.assign(m.sessions[0], { state: 'stopped', phase: 'stopped', abortOutcome: 'aborted',
+        error: 'EXPLICIT_STOP', failurePhase: 'awaiting-agent-end', turnEnded: false, modelStopReason: null });
+    }],
+    ['existing aborted and idle receipts', true, false, m => {
+      m.sessions[0].abortOutcome = 'aborted'; m.sessions[1].abortOutcome = 'idle-confirmed';
+      delete m.sessions[0].setupPending; delete m.sessions[1].finalizing;
+    }],
+    ['pending Verifier send', false, true, m => { m.sessions[1].sendPending = true; }],
+    ['pending Worker cleanup', false, true, m => { m.sessions[0].cleanupPending = true; }],
+    ['incomplete session phase', false, true, m => { m.sessions[1].phase = 'awaiting-agent-end'; }],
+    ['abnormal stop reason', false, true, m => { m.sessions[0].modelStopReason = 'error'; }],
+    ['session error', false, true, m => { m.sessions[1].error = 'SESSION_NOT_COMPLETED'; }],
+    ['session failure phase', false, true, m => { m.sessions[1].failurePhase = 'send'; }],
+    ['session SDK error', false, true, m => { m.sessions[0].sdkError = { code: 'HOST_OPERATION_FAILED' }; }],
+    ['unknown send receipt', false, true, m => { m.sessions[1].sendState = 'unconfirmed'; }],
+    ['missing finalizing flag', false, true, m => { delete m.sessions[0].finalizing; }],
+    ['missing setup flag', false, true, m => { delete m.sessions[1].setupPending; }],
+    ['missing error evidence', false, true, m => { delete m.sessions[1].sdkError; }],
+    ['missing Worker turn marker', false, true, m => { delete m.sessions[0].modelTurn; }],
+    ['invalid Worker turn number', false, true, m => { m.sessions[0].modelTurn = 0; }],
+    ['incomplete Worker turn', false, true, m => { m.sessions[0].turnEnded = false; }],
+    ['Verifier with controlled turn fields', false, true, m => { Object.assign(m.sessions[1], {modelTurn: 1, turnEnded: true}); }],
+    ['unconfirmed run cleanup', false, true, m => { m.abortOutcome = 'unconfirmed'; }],
+    ['unsettled root task', false, true, m => { m.taskSettlementPending = true; }],
+    ['unsettled Core task', false, true, m => { m.coreTaskSettlementPending = true; }],
+    ['remaining schedule', false, true, m => { m.scheduleIds = ['schedule-old']; }],
+    ['pending shared write', false, true, m => { m.pendingMutations = [{operation: 'gm_add'}]; }],
+  ];
+  for (const [label, readable, recoveryUnsettled, change] of cases) await t.test(label, async t => {
+    const hostCalls = [];
+    const f = await fixture(t, { async createService(sdk, options) {
+      for (const [domain, names] of [['tasks', ['get', 'list', 'listSchedules', 'getDelivery', 'fail', 'unschedule']],
+        ['sessions', ['get', 'list', 'context', 'abort']]]) {
+        for (const name of names) {
+          const original = sdk[domain][name];
+          sdk[domain][name] = (...args) => { hostCalls.push(`${domain}.${name}`); return original(...args); };
+        }
+      }
+      return createResearchService(sdk, { ...options, deferHistoricalWork: true });
+    } });
+    const {store, service} = f;
+    const projectPath = `research/projects/${projectId}`;
+    const workerPath = `context/projects/${projectId}/workers/${workerId}`;
+    const journalPath = `research/runs/${runId}/run.json`;
+    await store.mkdir(projectPath); await store.mkdir(workerPath); await store.mkdir(path.dirname(journalPath));
+    await store.write(`${projectPath}/project.json`, JSON.stringify({ schemaVersion: 1, projectId,
+      worker: { workerId, runs: [runId], lastRun: runId, start: { state: 'settled', runId } } }));
+    await store.write(`${workerPath}/run-ref.json`, JSON.stringify({ schemaVersion: 1, projectId, workerId, runId }));
+    const meta = { schemaVersion: 1, mode: 'project-worker', projectId, workerId, runId, taskId,
+      owner: { sessionId: 'owner-stable-id', sessionPath: origin.sessionPath },
+      state: 'finished', phase: 'finished', endedAt: 42, finalizing: false, cleanupPending: false, abortOutcome: 'confirmed',
+      indeterminate: false, cleanupErrors: [], submissions: [], verifiedFactIds: [fid], pendingMutations: [], scheduleIds: [],
+      taskCreatePending: false, schedulePending: false, taskSettlementPending: false, taskTerminalExpected: 'completed',
+      coreTaskId: 'task-core', coreTaskCreatePending: false, coreTaskSettlementPending: false, coreTaskTerminalExpected: 'completed',
+      runtimeCleanupPending: false, runtimeCleanupError: null,
+      lastResultError: { primary: { code: 'FACT_RESULT_INVALID' }, cleanup: { confirmed: true, error: null } },
+      sessions: [
+        { ...natural, role: 'worker', sessionId: 'child-worker', sessionPath: '/fixture/worker.jsonl',
+          cwd: store.absolute(workerPath), modelTurn: 2, turnEnded: true },
+        { ...natural, role: 'verifier', sessionId: 'child-verifier', sessionPath: '/fixture/verifier.jsonl', submissionId: 'candidate-1',
+          cwd: store.absolute(`context/projects/${projectId}/research/${runId}/verifiers/candidate-1`) },
+      ],
+    };
+    change?.(meta);
+    const bytes = JSON.stringify(meta); await store.write(journalPath, bytes);
+    assert.equal(service.projectDashboardHistorySeal(projectId, [runId]), null, 'scope must be hydrated first');
+    await service.prepareProjectHistory(projectId, refs, guard);
+    const writes = service.projectDashboardWriteState(projectId), seal = service.projectDashboardHistorySeal(projectId, [runId]);
+    if (readable) {
+      assert.deepEqual(writes, { pending: false, endedAt: 0 });
+      assert.match(seal, /^[a-f0-9]{64}$/);
+    } else assert.deepEqual({ writes, seal }, { writes: null, seal: null });
+    assert.deepEqual(service.projectWorkerMonitor(projectId, workerId, runId), { state: readable ? 'idle' : 'unknown' });
+    assert.equal((await service.projectWorkerStatus(projectId, runId)).recoveryUnsettled, recoveryUnsettled);
+    assert.equal(service.projectWorkerDiagnostic(projectId, runId).recoveryUnsettled, recoveryUnsettled);
+    await assert.rejects(service.confirmProjectAdmission(projectId, refs, guard), { code: 'PROJECT_HISTORY_UNCONFIRMED' });
+    await assert.rejects(service.run({ problem: 'global fixture' }, origin), { code: 'RECOVERY_BLOCKED' });
+    const handler = f.handlers.get('math-research-once');
+    assert.deepEqual(await handler.abort(taskId), { status: 'ignored' });
+    assert.deepEqual(await handler.run({ kind: 'schedule', input: { runId, nonce: 'old' } }), { status: 'ignored' });
+    assert.equal((await store.read(journalPath)).toString(), bytes, 'historical observations leave the journal untouched');
+    await assert.rejects(service.result(runId, fid, {...origin, sessionPath: '/foreign.jsonl'}), { code: 'OWNER_DENIED' });
+    if (readable) assert.equal((await service.result(runId, fid, origin)).fact.markdown, 'existing fixture fact');
+    else await assert.rejects(service.result(runId, fid, origin), { code: 'RUN_UNSETTLED' });
+    const after = await service.projectWorkerStatus(projectId, runId);
+    assert.equal(after.recoveryUnsettled, recoveryUnsettled);
+    if (recoveryUnsettled) {
+      assert.equal((await store.read(journalPath)).toString(), bytes);
+      assert.equal(after.lastResultError.primary.code, 'FACT_RESULT_INVALID');
+    }
+    assert.deepEqual(hostCalls, []);
+    assert.deepEqual(f.calls.core.map(call => call.operation), readable ? ['fact_get'] : []);
+  });
 });
 
 test('late schedule acknowledgement is cleaned and duplicate dispatcher cannot replay', async (t) => {

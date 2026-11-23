@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { registerPanel } from '../packages/hana-math/panel-service.mjs';
 import { dashboardSelection } from '../packages/hana-math/dashboard-request.mjs';
+import { workspaceProjectBusy } from '../packages/hana-math/dashboard-monitor-transport.mjs';
 import { LIVE_ACTIVATE, LIVE_ROUTE, livePaths } from '../packages/hana-math/ui/dashboard/live-protocol.mjs';
 
 const prefix = '/workspace-monitor';
@@ -90,6 +91,25 @@ test('terminal discovery returns only project, end and new scope; it cannot gran
   }
 });
 
+test('saved discovery emits only the reading basis; business GETs still require the issued scope', async () => {
+  const saved = { ...scope, state: 'saved', asOf: 1795312000123 };
+  let result = { ...saved, endedAt: 123, projectName: 'not part of the saved DTO', privateClaim: 'must not leak' };
+  const f = await routes(() => ({ current: () => result,
+    read: (selection, gen, guard) => gen === saved.generation && guard() ? witness[selection.view] : unavailable }));
+  await checked(await f.send(`${prefix}/current`), 200, saved);
+  for (const path of ['/api/overview', '/api/factgraph', '/api/channels', '/api/channel/verification']) {
+    await checked(await f.send(prefix + path, { headers: header }), 200, witness[dashboardSelection(path).view]);
+  }
+  await checked(await f.send(`${prefix}/api/factgraph`, { headers: { [generation]: 'old' } }), 409, unavailable);
+  await checked(await f.send(`${prefix}/api/factgraph`, { headers: header, stamp: () => requestStamp({}, { document: {} }) }), 403, unavailable);
+  for (const asOf of [undefined, null, '1795312000123', -1, 0, 1.25, 8640000000000001]) {
+    result = { ...saved, asOf }; await checked(await f.send(`${prefix}/current`), 503, unavailable);
+  }
+  for (const invalid of [{ projectId: '../other' }, { generation: 'a,b' }]) {
+    result = { ...saved, ...invalid }; await checked(await f.send(`${prefix}/current`), 503, unavailable);
+  }
+});
+
 test('unauthorized or out-of-scope Host stamps never reach Project', async () => {
   const f = await routes();
   for (const value of [null, requestStamp({ appId: 'foreign-app' }), requestStamp({}, { appId: 'foreign-app' }),
@@ -116,6 +136,33 @@ test('method, fixed path, query and generation constraints apply before I/O', as
   assert.deepEqual(f.calls, []);
   await checked(await f.send(`${prefix}/api/overview`, { headers: { [generation]: 'stale' } }), 409, unavailable);
   assert.equal(f.calls.length, 1, 'stale generation goes only to the protected reader');
+});
+
+test('only the exact fulfilled transport busy sentinel changes a protected GET conflict body', async () => {
+  const busy = { state: 'unavailable', reason: 'project_busy' };
+  let result = workspaceProjectBusy, throwing = false;
+  const f = await routes(() => ({ current: () => busy, async read() { if (throwing) throw result; return result; } }));
+  await checked(await f.send(`${prefix}/current`), 200, unavailable);
+  for (const route of ['/api/overview', '/api/factgraph', '/api/channel/plan']) {
+    await checked(await f.send(prefix + route, { headers: header }), 409, busy);
+  }
+  for (const lookalike of [busy, { ...busy, private: 'do not disclose this' }, { state: 'unavailable', reason: 'other' }]) {
+    result = lookalike;
+    await checked(await f.send(`${prefix}/api/overview`, { headers: header }), 409, unavailable);
+  }
+  result = { reason: 'project_busy' };
+  await checked(await f.send(`${prefix}/api/overview`, { headers: header }), 503, unavailable);
+  throwing = true; result = workspaceProjectBusy;
+  await checked(await f.send(`${prefix}/api/overview`, { headers: header }), 409, unavailable);
+});
+
+test('a late transport busy sentinel cannot override a revoked route guard', async () => {
+  let finish;
+  const f = await routes(() => ({ current: () => scope, read: () => new Promise(resolve => { finish = resolve; }) }));
+  const abort = new AbortController();
+  const response = f.send(`${prefix}/api/overview`, { headers: header, signal: abort.signal });
+  abort.abort(); finish(workspaceProjectBusy);
+  await checked(await response, 403, unavailable);
 });
 
 test('aborted and replaced requests cannot reach the reader or disclose a late response', async () => {

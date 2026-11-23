@@ -114,8 +114,9 @@ export function mountMathPanel(root, { request }) {
   const handles = new Set();
   const controllers = new Set();
   const groups = new Map();
+  const earlyPanelFailures = new WeakSet();
   let alive = true;
-  let editorSession = null;
+  let editorSession = null, cancelPanelRetry;
   root.setAttribute('data-hana-app-ui', '');
 
   function node(tag, className, text) {
@@ -140,10 +141,17 @@ export function mountMathPanel(root, { request }) {
     try {
       const response = await request(path, { ...init, signal: controller.signal });
       let data;
-      try { data = await response.json(); } catch { throw new Error('服务器返回了无法读取的数据'); }
+      try { data = await response.json(); } catch {
+        const error = new Error('服务器返回了无法读取的数据');
+        if (path === '/panel' && response.status === 404) earlyPanelFailures.add(error);
+        throw error;
+      }
       if (!response.ok || data?.ok === false) {
         const error = new Error(data?.error?.message || '请求失败，请重试');
         error.detail = data?.error || {};
+        if (path === '/panel' && (response.status === 404 || response.status === 503 && error.detail.code === 'MATH_BOOTSTRAP_PENDING')) {
+          earlyPanelFailures.add(error);
+        }
         throw error;
       }
       return data;
@@ -192,10 +200,11 @@ export function mountMathPanel(root, { request }) {
   function renderGroup(group, section) {
     const version = group.version = (group.version || 0) + 1;
     group.unavailable = false;
-    group.items = section?.state === 'ready' && Array.isArray(section.items) ? section.items : [];
+    const rosterReady = section?.state === 'ready' && Array.isArray(section.items);
+    group.items = rosterReady ? section.items : [];
     group.selected = defaultSelection(group.items, group.kind, group.selected);
     group.list.replaceChildren();
-    group.status.textContent = section?.state !== 'ready' ? `暂时无法读取${group.kind === 'role' ? '角色预设' : '助手'}` : !group.items.length ? `暂无可显示的${group.kind === 'role' ? '角色预设' : '助手'}` : '';
+    group.status.textContent = !rosterReady ? `暂时无法读取${group.kind === 'role' ? '角色预设' : '助手'}` : !group.items.length ? `暂无可显示的${group.kind === 'role' ? '角色预设' : '助手'}` : '';
     group.editHost.hidden = !group.selected;
     function updateSelection(focus = false) {
       for (const button of group.list.querySelectorAll('button')) {
@@ -228,7 +237,19 @@ export function mountMathPanel(root, { request }) {
 
   async function loadPanel() {
     try {
-      const data = await call('/panel', { method: 'GET' });
+      let data;
+      try { data = await call('/panel', { method: 'GET' }); }
+      catch (error) {
+        // A mounted iframe can beat registration of this fixed route. Retry
+        // the roster only, once; never retry editor requests or unknown errors.
+        if (!alive || !earlyPanelFailures.has(error)) throw error;
+        await new Promise(resolve => {
+          const timer = win.setTimeout(() => { cancelPanelRetry = undefined; resolve(); }, 250);
+          cancelPanelRetry = () => { win.clearTimeout(timer); resolve(); };
+        });
+        if (!alive) return;
+        data = await call('/panel', { method: 'GET' });
+      }
       if (!alive) return;
       renderGroup(groups.get('assistant'), data.assistants);
       renderGroup(groups.get('role'), data.roles);
@@ -477,6 +498,7 @@ export function mountMathPanel(root, { request }) {
   return { ready, destroy() {
     if (!alive) return;
     alive = false;
+    cancelPanelRetry?.(); cancelPanelRetry = undefined;
     editorSession?.finish(false);
     for (const controller of controllers) controller.abort(); controllers.clear();
     for (const handle of handles) handle.destroy(); handles.clear();

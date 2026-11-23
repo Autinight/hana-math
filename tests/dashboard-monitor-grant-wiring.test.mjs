@@ -155,3 +155,54 @@ test('reopened records do not backfill; only genuine creator Goal start/resume m
   await stop.dispose();
   assert.deepEqual(await discover(route),unavailable);
 });
+
+test('creator follow grants an already active restored worker; unfollow survives another reopen', options, async t => {
+  const g = await setup(t), { f } = g;
+  const p = await f.create(), unconsented = await f.create();
+  for (const project of [p, unconsented]) await f.service.assign({ task:'Opaque fixture assignment' }, project.context);
+  await f.service.dispose(); await f.open();
+  let route = g.mount();
+  const start = project => f.service.start({ projectId:project.projectId },project.context);
+  const stop = project => f.service.stop({ projectId:project.projectId, force:true },project.context);
+  const id = { projectId:p.projectId };
+  const old = await start(p);
+  assert.deepEqual(await discover(route),unavailable);
+  assert.equal(g.starts.length,0);
+  await assert.rejects(f.service.dashboardFollow(id,p.context));
+  await assert.rejects(f.service.dashboardFollow(id,{...origin,sessionPath:'/fixture/different-creator.jsonl'}));
+  const before = { runs:f.calls.starts.length, sends:f.calls.sends.length, schedules:f.calls.schedules.length, tasks:f.calls.tasks.length };
+  await f.service.dashboardFollow(id,origin);
+  assert.deepEqual({ runs:f.calls.starts.length, sends:f.calls.sends.length, schedules:f.calls.schedules.length, tasks:f.calls.tasks.length },before);
+  const first = await discover(route);
+  assert.partialDeepStrictEqual(first,{state:'active',projectId:p.projectId});
+  assert.equal((await route('/api/overview',first.generation)).status,200);
+  await start(unconsented);
+  const afterOtherStart = await discover(route);
+  assert.partialDeepStrictEqual(afterOtherStart,{state:'active',projectId:p.projectId},'a newer unconsented worker cannot displace the granted active project');
+  if (afterOtherStart.generation !== first.generation) assert.equal((await route('/api/overview',first.generation)).status,409);
+  const stillFollowed = await route('/api/overview',afterOtherStart.generation);
+  assert.equal(stillFollowed.status,200); assert.equal((await stillFollowed.json()).project,p.projectId);
+  await stop(unconsented); await stop(p);
+  await f.service.dispose(); await f.open(); route = g.mount();
+  const fresh = await start(p);
+  assert.notEqual(fresh.runId,old.runId);
+  const renewed = await discover(route);
+  assert.partialDeepStrictEqual(renewed,{state:'active',projectId:p.projectId});
+  assert.notEqual(renewed.generation,first.generation);
+  assert.equal((await route('/api/overview',first.generation)).status,409);
+  await assert.rejects(f.service.dashboardUnfollow(id,p.context));
+  const gate = g.hold(), pending = route('/api/factgraph',renewed.generation);
+  try { await gate.started.promise; await f.service.dashboardUnfollow(id,origin); }
+  finally { gate.release.resolve(); }
+  const late = await pending;
+  assert.equal(late.status,409); assert.deepEqual(await late.json(),unavailable);
+  assert.deepEqual(await discover(route),unavailable);
+  assert.equal((await f.service.goal('status',id,origin)).managed,false);
+  await stop(p);
+  await f.service.dispose(); await f.open(); route = g.mount(); await start(p);
+  const launches = g.starts.length;
+  assert.deepEqual(await discover(route),unavailable);
+  const stale = await route('/api/factgraph',renewed.generation);
+  assert.equal(stale.status,409); assert.deepEqual(await stale.json(),unavailable);
+  assert.equal(g.starts.length,launches);
+});

@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { createContextStore, contextId, ContextError } from './context-service.mjs';
+import { readResearchSessionInfo } from './research-session-info.mjs';
 
 const BUDGET_MS = 180000;
 const ACTIVE = new Set(['preparing', 'running']);
@@ -96,9 +97,9 @@ function pagesOf(lines) {
   return pages;
 }
 
-export function createContextProbe(sdk, contexts) {
+export function createContextProbe(sdk, contexts, { deferHistoricalWork = false } = {}) {
   const store = createContextStore(sdk.dataDir);
-  const owned = new Map();
+  const owned = new Map(), stopping = new Map();
   let disposed = false;
   const writes = new Map();
   const save = (record) => {
@@ -109,6 +110,7 @@ export function createContextProbe(sdk, contexts) {
   const publicRecord = (record) => copy(record);
   const ready = (async () => {
     await store.mkdir('context/probe-runs');
+    if (deferHistoricalWork === true) return;
     for (const file of await store.list('context/probe-runs')) {
       if (!/^probe-[a-z0-9-]+\.json$/.test(file)) continue;
       const record = await store.readJson(`context/probe-runs/${file}`);
@@ -138,12 +140,14 @@ export function createContextProbe(sdk, contexts) {
       record.taskDelivery = 'recorded';
     } catch (error) { record.taskDelivery = 'failed'; record.taskDeliveryError = recordError(record, 'task-delivery', error); }
   }
-  function abort(run) {
+  function abort(run, verifyReceipt = false) {
     const operation = (run.abortQueue || Promise.resolve()).catch(() => {}).then(async () => {
       if (!run.record.sessionId) return;
       const pendingAtRequest = Boolean(run.record.sendPending);
       try {
         const result = checked(await controlCall(() => sdk.sessions.abort({ sessionId: run.record.sessionId, reason: 'Math read probe stopped' })));
+        if (verifyReceipt && ((result.sessionId && result.sessionId !== run.record.sessionId) || (result.sessionRef
+          && (result.sessionRef.sessionId !== run.record.sessionId || result.sessionRef.sessionPath !== run.record.sessionPath)))) fail('ABORT_NOT_CONFIRMED');
         run.record.abortOutcome = result.aborted === true ? (pendingAtRequest ? 'awaiting-send-receipt' : 'aborted') : 'not-confirmed';
         if (result.aborted !== true) recordError(run.record, 'session-abort', 'ABORT_NOT_CONFIRMED');
       } catch (error) { run.record.abortOutcome = 'failed'; run.record.abortError = recordError(run.record, 'session-abort', error); }
@@ -489,6 +493,59 @@ export function createContextProbe(sdk, contexts) {
     if (record.probeId !== probeId || record.schemaVersion !== 1) fail('INVALID_PROBE_RECORD');
     return publicRecord(record);
   }
+  async function stopHistorical(probeId) {
+    const record = await get(probeId);
+    const unfinished = ACTIVE.has(record.state);
+    if (!unfinished && !record.sendPending && !record.cleanupPending && !record.setupPending && !record.finalizing
+      && !(record.state === 'interrupted' && record.taskDelivery === 'failed')) return record;
+    contextId(record.projectId);
+    if (!/^probe-[0-9a-f-]{36}$/.test(probeId) || !['main', 'worker', 'verifier'].includes(record.role)
+      || record.cwd !== store.absolute(`context/projects/${record.projectId}/probes/${probeId}/${record.role}`)) fail('INVALID_PROBE_RECORD');
+    let pending = !record.sessionId && (unfinished || record.setupPending || record.cleanupPending || record.sendPending);
+    record.cleanupPending = true;
+    record.stopReason = 'EXPLICIT_STOP';
+    await save(record);
+    if (record.sessionId && record.abortOutcome !== 'aborted') {
+      try {
+        const session = await readResearchSessionInfo(sdk, { sessionId: record.sessionId });
+        if (session.lifecycle !== 'active' || session.path !== record.sessionPath || session.agentId !== record.agentId
+          || session.cwd !== record.cwd || !record.agentId.startsWith(`hana-math-probe-${record.role}-`)) fail('STOP_SESSION_MISMATCH');
+        await abort({ record }, true);
+        pending ||= record.abortOutcome !== 'aborted';
+      } catch (error) {
+        pending = true;
+        record.abortOutcome = 'failed'; record.abortError = recordError(record, 'session-abort', error);
+      }
+    }
+    pending ||= record.sendPending || ['pending', 'unconfirmed'].includes(record.sendState)
+      || (!record.taskId && record.taskDelivery !== 'not-created');
+    if (!pending && record.taskId) {
+      try {
+        const task = taskRecord(await controlCall(() => sdk.tasks.get(record.taskId)), { taskId: record.taskId });
+        if (task.pluginId !== 'hana-math' || !['app', 'session'].includes(task.scope) || task.handlerKey != null
+          || task.metadata?.probeId !== probeId || task.metadata.projectId !== record.projectId
+          || task.metadata.role !== record.role) fail('TASK_RECEIPT_INVALID');
+        if (['completed', 'failed', 'canceled', 'aborted'].includes(task.status)) record.taskDelivery = 'recorded';
+        else {
+          await deliver({ record });
+          pending = record.taskDelivery !== 'recorded';
+        }
+      } catch (error) {
+        pending = true;
+        record.taskDelivery = 'failed'; record.taskDeliveryError = recordError(record, 'task-delivery', error);
+      }
+    }
+    record.cleanupPending = Boolean(pending);
+    if (!pending) {
+      if (unfinished) {
+        record.state = 'stopped'; record.error = 'EXPLICIT_STOP'; record.endedAt = Date.now();
+      }
+      record.setupPending = false; record.finalizing = false;
+      if (['queued', 'running'].includes(record.setupState)) record.setupState = 'interrupted';
+    }
+    await save(record);
+    return publicRecord(record);
+  }
   async function stop(probeId) {
     await ready; contextId(probeId);
     const run = owned.get(probeId);
@@ -500,6 +557,14 @@ export function createContextProbe(sdk, contexts) {
         await save(run.record);
       }
       return publicRecord(run.record);
+    }
+    if (deferHistoricalWork === true) {
+      if (disposed) fail('PROBE_DISPOSED');
+      if (!stopping.has(probeId)) {
+        const job = stopHistorical(probeId).finally(() => stopping.delete(probeId));
+        stopping.set(probeId, job);
+      }
+      return stopping.get(probeId);
     }
     const record = await get(probeId);
     if (record.state === 'interrupted') {
@@ -517,6 +582,7 @@ export function createContextProbe(sdk, contexts) {
       try { await controlCall(() => Promise.allSettled([...run.setup, ...(run.taskWatch ? [run.taskWatch] : []), ...(run.background ? [run.background] : [])])); }
       catch { run.record.cleanupPending = true; await save(run.record).catch(() => {}); }
     }
+    await Promise.allSettled([...stopping.values()]);
     await Promise.allSettled([...writes.values()]);
   }
   return { start, get, stop, dispose, recoveryReady: ready };

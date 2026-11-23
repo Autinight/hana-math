@@ -14,6 +14,8 @@ import { assertPlanMaterial, planInput, planDocuments, paperStitchText } from '.
 import { snapshotPaperSectionStart } from './paper-section-input.mjs';
 import { readSectionResources, buildSectionPrompt } from './paper-section.mjs';
 import { validSectionBinding, sectionDocuments } from './paper-section-binding.mjs';
+import { snapshotPaperMathSelector, validPaperMathBinding } from './paper-math-service-binding.mjs';
+import { PAPER_MATH_PINS, readPaperMathResources, buildPaperMathPrompt, parsePaperMathReport } from './paper-math-verification.mjs';
 
 const APP = 'hana-math', HANDLER = 'math-project-report';
 const TERMINAL = new Set(['completed', 'leak', 'failed', 'stopped', 'interrupted']);
@@ -82,13 +84,52 @@ async function bounded(promise) {
 }
 
 export async function createProjectReportService({ sdk, store, summaryWriter, authorizeCreator, projects, getProject,
-  assertLive, gatherFacts, withReportPublication, gatherPaperFacts, withPaperPublication, paperRunnerIpcScope, assertPaperTarget, readInput, track, projectLocation, literature }) {
+  assertLive, gatherFacts, withReportPublication, gatherPaperFacts, withPaperPublication, paperRunnerIpcScope, assertPaperTarget, readInput, track, projectLocation, literature,
+  deferHistoricalWork = false, isFreshProject = () => false }) {
   const records = new Map(), active = new Map(), damaged = new Set(), admitting = new Set();
+  const deferredByProject = new Map(), historyPreparation = new WeakMap(), mathReviewChecks = new WeakMap();
   let disposed = false, registration;
   const directory = (p, id) => `${projectLocation(p)}/reports/${id}`;
   const statePath = (p, id) => `${directory(p, id)}/metadata.json`;
   const key = (p, id) => `${p.meta.projectId}/${id}`;
   function wrap(meta) { return { meta, writes: Promise.resolve(), control: Promise.resolve(), failedSave: false, handle: null, job: null, jobSettled: false, schedulePromise: null, settlementPromise: null }; }
+  async function prepareHistory(p, authorize) {
+    const projectId = p.meta.projectId;
+    const assertProject = () => check(!disposed && p.meta.projectId === projectId && getProject(projectId) === p, 'PROJECT_DISPOSED');
+    assertProject();
+    let preparation = historyPreparation.get(p);
+    if (preparation?.ready) return;
+    if (!preparation) {
+      preparation = { ready: false };
+      historyPreparation.set(p, preparation);
+      preparation.job = (async () => {
+        let names = [], invalid = false;
+        try { names = await store.list(`${projectLocation(p)}/reports`); }
+        catch (error) { invalid = error.code !== 'ENOENT'; }
+        const loaded = [], blockers = new Set();
+        for (const id of names.filter(name => REPORT_ID.test(name))) {
+          assertProject();
+          try {
+            const meta = await store.readJson(statePath(p, id)); checkRecord(p, meta, id);
+            const r = wrap(meta);
+            r.historical = true;
+            loaded.push(r);
+            if (reportNeedsRecovery(meta)) blockers.add(r);
+          } catch { invalid = true; }
+        }
+        assertProject();
+        // Publish admission and lineage together. No artifact reads or Host work.
+        for (const r of loaded) records.set(key(p, r.meta.reportId), r);
+        if (blockers.size) deferredByProject.set(projectId, blockers);
+        if (invalid) damaged.add(projectId);
+        preparation.ready = true;
+      })();
+    }
+    await preparation.job;
+    // Each caller supplies its own authority after the shared disk wait.
+    await authorize();
+    assertProject();
+  }
   function exclusive(r, action) {
     const job = r.control.catch(() => {}).then(action);
     r.control = job;
@@ -103,6 +144,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   }
   function checkRecord(p, meta, id) {
     check(validReportPayload(meta, p.meta.projectId, paperValid), 'PROJECT_REPORT_RECORD_INVALID');
+    if (meta.kind === 'paper-math-verification') check(validPaperMathBinding(meta.math), 'PROJECT_REPORT_RECORD_INVALID');
     check(meta?.schemaVersion === 1 && meta.projectId === p.meta.projectId && meta.reportId === id && REPORT_ID.test(id)
       && ['queued', 'running', ...TERMINAL].includes(meta.state) && typeof meta.cleanupPending === 'boolean'
       && typeof meta.stopRequested === 'boolean' && typeof meta.taskCreating === 'boolean' && typeof meta.scheduleCreating === 'boolean'
@@ -160,10 +202,19 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     return m.kind === 'paper-revision' && m.state === 'completed' && m.revisionOutcome?.status === 'no_edits_applied'
       && !m.cleanupPending && !r.failedSave && !m.stopRequested && !m.error;
   }
+  function writerCleanupPending(m) {
+    return m.writer?.sendPending === true || ['pending', 'unconfirmed'].includes(m.writer?.sendState)
+      || m.recoveryStop === 'awaiting-send-receipt' || (!CONFIRMED_RECOVERY_STOPS.has(m.recoveryStop)
+        && (m.writer?.cleanupPending === true || ACTIVE_WRITER_STATES.has(m.writer?.state)));
+  }
   function planCleanupPending(m) {
     return m.cleanupPending || m.taskCreating || m.scheduleCreating || m.writerStarting || Boolean(m.scheduleId)
       || m.writer?.cleanupPending === true || ACTIVE_WRITER_STATES.has(m.writer?.state) || m.writer?.sendPending === true
       || ['pending', 'unconfirmed'].includes(m.writer?.sendState) || m.recoveryStop === 'awaiting-send-receipt';
+  }
+  function reportNeedsRecovery(m) {
+    return !TERMINAL.has(m.state) || m.taskSettlement !== 'confirmed' || m.cleanupPending || m.taskCreating
+      || m.scheduleCreating || m.writerStarting || Boolean(m.scheduleId) || writerCleanupPending(m);
   }
   function planView(r, settled = true) {
     const m = r.meta, clean = m.state === 'completed' && !m.error && !m.archiveError && !m.stopRequested && !r.failedSave
@@ -187,13 +238,43 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       ...(m.archiveError ? { archiveError: m.archiveError } : {}), sectionOrdering: 'not-checked', citationStatus: 'not-requested', mathematicsStatus: 'unreviewed', compileStatus: 'not-run',
       limitations: ['Frozen section fragment only; no current complete-chain, body-coverage, section-label, macro, mathematical, citation, assembly or compilation validation.'] };
   }
-  function view(r) {
+  function mathCompletionCandidate(r) {
     const m = r.meta;
+    return m.kind === 'paper-math-verification' && m.state === 'completed' && !r.failedSave
+      && !m.error && !m.stopRequested && !planCleanupPending(m) && !writerCleanupPending(m)
+      && m.writer?.state === 'completed' && m.writer.modelStopReason === 'stop'
+      && m.writer.cleanupPending === false && ['correct', 'wrong'].includes(m.mathVerdict);
+  }
+  // Settlement and artifact verification are independent. Readers must use
+  // this gate as well as checking the exact archived review bytes.
+  function cleanMathCompletion(r) {
+    return mathCompletionCandidate(r) && !r.mathSettlementWriting && r.meta.taskSettlement === 'confirmed'
+      && r.meta.mathTaskStatus === 'completed' && !r.meta.taskError;
+  }
+  async function settledMathView(p, r) {
+    if (cleanMathCompletion(r) && !mathReviewChecks.has(r)) {
+      // A concurrent status check may have cleared the producer's cache.
+      // Restore only from the exact archived review, not its verdict field.
+      try { await readPaperMathReview(p, r); } catch {}
+    }
+    return view(r);
+  }
+  function clearMathCompletion(r) {
+    const m = r.meta;
+    mathReviewChecks.delete(r);
+    delete m.mathVerdict;
+    m.completedAt = null; m.sha256 = null; m.bytes = null;
+  }
+  function view(r) {
+    const m = r.meta, mathCheck = mathReviewChecks.get(r);
+    const mathVerdict = cleanMathCompletion(r) && mathCheck && mathCheck.binding === JSON.stringify(m.math)
+      && mathCheck.sha256 === m.artifacts?.review?.sha256 && mathCheck.verdict === m.mathVerdict ? m.mathVerdict : null;
     return copy({ projectId: m.projectId, reportId: m.reportId, taskId: m.taskId, state: m.state, language: m.language,
       createdAt: m.createdAt, completedAt: m.completedAt ?? null, snapshotCapturedAt: m.snapshotCapturedAt ?? null,
       asOf: m.asOf ?? null, bytes: m.bytes ?? null,
       sha256: m.sha256 ?? null, error: m.error ?? null, cleanupPending: m.cleanupPending || r.failedSave,
-      stopRequested: m.stopRequested, taskSettlement: m.taskSettlement, delivery: m.delivery,
+      ...(r.historical && reportNeedsRecovery(m) ? { recoveryPending: true } : {}),
+      stopRequested: m.stopRequested, taskSettlement: r.mathSettlementWriting && m.taskSettlement === 'confirmed' ? 'pending' : m.taskSettlement, delivery: m.delivery,
       snapshotAdvancedDuringWriting: m.snapshotAdvancedDuringWriting === true,
       sessionStop: m.recoveryStop || m.recoveryError ? { outcome: m.recoveryStop ?? null,
         confirmed: CONFIRMED_RECOVERY_STOPS.has(m.recoveryStop), error: m.recoveryError ?? null } : null,
@@ -210,6 +291,12 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         sourceMainSha256: m.audit.mainSha256, sourceLedgerSha256: m.audit.ledgerSha256,
         contractSha256: m.audit.contractSha256, auditorPromptSha256: m.audit.auditorPromptSha256,
         promptSha256: m.audit.promptSha256, auditMode: 'offline', citationStatus: 'unverified' } : {}),
+      ...(m.kind === 'paper-math-verification' ? { kind: m.kind, ...copy(m.math),
+        ...(mathVerdict ? { mathVerdict } : {}),
+        ...(!r.mathSettlementWriting && m.taskSettlement === 'confirmed' && m.mathTaskStatus ? { mathTaskStatus: m.mathTaskStatus } : {}),
+        ...(m.taskError ? { taskError: m.taskError } : {}),
+        paperMathGate: mathVerdict === 'correct' ? 'passed' : mathVerdict === 'wrong' ? 'failed' : 'not-assessed',
+        publicationStatus: 'not-assessed', compileStatus: 'not-run' } : {}),
       ...(m.kind === 'reference-verification' ? { kind: m.kind, auditReportId: m.verification.auditReportId,
         sourceReportId: m.verification.sourceReportId, paperId: m.verification.paperId,
         sourceMainSha256: m.verification.mainSha256, sourceLedgerSha256: m.verification.ledgerSha256,
@@ -229,7 +316,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         state: CONFIRMED_RECOVERY_STOPS.has(m.recoveryStop) && ACTIVE_WRITER_STATES.has(m.writer.state) ? 'stopped' : m.writer.state,
         ...researchSessionDiagnostics(m.writer),
         ...(m.recoveryStop && RECOVERY_STOP_OUTCOMES.has(m.recoveryStop) ? { stopEvidence: m.recoveryStop } : {}),
-        toolSelection: m.writer.toolSelection, model: m.writer.model,
+        toolSelection: m.writer.toolSelection ?? null, model: m.writer.model ?? null,
         cleanupPending: CONFIRMED_RECOVERY_STOPS.has(m.recoveryStop) && ACTIVE_WRITER_STATES.has(m.writer.state) ? false : m.writer.cleanupPending,
       } : null });
   }
@@ -240,8 +327,16 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     if (!r.meta.taskId || r.meta.taskCreating) return;
     if (!r.settlementPromise) {
       const job = (async () => {
+        const m = r.meta, math = m.kind === 'paper-math-verification';
+        const noteMathSaveFailure = error => {
+          if (m.state === 'completed') { m.state = 'failed'; setReportError(m, code(error)); }
+          clearMathCompletion(r); m.cleanupPending = true;
+          m.taskSettlement = 'unknown'; m.taskError = code(error); delete m.mathTaskStatus;
+        };
+        if (math) r.mathSettlementWriting = true;
         try {
-          const task = await taskReceipt(p, r), good = ['completed', 'leak'].includes(r.meta.state);
+          const task = await taskReceipt(p, r), good = math ? mathCompletionCandidate(r) : ['completed', 'leak'].includes(m.state);
+          let terminal = task;
           if (['pending', 'running'].includes(task.status)) {
             const result = { projectId: r.meta.projectId, reportId: r.meta.reportId, status: r.meta.state,
               sha256: r.meta.sha256 ?? null, bytes: r.meta.bytes ?? null, cleanupPending: r.meta.cleanupPending,
@@ -250,15 +345,41 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
               ...(r.meta.kind === 'paper-plan' ? planView(r, false) : r.meta.kind === 'paper-section' ? sectionView(r, false) : {}),
               ...(r.meta.kind === 'paper-revision' && Object.hasOwn(r.meta, 'revisionOutcome')
                 ? { revisionOutcome: copy(r.meta.revisionOutcome), ...(completedRevisionNoOp(r) ? { proposalProduced: false } : {}) } : {}) };
-            const receipt = good ? await bounded(sdk.tasks.complete(r.meta.taskId, result))
+            terminal = good ? await bounded(sdk.tasks.complete(r.meta.taskId, result))
               : await bounded(sdk.tasks.fail(r.meta.taskId, r.meta.error ?? 'PROJECT_REPORT_STOPPED'));
-            check(receipt?.taskId === task.taskId && ['completed', 'failed', 'canceled', 'aborted'].includes(receipt.status), 'PROJECT_REPORT_TASK_UNCONFIRMED');
-          } else {
-            check(['completed', 'failed', 'canceled', 'aborted'].includes(task.status), 'PROJECT_REPORT_TASK_UNCONFIRMED');
           }
-          r.meta.taskSettlement = 'confirmed'; r.meta.taskError = null;
-          await save(p, r);
-        } catch (error) { r.meta.taskSettlement = 'unknown'; r.meta.taskError = code(error); await save(p, r); return; }
+          check(terminal?.taskId === task.taskId && ['completed', 'failed', 'canceled', 'aborted'].includes(terminal.status), 'PROJECT_REPORT_TASK_UNCONFIRMED');
+          if (math) {
+            check(terminal.pluginId === APP && terminal.scope === 'session' && terminal.handlerKey === HANDLER && terminal.delivery === 'next-step'
+              && terminal.parentSessionId === m.creator.sessionId && terminal.parentSessionPath === m.creator.sessionPath
+              && m.creator.sessionId === p.meta.creator?.sessionId && m.creator.sessionPath === p.meta.creator?.sessionPath
+              && matchesReportTaskFields(m, terminal.metadata), 'PROJECT_REPORT_TASK_UNCONFIRMED');
+            m.mathTaskStatus = terminal.status;
+            const stopped = terminal.status === 'canceled' || terminal.status === 'aborted';
+            if (stopped || m.state === 'completed' && (terminal.status !== 'completed' || !mathCompletionCandidate(r))) {
+              m.state = stopped ? 'stopped' : 'failed';
+              if (stopped) m.stopRequested = true;
+              setReportError(m, stopped ? `PROJECT_REPORT_TASK_${terminal.status.toUpperCase()}`
+                : terminal.status === 'failed' ? 'PROJECT_REPORT_TASK_FAILED' : m.error ?? 'PROJECT_REPORT_NOT_READY');
+              clearMathCompletion(r);
+            }
+          }
+          // Commit a math completion only once, after the delivery observation.
+          // A failed final write must not leave an earlier clean witness on disk.
+          if (!math) { m.taskSettlement = 'confirmed'; m.taskError = null; await save(p, r); }
+        } catch (error) {
+          m.taskSettlement = 'unknown'; m.taskError = code(error);
+          if (math) {
+            delete m.mathTaskStatus;
+            if (r.failedSave) noteMathSaveFailure(error);
+          }
+          try { await save(p, r); }
+          catch (saveError) {
+            if (!math) throw saveError;
+            noteMathSaveFailure(saveError); await save(p, r);
+          } finally { if (math) r.mathSettlementWriting = false; }
+          return;
+        }
         try {
           const delivery = await bounded(sdk.tasks.getDelivery(r.meta.taskId));
           r.meta.delivery = { state: delivery?.state ?? 'unknown', delivered: delivery?.delivered === true };
@@ -267,7 +388,19 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
           r.meta.delivery = { state: 'unknown', delivered: false };
           r.meta.deliveryError = code(error);
         }
-        await save(p, r);
+        if (!math) { await save(p, r); return; }
+        // Queue a snapshot on the same write tail as save(). Readers must
+        // not observe confirmed while this final metadata write is pending.
+        const bytes = JSON.stringify({ ...m, taskSettlement: 'confirmed', taskError: null }) + '\n';
+        const writing = r.writes.catch(() => {}).then(() => store.write(statePath(p, m.reportId), bytes, true));
+        r.writes = writing;
+        try {
+          await writing;
+          m.taskSettlement = 'confirmed'; m.taskError = null;
+        } catch (error) {
+          r.failedSave = true;
+          noteMathSaveFailure(error); await save(p, r);
+        } finally { r.mathSettlementWriting = false; }
       })();
       r.settlementPromise = job;
       job.finally(() => { if (r.settlementPromise === job) r.settlementPromise = null; }).catch(() => {});
@@ -339,6 +472,80 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         await save(p, r);
       });
     }, r.meta.paper.factIds ?? []);
+  }
+  async function paperMathSource(p, selector, guard, authorize) {
+    const identity = r => {
+      const m = r.meta;
+      check(m.projectId === p.meta.projectId && m.reportId === r.meta.reportId && m.creator?.sessionId === p.meta.creator?.sessionId
+        && m.creator?.sessionPath === p.meta.creator?.sessionPath && m.state === 'completed' && !m.cleanupPending
+        && !m.stopRequested && !m.taskCreating && !m.scheduleCreating && !m.writerStarting
+        && m.taskSettlement === 'confirmed' && !m.error && !r.failedSave, 'PROJECT_PAPER_MATH_SOURCE_INVALID');
+      return JSON.stringify([m.kind, m.projectId, m.reportId, m.state, m.cleanupPending, m.stopRequested, m.taskCreating,
+        m.scheduleCreating, m.writerStarting, m.taskSettlement, m.error, m.sourceStatus, m.leakFindings,
+        m.math, m.section, m.artifacts]);
+    };
+    let mainTexBytes, ledgerBytes, sourceReports = [], singleSource = null, stitchedSource = null;
+    if (selector.sourceReportId) {
+      const source = get(p, selector.sourceReportId), m = source.meta, before = identity(source);
+      check(m.kind === 'paper-source' && ['generated', 'flagged'].includes(m.sourceStatus) && !m.leakFindings?.length
+        && !m.artifacts?.quarantinedSource && !m.artifacts?.invalidSource && !m.findings?.leaks?.length,
+      'PROJECT_PAPER_MATH_SOURCE_INVALID');
+      const artifact = (role, name) => {
+        const value = m.artifacts?.[role];
+        check(value?.name === name && value.artifact === `${directory(p, m.reportId)}/${name}`
+          && Number.isSafeInteger(value.bytes) && value.bytes > 0 && value.bytes <= PAPER_ARTIFACT_MAX_BYTES
+          && /^[a-f0-9]{64}$/.test(value.sha256), 'PROJECT_PAPER_MATH_SOURCE_INVALID');
+        return copy(value);
+      };
+      const mainArtifact = artifact('source', 'main.tex'), savedLedger = artifact('ledger', 'REFERENCE_LEDGER.md');
+      [mainTexBytes, ledgerBytes] = await Promise.all([store.read(mainArtifact.artifact), store.read(savedLedger.artifact)]);
+      guard();
+      check(identity(source) === before && JSON.stringify(m.artifacts.source) === JSON.stringify(mainArtifact)
+        && JSON.stringify(m.artifacts.ledger) === JSON.stringify(savedLedger)
+        && mainTexBytes.length === mainArtifact.bytes && hash(mainTexBytes) === mainArtifact.sha256
+        && ledgerBytes.length === savedLedger.bytes && hash(ledgerBytes) === savedLedger.sha256,
+      'PROJECT_PAPER_MATH_SOURCE_CHANGED');
+      sourceReports = [{ report: source, identity: hash(JSON.stringify(source.meta)) }];
+      singleSource = { report: source, identity: hash(JSON.stringify(source.meta)), mainArtifact, ledgerArtifact: savedLedger };
+    } else {
+      stitchedSource = await stitchInternal(p, selector, authorize, guard);
+      mainTexBytes = stitchedSource.bytes; ledgerBytes = Buffer.from(stitchedSource.ledger, 'utf8');
+    }
+    const mainTex = strictText(mainTexBytes), ledger = strictText(ledgerBytes);
+    const resources = await readPaperMathResources();
+    const prompt = buildPaperMathPrompt({ mainTex, ledger, ...resources });
+    const binding = { ...selector,
+      mainSha256: hash(mainTexBytes), ledgerSha256: hash(ledgerBytes),
+      contractSha256: hash(Buffer.from(resources.contract)), verifierPromptSha256: hash(Buffer.from(resources.verifierPrompt)),
+      promptSha256: hash(Buffer.from(prompt)) };
+    check(binding.contractSha256 === PAPER_MATH_PINS.contractSha256
+      && binding.verifierPromptSha256 === PAPER_MATH_PINS.verifierPromptSha256, 'PROJECT_PAPER_MATH_RESOURCE_INVALID');
+    const assertSource = async () => {
+      await authorize(); guard();
+      for (const entry of sourceReports) check(hash(JSON.stringify(entry.report.meta)) === entry.identity, 'PROJECT_PAPER_MATH_SOURCE_CHANGED');
+      if (stitchedSource) {
+        await stitchedSource.checkDelivery();
+        check(hash(stitchedSource.bytes) === binding.mainSha256
+          && hash(Buffer.from(stitchedSource.ledger, 'utf8')) === binding.ledgerSha256, 'PROJECT_PAPER_MATH_SOURCE_CHANGED');
+      } else {
+        check(singleSource && hash(JSON.stringify(singleSource.report.meta)) === singleSource.identity
+          && JSON.stringify(singleSource.report.meta.artifacts?.source) === JSON.stringify(singleSource.mainArtifact)
+          && JSON.stringify(singleSource.report.meta.artifacts?.ledger) === JSON.stringify(singleSource.ledgerArtifact),
+        'PROJECT_PAPER_MATH_SOURCE_CHANGED');
+        const [latestMain, latestLedger] = await Promise.all([store.read(singleSource.mainArtifact.artifact), store.read(singleSource.ledgerArtifact.artifact)]);
+        guard();
+        check(latestMain.length === singleSource.mainArtifact.bytes && hash(latestMain) === binding.mainSha256
+          && latestLedger.length === singleSource.ledgerArtifact.bytes && hash(latestLedger) === binding.ledgerSha256,
+        'PROJECT_PAPER_MATH_SOURCE_CHANGED');
+      }
+      const latest = await readPaperMathResources();
+      check(hash(Buffer.from(latest.contract)) === binding.contractSha256
+        && hash(Buffer.from(latest.verifierPrompt)) === binding.verifierPromptSha256
+        && hash(Buffer.from(buildPaperMathPrompt({ mainTex, ledger, ...latest }))) === binding.promptSha256,
+      'PROJECT_PAPER_MATH_RESOURCE_INVALID');
+      guard();
+    };
+    return { binding, prompt, assertSource };
   }
   async function auditSource(p, audit) {
     const source = get(p, audit.sourceReportId), meta = source.meta;
@@ -588,6 +795,104 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       r.meta.state = 'completed'; r.meta.completedAt = Date.now(); r.meta.cleanupPending = false; await save(p, r);
     });
   }
+  function paperMathWriterRecord(p, r, snapshot, cwd, allowPrepared = false) {
+    const field = name => {
+      const descriptor = snapshot && Object.getOwnPropertyDescriptor(snapshot, name);
+      return descriptor?.enumerable === true && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+    };
+    const expectedKind = `math-paper-math-verification:${r.meta.projectId}:${r.meta.reportId}`;
+    const agentId = field('agentId'), sessionId = field('sessionId'), sessionPath = field('sessionPath');
+    const sendState = field('sendState'), sendPending = field('sendPending') === true;
+    const unbound = sessionId == null && sessionPath == null;
+    check(field('role') === 'report-writer' && typeof agentId === 'string'
+      && /^paper-math-verifier-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(agentId)
+      && field('kind') === expectedKind && field('cwd') === cwd
+      && (unbound ? allowPrepared && field('state') === 'preparing' && sendPending === false && sendState === 'not-sent'
+        : typeof sessionId === 'string' && sessionId.length > 0 && typeof sessionPath === 'string' && sessionPath.length > 0),
+    'PROJECT_PAPER_MATH_WRITER_IDENTITY_INVALID');
+    const state = field('state');
+    // Keep the public writer projection valid JSON without publishing arbitrary
+    // Host fields or reporting empty tools before the sender actually saw them.
+    const tools = field('toolSelection');
+    const empty = a => Array.isArray(a) && a.length === 0;
+    const toolSelection = tools?.effective === 'current' && tools.pendingToolNames === null
+      && empty(tools.requested) && empty(tools.resolved)
+      ? { requested: [], resolved: [], effective: 'current', pendingToolNames: null } : null;
+    const model = researchSessionDiagnostics({ actualModel: field('model') }).actualModel;
+    return { role: 'report-writer', agentId, model, toolSelection, sessionId: unbound ? null : sessionId, sessionPath: unbound ? null : sessionPath,
+      cwd, kind: expectedKind,
+      state: ['preparing', 'running', 'completed', 'failed', 'stopped', 'timed-out'].includes(state) ? state : 'preparing',
+      cleanupPending: field('cleanupPending') === true, sendPending,
+      sendState: ['not-sent', 'pending', 'accepted', 'rejected', 'unconfirmed'].includes(sendState) ? sendState : 'unconfirmed',
+      ...researchSessionDiagnostics(snapshot) };
+  }
+  function stoppedWriterEvidence(p, r, snapshot) {
+    if (r.meta.kind === 'paper-math-verification') {
+      // A model/configuration failure can stop the sender before a Host
+      // session exists. There is no new binding to record in that case.
+      if (snapshot?.sessionId == null && snapshot?.sessionPath == null) return r.meta.writer;
+      return paperMathWriterRecord(p, r, snapshot, store.absolute(directory(p, r.meta.reportId)));
+    }
+    return linearKind(r.meta.kind) ? planWriterEvidence(snapshot) : copy(snapshot);
+  }
+  async function runPaperMathVerification(p, r, guard, assertActive) {
+    const binding = copy(r.meta.math), selector = Object.fromEntries(Object.entries(binding)
+      .filter(([key]) => key === 'sourceReportId' || key === 'planReportId' || key === 'finalSectionReportId'));
+    const recheck = async () => {
+      assertActive(); check(JSON.stringify(r.meta.math) === JSON.stringify(binding), 'PROJECT_PAPER_MATH_SOURCE_CHANGED');
+      const material = await paperMathSource(p, selector, assertActive, async () => { await guard(); });
+      check(JSON.stringify(material.binding) === JSON.stringify(binding), 'PROJECT_PAPER_MATH_SOURCE_CHANGED');
+      await material.assertSource(); assertActive(); await guard();
+      return material;
+    };
+    let input = await recheck();
+    const cwd = await store.mkdir(directory(p, r.meta.reportId)); await recheck();
+    r.meta.writerStarting = true; r.meta.cleanupPending = true; await save(p, r); assertActive();
+    const handle = await summaryWriter.start({ projectId: r.meta.projectId, reportId: r.meta.reportId,
+      kind: 'paper-math-verification', prompt: input.prompt, cwd, deadlineAt: Date.now() + 30 * 60 * 1000, assertActive,
+      onBound: async writer => {
+        r.meta.writer = { ...paperMathWriterRecord(p, r, writer, cwd), state: 'preparing', cleanupPending: true };
+        await save(p, r); await recheck(); return { ok: true };
+      },
+      onUpdate: async snapshot => {
+        const next = paperMathWriterRecord(p, r, snapshot, cwd, true);
+        const prior = r.meta.writer;
+        // The sender reports prepared snapshots before session creation. After
+        // binding, keep the real stable identity; never persist finalText.
+        if (prior?.sessionId) check(next.agentId === prior.agentId && next.sessionId === prior.sessionId
+          && next.sessionPath === prior.sessionPath && next.kind === prior.kind, 'PROJECT_PAPER_MATH_WRITER_IDENTITY_INVALID');
+        r.meta.writer = next; await save(p, r);
+        if (next.sendPending && ['pending', 'running'].includes(next.sendState)) await recheck();
+        else { assertActive(); await guard(); }
+        return { ok: true };
+      } });
+    r.handle = handle; r.meta.writerStarting = false; await save(p, r);
+    const terminal = await handle.done;
+    r.meta.writer = paperMathWriterRecord(p, r, terminal, cwd); r.meta.cleanupPending = terminal?.cleanupPending !== false; await save(p, r);
+    if (typeof terminal?.finalText === 'string') {
+      check(Buffer.byteLength(terminal.finalText) <= PAPER_ARTIFACT_MAX_BYTES, 'PROJECT_PAPER_OUTPUT_TOO_LARGE');
+      await paperArtifact(p, r, 'response', Buffer.from(terminal.finalText), 'text/plain');
+    }
+    assertActive(); check(terminal?.state === 'completed' && terminal.modelStopReason === 'stop'
+      && terminal.cleanupPending === false && typeof terminal.finalText === 'string' && terminal.finalText.trim(), 'PROJECT_SUMMARY_WRITER_FAILED');
+    const parsed = parsePaperMathReport(terminal.finalText);
+    await recheck();
+    const limitations = ['Whole supplied manuscript and ledger text only; no fact graph was queried.',
+      'References were not independently verified; citation applicability is not certified.',
+      'No executable mathematics, formal verification, compilation or publication review was performed.'];
+    const review = { schemaVersion: 1, kind: 'paper-math-verification', projectId: r.meta.projectId, reportId: r.meta.reportId,
+      binding: copy(binding), findings: copy(parsed.findings), report: parsed.report, verdict: parsed.verdict, limitations };
+    await paperArtifact(p, r, 'review', Buffer.from(JSON.stringify(review, null, 2) + '\n'), 'application/json');
+    await recheck();
+    await exclusive(r, async () => {
+      current(p, r); check(JSON.stringify(r.meta.math) === JSON.stringify(binding), 'PROJECT_PAPER_MATH_SOURCE_CHANGED');
+      r.meta.mathVerdict = parsed.verdict; r.meta.sha256 = r.meta.artifacts.review.sha256;
+      r.meta.bytes = r.meta.artifacts.review.bytes; r.meta.state = 'completed'; r.meta.completedAt = Date.now();
+      r.meta.cleanupPending = false;
+      mathReviewChecks.set(r, { binding: JSON.stringify(binding), sha256: r.meta.artifacts.review.sha256, verdict: parsed.verdict });
+      await save(p, r);
+    });
+  }
   async function runVerification(p, r, guard, assertActive) {
     const binding = copy(r.meta.verification), encodedBinding = JSON.stringify(binding);
     const recheck = async () => {
@@ -746,7 +1051,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   }
   // Strictly read-only on the report archives: don't use inspectSavedSection,
   // which may quarantine a record or write an interrupted state on corruption.
-  async function stitch(p, { planReportId, finalSectionReportId }, authorize, guard) {
+  async function stitchInternal(p, { planReportId, finalSectionReportId }, authorize, guard) {
     const unavailable = 'PROJECT_PAPER_STITCH_NOT_READY', invalid = 'PROJECT_PAPER_STITCH_CHAIN_INVALID';
     const corrupted = 'PROJECT_REPORT_ARTIFACT_INVALID', witnessed = new Map(), selected = [], warnings = [];
     const sessionId = p.meta.creator.sessionId, projectId = p.meta.projectId;
@@ -776,6 +1081,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       }
     };
     await authorize(); alive();
+    if (deferHistoricalWork === true) { await prepareHistory(p, authorize); alive(); }
     const parent = getKind(p, planReportId, { kind: 'paper-plan' }); await remember(parent);
     let saved;
     try { saved = await readSavedPlan(p, parent, read); } catch { throw failure(corrupted); }
@@ -820,10 +1126,16 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       }
       await authorize(); assertSelected();
     };
-    return { bytes, sessionId, checkDelivery, summary: { projectId, paperId: source.paperId, planReportId, finalSectionReportId,
+    return { bytes, ledger: saved.ledger, sessionId, checkDelivery, selectedReports: selected.map(({ r, signature }) => ({ report: r, identity: signature })),
+      summary: { projectId, paperId: source.paperId, planReportId, finalSectionReportId,
       chainRootReportId: rootId, sectionCount: count, sections: warnings.reverse(), bibliographyStatus, mathematicsStatus: 'unreviewed',
       citationStatus: 'not-checked', compileStatus: 'not-run', limitations: ['Frozen plan and selected archived chain only; current facts were not checked.',
         'Reviewable TeX text only: no TeX execution, macro safety, mathematical, citation, or compilation validation.'] } };
+  }
+  async function stitch(p, selector, authorize, guard) {
+    const result = await stitchInternal(p, selector, authorize, guard);
+    const { ledger, selectedReports, ...publicResult } = result;
+    return publicResult;
   }
   async function sectionContext(p, selector, expectedSource = null) {
     const parent = getKind(p, selector.planReportId, { kind: 'paper-plan' });
@@ -1035,6 +1347,46 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       await save(p, r).catch(() => {});
     }
   }
+  async function readPaperMathReview(p, r) {
+    const m = r.meta, descriptor = copy(m.artifacts?.review);
+    check(m.kind === 'paper-math-verification' && m.state === 'completed' && !m.cleanupPending && !m.stopRequested
+      && !r.failedSave && !r.mathSettlementWriting && cleanMathCompletion(r)
+      && m.taskSettlement === 'confirmed' && !m.error && validPaperMathBinding(m.math)
+      && object(m.artifacts) && Object.keys(m.artifacts).length === 2 && object(m.artifacts.response)
+      && Object.keys(m.artifacts.response).length === 5 && m.artifacts.response.name === 'raw-response.txt'
+      && m.artifacts.response.mime === 'text/plain' && m.artifacts.response.artifact === `${directory(p, m.reportId)}/raw-response.txt`
+      && Number.isSafeInteger(m.artifacts.response.bytes) && m.artifacts.response.bytes > 0
+      && m.artifacts.response.bytes <= PAPER_ARTIFACT_MAX_BYTES && /^[a-f0-9]{64}$/.test(m.artifacts.response.sha256)
+      && descriptor && Object.keys(descriptor).length === 5 && descriptor.name === 'MATH_REVIEW.json'
+      && descriptor.mime === 'application/json' && descriptor.artifact === `${directory(p, m.reportId)}/MATH_REVIEW.json`
+      && Number.isSafeInteger(descriptor.bytes) && descriptor.bytes > 0 && descriptor.bytes <= PAPER_ARTIFACT_MAX_BYTES
+      && /^[a-f0-9]{64}$/.test(descriptor.sha256) && descriptor.sha256 === m.sha256 && descriptor.bytes === m.bytes,
+    'PROJECT_PAPER_MATH_REVIEW_INVALID');
+    const { bytes, identity: fileIdentity } = await store.readWitness(descriptor.artifact);
+    check(bytes.length === descriptor.bytes && hash(bytes) === descriptor.sha256, 'PROJECT_PAPER_MATH_REVIEW_INVALID');
+    const raw = strictText(bytes);
+    const responseBytes = await store.read(m.artifacts.response.artifact);
+    check(responseBytes.length === m.artifacts.response.bytes && hash(responseBytes) === m.artifacts.response.sha256,
+      'PROJECT_PAPER_MATH_REVIEW_INVALID');
+    const responseText = strictText(responseBytes);
+    let responseParsed;
+    try { responseParsed = parsePaperMathReport(responseText); } catch { throw failure('PROJECT_PAPER_MATH_REVIEW_INVALID'); }
+    let saved;
+    try { saved = JSON.parse(raw); } catch { throw failure('PROJECT_PAPER_MATH_REVIEW_INVALID'); }
+    check(object(saved) && Object.keys(saved).length === 9 && ['schemaVersion', 'kind', 'projectId', 'reportId', 'binding', 'findings', 'report', 'verdict', 'limitations']
+      .every(key => Object.hasOwn(saved, key)) && raw === `${JSON.stringify(saved, null, 2)}\n`
+      && saved.schemaVersion === 1 && saved.kind === 'paper-math-verification'
+      && saved.projectId === m.projectId && saved.reportId === m.reportId
+      && JSON.stringify(saved.binding) === JSON.stringify(m.math)
+      && Array.isArray(saved.limitations) && saved.limitations.length === 3
+      && saved.limitations.every(value => typeof value === 'string' && value.length <= 256), 'PROJECT_PAPER_MATH_REVIEW_INVALID');
+    const parsed = parsePaperMathReport(JSON.stringify({ findings: saved.findings, report: saved.report }));
+    check(JSON.stringify(responseParsed.findings) === JSON.stringify(parsed.findings) && responseParsed.report === parsed.report
+      && responseParsed.verdict === parsed.verdict && parsed.verdict === saved.verdict && parsed.verdict === m.mathVerdict
+      && await store.fileIdentity(descriptor.artifact) === fileIdentity, 'PROJECT_PAPER_MATH_REVIEW_INVALID');
+    mathReviewChecks.set(r, { binding: JSON.stringify(m.math), sha256: descriptor.sha256, verdict: parsed.verdict });
+    return { descriptor, bytes, review: { ...saved, verdict: parsed.verdict }, fileIdentity };
+  }
   async function paperResult(p, r) {
     const m = r.meta;
     check(TERMINAL.has(m.state) && !r.failedSave, 'PROJECT_REPORT_NOT_READY');
@@ -1056,8 +1408,13 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     if (m.kind === 'paper-plan') {
       check(planView(r).coverageStatus === 'exact-once', 'PROJECT_REPORT_NOT_READY'); await readSavedPlan(p, r);
     }
-    if (m.kind === 'paper-section') { check(sectionView(r).publicationStatus === 'reviewable-section', 'PROJECT_REPORT_NOT_READY'); await inspectSavedSection(p, r); }
+    if (m.kind === 'paper-section') {
+      check(sectionView(r).publicationStatus === 'reviewable-section', 'PROJECT_REPORT_NOT_READY');
+      await (r.historical ? readSavedSection(p, r) : inspectSavedSection(p, r));
+    }
     if (m.kind === 'paper-revision' && m.revision.mode === 'operator-notes') await readOperatorNotes(p, r);
+    let checkedMathReview = null;
+    if (m.kind === 'paper-math-verification') checkedMathReview = await readPaperMathReview(p, r);
     if (completedRevisionNoOp(r)) return { ...view(r), saved: true, status: 'no_edits_applied', files: [],
       diagnosis: { responseSaved: Boolean(m.artifacts?.response) } };
     const files = [];
@@ -1071,20 +1428,37 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         'PROJECT_REPORT_ARTIFACT_INVALID');
         const bytes = await store.read(a.artifact);
         check(bytes.length === a.bytes && hash(bytes) === a.sha256, 'PROJECT_REPORT_ARTIFACT_INVALID');
+        if (role === 'review' && checkedMathReview) {
+          const beforeStage = await store.readWitness(a.artifact);
+          check(beforeStage.identity === checkedMathReview.fileIdentity && beforeStage.bytes.equals(checkedMathReview.bytes),
+            'PROJECT_PAPER_MATH_REVIEW_INVALID');
+        }
         const receipt = await sdk.resources.stage({ path: store.absolute(a.artifact), name: a.name, mime: a.mime, deliverAs: 'attachment' });
+        if (role === 'review' && checkedMathReview) {
+          const after = await store.readWitness(a.artifact);
+          check(after.identity === checkedMathReview.fileIdentity && after.bytes.equals(checkedMathReview.bytes)
+            && after.bytes.length === a.bytes && hash(after.bytes) === a.sha256, 'PROJECT_PAPER_MATH_REVIEW_INVALID');
+        }
         const resource = receipt?.resource;
         check(receipt?.ok !== false && !receipt?.error && resource?.kind === 'session-file'
-          && typeof resource.fileId === 'string' && resource.fileId && typeof resource.sessionId === 'string' && resource.sessionId, 'PROJECT_REPORT_STAGE_INVALID');
+          && typeof resource.fileId === 'string' && resource.fileId && typeof m.creator.sessionId === 'string'
+          && resource.sessionId === m.creator.sessionId, 'PROJECT_REPORT_STAGE_INVALID');
         files.push({ role, name: a.name, bytes: a.bytes, sha256: a.sha256,
           resource: { kind: 'session-file', fileId: resource.fileId, sessionId: resource.sessionId } });
       } catch (error) { failed = true; files.push({ role, name: a?.name, error: code(error) }); }
     }
     m.delivery = { state: failed ? 'failed' : 'staged', delivered: false, files: copy(files) }; await save(p, r);
-    return { ...readView(r), saved: true, status: failed ? 'delivery-failed' : m.sourceStatus === 'flagged' ? 'flagged' : 'ok', files,
+    const result = { ...readView(r), saved: true, status: failed ? 'delivery-failed' : m.sourceStatus === 'flagged' ? 'flagged' : 'ok', files,
+      ...(checkedMathReview && !failed ? { verdict: checkedMathReview.review.verdict, mathVerdict: checkedMathReview.review.verdict } : {}),
       ...(failed ? { readError: { code: 'PROJECT_REPORT_EXPORT_FAILED', phase: 'delivery' } } : {}) };
+    if (failed && checkedMathReview) {
+      delete result.verdict; delete result.mathVerdict; result.paperMathGate = 'not-assessed';
+      mathReviewChecks.delete(r);
+    }
+    return result;
   }
   async function run(p, r) {
-    let terminal;
+    let terminal, settledHere = false;
     try {
       await readGuard(p, r);
       try { await unschedule(p, r); } catch (error) { r.meta.cleanupPending = true; throw error; }
@@ -1095,6 +1469,12 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       if (r.meta.kind === 'paper-plan') { await runPlan(p, r, guard, assertActive); return view(r); }
       if (r.meta.kind === 'paper-revision') { await runRevision(p, r, guard, assertActive); return view(r); }
       if (r.meta.kind === 'reference-verification') { await runVerification(p, r, guard, assertActive); return view(r); }
+      if (r.meta.kind === 'paper-math-verification') {
+        await runPaperMathVerification(p, r, guard, assertActive);
+        settledHere = true;
+        await settle(p, r).catch(() => {});
+        return settledMathView(p, r);
+      }
       if (audit) { await runAudit(p, r, guard, assertActive); return view(r); }
       if (paper) await assertPaperTarget(p.meta.projectId, copy(r.meta.paper.target));
       const source = paper ? await import('./paper-source.mjs') : null;
@@ -1189,11 +1569,13 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       }
     } catch (error) {
       r.meta.state = r.meta.stopRequested || disposed ? 'stopped' : 'failed';
+      const math = r.meta.kind === 'paper-math-verification';
+      if (math) clearMathCompletion(r);
       if (linearKind(r.meta.kind)) setLinearRunError(r, error);
       else setReportError(r.meta, code(error));
       if (r.handle) {
         try {
-          terminal = await r.handle.stop(); r.meta.writer = linearKind(r.meta.kind) ? planWriterEvidence(terminal) : copy(terminal);
+          terminal = await r.handle.stop(); r.meta.writer = stoppedWriterEvidence(p, r, terminal);
           r.meta.cleanupPending = terminal?.cleanupPending !== false;
         } catch { r.meta.cleanupPending = true; }
       } else if (linearKind(r.meta.kind)) {
@@ -1202,11 +1584,11 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         r.meta.writerStarting = false;
         r.meta.cleanupPending = Boolean(r.meta.writer?.sessionId) || Boolean(r.meta.scheduleId) || r.meta.scheduleCreating;
       }
-      if (linearKind(r.meta.kind)) r.meta.cleanupPending ||= r.meta.taskCreating || r.meta.scheduleCreating
+      if (linearKind(r.meta.kind) || math) r.meta.cleanupPending ||= r.meta.taskCreating || r.meta.scheduleCreating
         || r.meta.writerStarting || Boolean(r.meta.scheduleId) || r.failedSave;
       await save(p, r).catch(() => {});
     } finally {
-      await settle(p, r).catch(() => {});
+      if (!settledHere) await settle(p, r).catch(() => {});
     }
     return view(r);
   }
@@ -1229,6 +1611,13 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   }
   async function start(p, args, ctx, admission = null) {
     check(!isProxy(args), 'PROJECT_INVALID_INPUT');
+    if (Object.getOwnPropertyDescriptor(args ?? {}, 'kind')?.value === 'paper-math-verification') {
+      const selector = snapshotPaperMathSelector(Object.getOwnPropertyDescriptor(args, 'math')?.value);
+      check(selector && Object.getOwnPropertyDescriptor(args, 'language')?.value === 'English'
+        && Object.keys(args).every(key => ['kind', 'language', 'math', 'projectId'].includes(key))
+        && (args.projectId === undefined || args.projectId === p.meta.projectId), 'PROJECT_INVALID_INPUT');
+      args = { kind: 'paper-math-verification', language: 'English', math: selector };
+    }
     if (args && (Object.getOwnPropertyDescriptor(args, 'kind')?.value === 'paper-revision' || Object.hasOwn(args, 'revision'))) args = snapshotPaperRevisionStart(args);
     if (Object.getOwnPropertyDescriptor(args ?? {}, 'kind')?.value === 'paper-plan') args = snapshotPaperPlanStart(args);
     if (Object.getOwnPropertyDescriptor(args ?? {}, 'kind')?.value === 'paper-section') args = snapshotPaperSectionStart(args);
@@ -1237,6 +1626,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     const planBase = plan ? copy(args.plan) : null;
     const revisionSelector = args?.kind === 'paper-revision' ? copy(args.revision) : null;
     const verificationSelector = args?.kind === 'reference-verification' ? copy(args.verification) : null;
+    const mathSelector = args?.kind === 'paper-math-verification' ? copy(args.math) : null;
     if (admission) {
       check((args?.kind === 'paper-source' || linear) && typeof admission.authorize === 'function' && typeof admission.guard === 'function', 'PROJECT_INVALID_INPUT');
       await admission.authorize(); admission.guard();
@@ -1244,8 +1634,13 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
     if (revisionSelector) check(args.kind === 'paper-revision' && JSON.stringify(args.revision) === JSON.stringify(revisionSelector), 'PROJECT_INVALID_INPUT');
     if (verificationSelector) check(args.kind === 'reference-verification' && JSON.stringify(args.verification) === JSON.stringify(verificationSelector), 'PROJECT_INVALID_INPUT');
+    if (mathSelector) check(args.kind === 'paper-math-verification' && JSON.stringify(args.math) === JSON.stringify(mathSelector), 'PROJECT_INVALID_INPUT');
     if (!section) check(typeof summaryWriter?.start === 'function', 'PROJECT_SUMMARY_UNAVAILABLE');
     check(validReportStart(args, p.meta.projectId, paperValid), 'PROJECT_INVALID_INPUT');
+    if (deferHistoricalWork === true) {
+      await prepareHistory(p, () => admission ? admission.authorize() : authorizeCreator(p, ctx));
+      admission?.guard(); assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
+    }
     let sectionRecord = null, sectionReport = null, sectionParent = null;
     const admissionSectionCheck = async () => {
       await admission.authorize(); admission.guard(); assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
@@ -1319,6 +1714,16 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       await revisionMaterial(p, revisionRecord, null, args.notes);
       await authorizeCreator(p, ctx); assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
     }
+    let mathBinding = null, mathMaterial = null;
+    if (args.kind === 'paper-math-verification') {
+      const sourceSelector = { ...mathSelector };
+      const authorize = () => authorizeCreator(p, ctx);
+      mathMaterial = await paperMathSource(p, sourceSelector,
+        () => { assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); }, authorize);
+      mathBinding = mathMaterial.binding;
+      check(validPaperMathBinding(mathBinding), 'PROJECT_INVALID_INPUT');
+      await mathMaterial.assertSource();
+    }
     let verificationRecord = null;
     if (args.kind === 'reference-verification') {
       const material = await verificationMaterial(p, verificationSelector);
@@ -1335,13 +1740,14 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       await assertPaperTarget(p.meta.projectId, copy(paperRecord.target));
       if (admission) { await admission.authorize(); admission.guard(); }
     }
-    const blocker = active.get(p.meta.projectId);
+    if (deferHistoricalWork === true) { admission?.guard(); assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); }
+    const blocker = active.get(p.meta.projectId) ?? deferredByProject.get(p.meta.projectId)?.values().next().value;
     check(!damaged.has(p.meta.projectId) && !admitting.has(p.meta.projectId), 'PROJECT_SUMMARY_BUSY');
     if (blocker) throw Object.assign(failure('PROJECT_SUMMARY_BUSY'), { reportId: blocker.meta.reportId, projectId: p.meta.projectId });
     const reportId = `report-${randomUUID()}`;
     if (section) { sectionRecord.lineage.chainRootReportId ??= reportId; check(validSectionBinding(sectionRecord, p.meta.projectId, reportId), 'PROJECT_PAPER_SECTION_BINDING_INVALID'); }
     const r = wrap({ schemaVersion: 1, projectId: p.meta.projectId, reportId, state: 'queued',
-      ...spec.recordFields(sectionRecord ?? planRecord ?? revisionRecord ?? verificationRecord ?? (paper ? paperRecord : auditRecord)),
+      ...spec.recordFields(sectionRecord ?? planRecord ?? revisionRecord ?? verificationRecord ?? mathBinding ?? (paper ? paperRecord : auditRecord)),
       language: args.language, creator: copy(p.meta.creator), createdAt: Date.now(), taskId: null, taskCreating: false,
       scheduleId: null, scheduleCreating: false, scheduleCleaned: false, nonce: randomBytes(24).toString('hex'),
       writerStarting: false, writer: null, cleanupPending: false, stopRequested: false, taskSettlement: 'pending', delivery: null });
@@ -1351,6 +1757,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     const admissionLinearCheck = section ? admissionSectionCheck : admissionPlanCheck;
     try {
       await store.mkdir(directory(p, reportId), true); await save(p, r);
+      if (mathMaterial) await mathMaterial.assertSource();
       if (revisionRecord?.mode === 'operator-notes') {
         await revisionMaterial(p, revisionRecord, null, args.notes);
         await paperArtifact(p, r, 'notes', Buffer.from(args.notes), 'text/markdown');
@@ -1366,6 +1773,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         && task.parentSessionId === p.meta.creator.sessionId && task.parentSessionPath === ctx.sessionPath
         && matchesReportTaskFields(r.meta, task.metadata) && typeof task.taskId === 'string', 'PROJECT_REPORT_TASK_UNCONFIRMED');
       r.meta.taskId = task.taskId; r.meta.taskCreating = false; await save(p, r);
+      if (mathMaterial) await mathMaterial.assertSource();
       if (linear) { const receipt = await taskReceipt(p, r); check(['pending', 'running'].includes(receipt.status), 'PROJECT_REPORT_TASK_INACTIVE'); await admissionLinearCheck(); }
       if (revisionRecord?.mode === 'operator-notes') {
         await revisionMaterial(p, revisionRecord, r);
@@ -1375,6 +1783,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         await revisionMaterial(p, revisionRecord, r);
       }
       check(!disposed, 'PROJECT_DISPOSED'); check(!r.meta.stopRequested, 'PROJECT_SUMMARY_STOPPED');
+      if (mathMaterial) await mathMaterial.assertSource();
       r.meta.scheduleCreating = true; await save(p, r);
       const schedule = await bounded(sdk.tasks.schedule({ scope: 'app', handlerKey: HANDLER, runAt: Date.now(), label: 'Write Math report once',
         payload: { projectId: p.meta.projectId, reportId, nonce: r.meta.nonce } }));
@@ -1413,7 +1822,8 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     let p;
     try { p = getProject(event.input?.projectId); } catch { return { status: 'ignored' }; }
     const r = records.get(key(p, event.input?.reportId));
-    if (!r || r.meta.state !== 'queued' || r.meta.nonce !== event.input?.nonce || r.meta.stopRequested) return { status: 'ignored' };
+    if (!r || r.historical || active.get(p.meta.projectId) !== r || r.meta.state !== 'queued'
+      || r.meta.nonce !== event.input?.nonce || r.meta.stopRequested) return { status: 'ignored' };
     r.meta.state = 'running'; // one dispatch owner, before the first await
     if (event.scheduleId) { r.meta.scheduleId = event.scheduleId; r.meta.scheduleCleaned = true; }
     r.job = track(p, (async () => { await save(p, r); return run(p, r); })());
@@ -1425,7 +1835,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   }
   function getKind(p, id, options) {
     const expected = options?.kind ?? 'summary';
-    check(['summary', 'paper-source', 'reference-audit', 'reference-verification', 'paper-revision', 'paper-plan', 'paper-section'].includes(expected), 'PROJECT_INVALID_INPUT');
+    check(['summary', 'paper-source', 'reference-audit', 'reference-verification', 'paper-revision', 'paper-plan', 'paper-section', 'paper-math-verification'].includes(expected), 'PROJECT_INVALID_INPUT');
     const r = get(p, id);
     check((r.meta.kind ?? 'summary') === expected, 'PROJECT_REPORT_KIND_MISMATCH');
     return r;
@@ -1501,12 +1911,28 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     return result;
   }
   async function status(p, args, ctx, options) {
-    await authorizeCreator(p, ctx); const r = getKind(p, args.reportId, options);
+    await authorizeCreator(p, ctx);
+    if (deferHistoricalWork === true) await prepareHistory(p, () => authorizeCreator(p, ctx));
+    const r = getKind(p, args.reportId, options);
     if (r.meta.kind === 'paper-plan' && r.meta.state === 'completed') await readSavedPlan(p, r);
     const inspection = r.meta.kind === 'paper-section' && r.meta.state === 'completed'
-      ? await inspectSavedSection(p, r, true) : null;
+      ? await (r.historical ? readSavedSection(p, r) : inspectSavedSection(p, r, true)) : null;
+    if (r.historical && r.meta.kind === 'paper-revision' && r.meta.revision.mode === 'operator-notes' && r.meta.state === 'completed') {
+      await readOperatorNotes(p, r);
+    }
+    let mathReviewError = null;
+    if (r.meta.kind === 'paper-math-verification') {
+      mathReviewChecks.delete(r);
+      // A producer-completed record can be observed while its Host task receipt
+      // is still pending. Do not parse/project a verdict until settlement is clean.
+      if (cleanMathCompletion(r)) {
+        try { await readPaperMathReview(p, r); }
+        catch { mathReviewChecks.delete(r); mathReviewError = { code: 'PROJECT_PAPER_MATH_REVIEW_INVALID', phase: 'archive-validation' }; }
+      }
+    }
     const result = readView(r);
     if (inspection?.readError) result.readError = inspection.readError;
+    if (mathReviewError) result.readError = mathReviewError;
     if (r.meta.kind === 'reference-verification' && TERMINAL.has(r.meta.state) && r.meta.writer?.sessionId) {
       result.writer.toolAvailabilityReadback = await toolAvailabilityReadback(p, r);
     }
@@ -1586,12 +2012,16 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       sha256: hash(output), bytes: output.length };
   }
   async function result(p, args, ctx, options) {
-    await authorizeCreator(p, ctx); const r = getKind(p, args.reportId, options), m = r.meta;
-    if (m.kind === 'paper-source' || m.kind === 'reference-audit' || m.kind === 'reference-verification' || m.kind === 'paper-revision' || m.kind === 'paper-plan' || m.kind === 'paper-section') return paperResult(p, r);
+    await authorizeCreator(p, ctx);
+    if (deferHistoricalWork === true) await prepareHistory(p, () => authorizeCreator(p, ctx));
+    const r = getKind(p, args.reportId, options), m = r.meta;
+    if (m.kind === 'paper-source' || m.kind === 'reference-audit' || m.kind === 'reference-verification' || m.kind === 'paper-revision'
+      || m.kind === 'paper-plan' || m.kind === 'paper-section' || m.kind === 'paper-math-verification') return paperResult(p, r);
     check(['completed', 'leak'].includes(m.state) && !m.cleanupPending && !r.failedSave, 'PROJECT_REPORT_NOT_READY');
     if (m.state === 'leak') return { ...view(r), saved: true, status: 'leak' };
     const { sessionId, sessionPath } = p.meta.creator ?? {};
     const artifact = m.publishedArtifact ?? m.artifact;
+    check(artifact === `${directory(p, m.reportId)}/report.md`, 'PROJECT_REPORT_ARTIFACT_INVALID');
     const expectedBytes = m.publishedArtifact ? m.publishedBytes : m.bytes;
     const expectedHash = m.publishedArtifact ? m.publishedSha256 : m.sha256;
     const bytes = await store.read(artifact);
@@ -1601,7 +2031,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       const receipt = await sdk.resources.stage({ path: store.absolute(artifact), name: 'math-progress-report.md', mime: 'text/markdown', deliverAs: 'attachment' });
       const resource = receipt?.resource;
       check(receipt?.ok !== false && !receipt?.error && resource?.kind === 'session-file'
-        && typeof resource.fileId === 'string' && resource.fileId && typeof resource.sessionId === 'string' && resource.sessionId,
+        && typeof resource.fileId === 'string' && resource.fileId && typeof sessionId === 'string' && resource.sessionId === sessionId,
       'PROJECT_REPORT_STAGE_INVALID');
       m.delivery = { state: 'staged', delivered: false, fileId: resource.fileId }; await save(p, r);
       markdownResult = { ...view(r), saved: true, status: 'ok', fileId: resource.fileId, resource: { kind: 'session-file', fileId: resource.fileId, sessionId: resource.sessionId },
@@ -1614,6 +2044,21 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   }
   async function stopInternal(p, r) {
     return exclusive(r, async () => {
+      const math = r.meta.kind === 'paper-math-verification';
+      if (math && (mathCompletionCandidate(r) || r.settlementPromise && TERMINAL.has(r.meta.state))) {
+        // Join the producer's terminal settlement, including a rejection that
+        // is still being saved. A stop cannot rewrite an already clean review.
+        if (r.settlementPromise || !cleanMathCompletion(r)) await settle(p, r);
+        if (!reportNeedsRecovery(r.meta) && !r.failedSave && (!r.job || r.jobSettled)
+          && active.get(p.meta.projectId) === r) active.delete(p.meta.projectId);
+        return settledMathView(p, r);
+      }
+      if (math && r.meta.state === 'completed') {
+        r.meta.state = r.failedSave ? 'failed' : 'stopped'; r.meta.stopRequested = true;
+        setReportError(r.meta, r.meta.error ?? (r.failedSave ? 'PROJECT_REPORT_PERSISTENCE_FAILED' : 'PROJECT_REPORT_STOPPED'));
+        clearMathCompletion(r);
+        await save(p, r);
+      }
       if (linearKind(r.meta.kind)) r.meta.cleanupPending ||= r.meta.taskCreating || r.meta.scheduleCreating
         || r.meta.writerStarting || r.failedSave;
       if (TERMINAL.has(r.meta.state) && !r.meta.cleanupPending && r.meta.taskSettlement === 'confirmed'
@@ -1625,7 +2070,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       try { await unschedule(p, r); } catch { r.meta.cleanupPending = true; }
       if (r.handle) {
         delete r.meta.recoveryStop; delete r.meta.recoveryError;
-        try { const stopped = await r.handle.stop(); r.meta.writer = linearKind(r.meta.kind) ? planWriterEvidence(stopped) : copy(stopped); r.meta.cleanupPending = stopped?.cleanupPending !== false; }
+        try { const stopped = await r.handle.stop(); r.meta.writer = stoppedWriterEvidence(p, r, stopped); r.meta.cleanupPending = stopped?.cleanupPending !== false; }
         catch { r.meta.cleanupPending = true; }
       } else if (r.meta.writer?.sessionId) {
         delete r.meta.recoveryStop; delete r.meta.recoveryError;
@@ -1640,7 +2085,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         // A recovered pre-task archive failure has no Host resources. Never clear uncertain creation markers.
         r.meta.cleanupPending = false; r.meta.taskSettlement = 'confirmed';
       }
-      if (linearKind(r.meta.kind)) r.meta.cleanupPending ||= r.meta.taskCreating || r.meta.scheduleCreating
+      if (linearKind(r.meta.kind) || math) r.meta.cleanupPending ||= r.meta.taskCreating || r.meta.scheduleCreating
         || r.meta.writerStarting || Boolean(r.meta.scheduleId) || r.failedSave;
       await save(p, r); await settle(p, r);
       if (!r.meta.cleanupPending && r.meta.taskSettlement === 'confirmed' && (!r.job || r.jobSettled)
@@ -1648,10 +2093,70 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       return view(r);
     });
   }
-  async function stop(p, args, ctx, options) { await authorizeCreator(p, ctx); return stopInternal(p, getKind(p, args.reportId, options)); }
+  async function stopHistorical(p, r) {
+    return exclusive(r, async () => {
+      assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
+      const m = r.meta;
+      if (!reportNeedsRecovery(m)) return view(r);
+      const unfinished = !TERMINAL.has(m.state);
+      let pending = m.taskCreating || m.scheduleCreating || m.writerStarting || r.failedSave;
+      if (unfinished) m.stopRequested = true;
+      // Make the unresolved stop durable before Host side effects. Keep the recorded
+      // state until cleanup and task settlement actually succeed.
+      const stopWriter = !CONFIRMED_RECOVERY_STOPS.has(m.recoveryStop)
+        && (unfinished || m.cleanupPending || writerCleanupPending(m));
+      m.cleanupPending = true;
+      await save(p, r);
+      if (m.scheduleId) {
+        try {
+          const id = m.scheduleId, schedule = await bounded(sdk.tasks.getSchedule(id));
+          if (schedule === null) {
+            m.scheduleId = null; m.scheduleCleaned = true;
+          } else {
+            check(schedule?.scheduleId === id && schedule.pluginId === APP && schedule.scope === 'app' && schedule.handlerKey === HANDLER
+              && schedule.payload?.projectId === m.projectId && schedule.payload.reportId === m.reportId
+              && schedule.payload.nonce === m.nonce, 'PROJECT_REPORT_SCHEDULE_UNCONFIRMED');
+            await unschedule(p, r);
+          }
+        } catch { pending = true; }
+      }
+      if (stopWriter && m.writer?.sessionId) {
+        delete m.recoveryStop; delete m.recoveryError;
+        try {
+          const prefix = (m.kind ?? 'summary') === 'summary' ? 'math-summary' : `math-${m.kind}`;
+          check(m.writer.kind === `${prefix}:${m.projectId}:${m.reportId}`
+            && m.writer.cwd === store.absolute(directory(p, m.reportId)), 'PROJECT_REPORT_WRITER_UNCONFIRMED');
+          const stopped = await confirmResearchSessionStop(sdk, m.writer);
+          m.recoveryStop = stopped.abortOutcome;
+        } catch (error) { pending = true; m.recoveryError = code(error); }
+      }
+      m.cleanupPending = pending || writerCleanupPending(m);
+      if (!m.cleanupPending && m.taskSettlement !== 'confirmed') {
+        if (!m.taskId && !m.taskCreating) m.taskSettlement = 'confirmed';
+        else await settle(p, r);
+      }
+      if (unfinished && !m.cleanupPending && m.taskSettlement === 'confirmed') {
+        m.state = 'stopped'; setReportError(m, 'PROJECT_REPORT_STOPPED');
+      }
+      await save(p, r);
+      if (!reportNeedsRecovery(m)) {
+        const blockers = deferredByProject.get(m.projectId);
+        blockers?.delete(r);
+        if (!blockers?.size) deferredByProject.delete(m.projectId);
+      }
+      return view(r);
+    });
+  }
+  async function stop(p, args, ctx, options) {
+    await authorizeCreator(p, ctx);
+    if (deferHistoricalWork === true) await prepareHistory(p, () => authorizeCreator(p, ctx));
+    const r = getKind(p, args.reportId, options);
+    return r.historical ? stopHistorical(p, r) : stopInternal(p, r);
+  }
   async function revise(p, args, ctx) {
     args = snapshotPaperRevisionRequest(args);
     await authorizeCreator(p, ctx);
+    if (deferHistoricalWork === true) await prepareHistory(p, () => authorizeCreator(p, ctx));
     // Select the lane before reading a parent; never fall back from citation failure.
     if (args.mode === 'operator-notes') {
       const parent = getKind(p, args.reportId, { kind: 'paper-source' });
@@ -1728,8 +2233,8 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     check(typeof literature?.search === 'function', 'PROJECT_REFERENCE_VERIFY_LITERATURE_UNAVAILABLE');
     return literature.search(query, numResults);
   }
-  // Recovery never starts an Agent, a session or a model send.
-  for (const p of projects()) {
+  // Default recovery never starts an Agent, a session or a model send.
+  if (deferHistoricalWork !== true) for (const p of projects()) {
     let names;
     try { names = await store.list(`${projectLocation(p)}/reports`); }
     catch (error) { if (error.code === 'ENOENT') continue; damaged.add(p.meta.projectId); continue; }
@@ -1787,7 +2292,8 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   }
   if (sdk.tasks?.registerHandler) {
     registration = await bounded(sdk.tasks.registerHandler(HANDLER, { run: handle, abort: async taskId => {
-      for (const r of records.values()) if (r.meta.taskId === taskId) return stopInternal(getProject(r.meta.projectId), r);
+      if (disposed) return { status: 'ignored' };
+      for (const r of records.values()) if (!r.historical && r.meta.taskId === taskId) return stopInternal(getProject(r.meta.projectId), r);
       return { status: 'ignored' };
     } }));
     if (registration?.ready) await bounded(registration.ready);
@@ -1801,8 +2307,20 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     let writer = { cleanupPending: false, errors: [] };
     if (summaryWriter?.dispose) { try { writer = await summaryWriter.dispose(); } catch (error) { writer = { cleanupPending: true, errors: [{ code: code(error) }] }; } }
     if (registration?.disposeAsync) await registration.disposeAsync(); else if (typeof registration === 'function') registration();
-    return { cleanupPending: damaged.size > 0 || active.size > 0 || writer?.cleanupPending !== false || errors.length > 0,
+    return { cleanupPending: damaged.size > 0 || active.size > 0 || deferredByProject.size > 0 || hasUnopenedHistory()
+        || writer?.cleanupPending !== false || errors.length > 0,
       errors: [...errors, ...(writer?.errors ?? [])] };
   }
-  return Object.freeze({ start, status, result, stop, revise, stitch, handlesLiterature, invokeLiterature, dispose });
+  function hasUnopenedHistory() {
+    // Only this process's exclusive Project creation rules out prior reports.
+    // Do not list or load old metadata to make a shutdown claim.
+    if (deferHistoricalWork === true) for (const p of projects()) {
+      if (!historyPreparation.get(p)?.ready && isFreshProject(p) !== true) return true;
+    }
+    return false;
+  }
+  function dashboardShutdownIdle() {
+    return !disposed && active.size === 0 && deferredByProject.size === 0 && damaged.size === 0 && !hasUnopenedHistory();
+  }
+  return Object.freeze({ start, status, result, stop, revise, stitch, handlesLiterature, invokeLiterature, dispose, dashboardShutdownIdle });
 }

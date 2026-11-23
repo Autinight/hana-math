@@ -60,7 +60,8 @@ test('panel uses documented partition, app avatars, own verified instances and f
 
 test('genuine empty list differs from old-host, permission, transport and malformed-list failures', async () => {
   assert.deepEqual((await loadPanel(fakeSdk())).assistants, { state: 'ready', items: [] });
-  for (const failure of [() => { throw new Error('PRIVATE_HOST_ERROR'); }, () => ({ agents: null }), () => ({ error: 'unsupported' })]) {
+  for (const failure of [() => { throw new Error('PRIVATE_HOST_ERROR'); }, () => ({ agents: null }), () => ({ error: 'unsupported' }),
+    () => ({ ok: false, agents: [] }), () => ({ agents: [], error: 'PRIVATE_HOST_ERROR' })]) {
     const sdk = fakeSdk();
     const original = sdk.agents.list;
     sdk.agents.list = async (input) => input.scope === 'all' ? failure() : original(input);
@@ -70,9 +71,13 @@ test('genuine empty list differs from old-host, permission, transport and malfor
     assert.doesNotMatch(JSON.stringify(result), /PRIVATE_HOST_ERROR/);
   }
   const sdk = fakeSdk([publicAgent('available')]);
-  sdk.roles.list = async () => { throw new Error('OLD_HOST'); };
-  assert.equal((await loadPanel(sdk)).assistants.items.length, 1);
-  assert.deepEqual((await loadPanel(sdk)).roles, { state: 'error', items: [] });
+  const roles = await sdk.roles.list();
+  for (const failure of [() => { throw new Error('OLD_HOST'); }, () => ({ ...roles, ok: false })]) {
+    sdk.roles.list = async () => failure();
+    const result = await loadPanel(sdk);
+    assert.equal(result.assistants.items.length, 1);
+    assert.deepEqual(result.roles, { state: 'error', items: [] });
+  }
 });
 
 test('invalid/foreign/duplicate role templates and forged private bindings fail closed', async () => {

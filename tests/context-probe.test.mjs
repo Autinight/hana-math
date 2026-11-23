@@ -117,7 +117,7 @@ async function fixture(t) {
     taskRecords.set(taskId, { ...taskRecords.get(taskId), status, updatedAt: Date.now(), ...(['failed', 'canceled', 'aborted'].includes(status) ? { error: 'Fixture host task reason' } : {}) });
     for (const controller of taskStreams.get(taskId) || []) controller.enqueue(encoder.encode(`event: ${type}\ndata: ${JSON.stringify(taskRecords.get(taskId))}\n\n`));
   };
-  return { sdk, contexts, controls, calls, listeners, taskRecords, taskStreams, taskEvent, completed, failed, dataDir, texts, emit, readOne, reads, end, start, enqueue, settled, waitReads, waitForProbe, get probe() { return probe; }, get session() { return session; }, get service() { return service; }, restart() { service = createContextProbe(sdk, contexts); return service; } };
+  return { sdk, contexts, controls, calls, listeners, taskRecords, taskStreams, taskEvent, completed, failed, dataDir, texts, emit, readOne, reads, end, start, enqueue, settled, waitReads, waitForProbe, get probe() { return probe; }, get session() { return session; }, get service() { return service; }, restart(options) { service = createContextProbe(sdk, contexts, options); return service; } };
 }
 
 test('setup is inference-free; explicit start uses isolated role/session, selects read only, subscribes before send', async (t) => {
@@ -230,6 +230,66 @@ test('recovery aborts recorded unfinished own sessions and marks interrupted wit
   assert.equal(result.abortOutcome, 'aborted'); assert.match(result.limitation, /unexpected App crash/);
   assert.equal((await f.service.stop(started.probeId)).state, 'interrupted');
   assert.equal(f.calls.findLast((call) => call.name === 'sessions.abort').input.sessionId, record.sessionId);
+});
+
+test('deferred probe startup leaves unrelated history untouched and verifies only the explicit stop target', async t => {
+  for (const count of [0, 16, 2]) await t.test(`${count === 2 ? 'unfinished' : 'finished'}: ${count}`, async t => {
+    const f = await fixture(t);
+    await f.service.dispose();
+    const sdkSessions = new Map(), records = [];
+    f.sdk.sessions.get = async ({ sessionId }) => { f.calls.push({ name: 'sessions.get', input: { sessionId } }); return { session: sdkSessions.get(sessionId) }; };
+    f.sdk.sessions.list = async ({ agentId }) => { f.calls.push({ name: 'sessions.list', input: { agentId } }); return { sessions: [...sdkSessions.values()].filter(s => s.agentId === agentId) }; };
+    for (let i = 0; i < count; ++i) {
+      const probeId = `probe-${randomUUID()}`, projectId = `fixture-${i}`, role = 'worker';
+      const taskId = `historic-task-${i}`, sessionId = `historic-session-${i}`, agentId = `hana-math-probe-worker-${randomUUID()}`;
+      const cwd = path.join(f.dataDir, 'context/projects', projectId, 'probes', probeId, role), sessionPath = `/software-fixture/${sessionId}.jsonl`;
+      const record = { schemaVersion: 1, probeId, projectId, role, state: count === 2 ? 'running' : 'passed',
+        taskId, sessionId, sessionPath, agentId, cwd, sendState: 'accepted', sendPending: false, setupPending: false,
+        finalizing: false, cleanupPending: false, taskDelivery: count === 2 ? 'pending' : 'recorded' };
+      const file = path.join(f.dataDir, 'context/probe-runs', `${probeId}.json`);
+      sdkSessions.set(sessionId, { sessionId, path: sessionPath, agentId, cwd, ownerPluginId: 'hana-math',
+        visibility: 'plugin_private', namespace: 'app', kind: null, lifecycle: 'active' });
+      f.taskRecords.set(taskId, { taskId, scope: 'app', pluginId: 'hana-math', handlerKey: null, status: 'pending', metadata: { probeId, projectId, role } });
+      await fs.writeFile(file, JSON.stringify(record)); records.push({ file, record });
+    }
+    await f.restart({ deferHistoricalWork: true }).recoveryReady;
+    for (const { file, record } of records) {
+      assert.deepEqual(await f.service.get(record.probeId), record);
+      assert.equal(await fs.readFile(file, 'utf8'), JSON.stringify(record));
+    }
+    assert.deepEqual(f.calls, []);
+    if (count === 2) {
+      const [{ record }, other] = records;
+      const row = sdkSessions.get(record.sessionId);
+      row.cwd = sdkSessions.get(other.record.sessionId).cwd;
+      const failed = await f.service.stop(record.probeId);
+      assert.equal(failed.state, 'running');
+      assert.equal(failed.cleanupPending, true);
+      assert.equal(failed.abortError, 'STOP_SESSION_MISMATCH');
+      assert.deepEqual(f.calls.splice(0).map(c => c.name), ['sessions.get', 'sessions.list']);
+      row.cwd = record.cwd;
+      f.taskRecords.get(record.taskId).metadata.probeId = other.record.probeId;
+      const unbound = await f.service.stop(record.probeId);
+      assert.equal(unbound.state, 'running');
+      assert.equal(unbound.taskDeliveryError, 'TASK_RECEIPT_INVALID');
+      assert.deepEqual(f.calls.splice(0).map(c => c.name), ['sessions.get', 'sessions.list', 'sessions.abort', 'tasks.get']);
+      f.taskRecords.get(record.taskId).metadata.probeId = record.probeId;
+      const [stopped, sameStop] = await Promise.all([f.service.stop(record.probeId), f.service.stop(record.probeId)]);
+      assert.deepEqual(stopped, sameStop);
+      assert.equal(stopped.state, 'stopped');
+      assert.equal(stopped.cleanupPending, false);
+      assert.deepEqual(f.calls.splice(0), [{ name: 'tasks.get', input: { taskId: record.taskId } },
+        { name: 'tasks.fail', input: { taskId: record.taskId } }]);
+      assert.equal(f.failed.at(-1).taskId, record.taskId);
+      assert.equal(await fs.readFile(other.file, 'utf8'), JSON.stringify(other.record));
+      const fresh = await f.start();
+      assert.equal(fresh.state, 'running');
+      await f.service.dispose(); f.calls.length = 0;
+    } else await f.service.dispose();
+    assert.deepEqual(f.calls, []);
+    await f.restart().recoveryReady;
+    assert.deepEqual(f.calls.map(c => c.name), count === 2 ? ['sessions.abort', 'tasks.fail'] : []);
+  });
 });
 
 test('an automatic retry can later pass, but final context must still match the role', async (t) => {

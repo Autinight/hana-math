@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createContextStore } from '../packages/hana-math/context-service.mjs';
 import { createProjectReportService } from '../packages/hana-math/project-report-service.mjs';
 import { capturePaperMaterial } from '../packages/hana-math/paper-source.mjs';
@@ -64,6 +64,15 @@ async function fixture(t, { references = false, plan = false } = {}) {
       sessions.set(binding.sessionPath, { ...binding, path: binding.sessionPath, ownerPluginId: 'hana-math', namespace: 'app', visibility: 'plugin_private', lifecycle: 'active' });
       if (!agents.some(row => row.id === binding.agentId)) agents.push({ id: binding.agentId, state: 'active', deletedAt: null, ownerPluginId: 'hana-math', visibility: 'plugin_private', plugin: { ownerPluginId: 'hana-math', visibility: 'plugin_private', kind: 'math-report-writer' } });
       lastBinding = binding; await beforeBound?.(); await input.onBound(binding); await input.onUpdate({ ...binding, state: 'running', cleanupPending: true });
+    } else if (input.kind === 'paper-math-verification') {
+      binding = { role: 'report-writer', agentId: 'paper-math-verifier-01234567-89ab-cdef-0123-456789abcdef', sessionId: `math-fixture-${sequence}`,
+        sessionPath: `/fixture/math-${sequence}.jsonl`, cwd: input.cwd, kind: `math-paper-math-verification:${input.projectId}:${input.reportId}`,
+        sendState: 'not-sent', sendPending: false };
+      sessions.set(binding.sessionPath, { ...binding, path: binding.sessionPath, ownerPluginId: 'hana-math', namespace: 'app', visibility: 'plugin_private', lifecycle: 'active' });
+      if (!agents.some(row => row.id === binding.agentId)) agents.push({ id: binding.agentId, state: 'active', deletedAt: null, ownerPluginId: 'hana-math', visibility: 'plugin_private',
+        plugin: { ownerPluginId: 'hana-math', visibility: 'plugin_private', kind: 'paper-math-verifier' } });
+      lastBinding = binding;
+      await beforeBound?.(); await input.onBound(binding); await input.onUpdate({ ...binding, state: 'running', cleanupPending: true });
     } else if (input.kind === 'reference-verification') {
       binding = { role: 'reference-verifier', agentId: 'math-reference-verifier-01234567-89ab-cdef-0123-456789abcdef', sessionId: `verifier-fixture-${sequence}`,
         sessionPath: `/fixture/verifier-${sequence}.jsonl`, cwd: input.cwd, kind: `math-reference-verification:${input.projectId}:${input.reportId}` };
@@ -82,7 +91,7 @@ async function fixture(t, { references = false, plan = false } = {}) {
     started.resolve(); started = defer();
     return { done: output.promise, async stop() { const result = terminalSnapshot ?? { ...binding, state: 'stopped', cleanupPending: false }; output.resolve(result); return result; } };
   }, async dispose() { return { cleanupPending: false }; } };
-  async function open() {
+  async function open(options = {}) {
     service = await createProjectReportService({ sdk, store, summaryWriter: writer,
       literature: { async search(query, count) { calls.literature.push([query, count]); return { query, count, results: [] }; } },
       async authorizeCreator(_p, ctx) { if (ctx !== owner) throw Object.assign(new Error('denied'), { code: 'CREATOR_DENIED' }); },
@@ -91,6 +100,7 @@ async function fixture(t, { references = false, plan = false } = {}) {
       async assertPaperTarget(id, received) { calls.assertions++; assert.equal(id, p.meta.projectId); assert.deepEqual(received, target); if (revoked) throw Object.assign(new Error('changed'), { code: 'PROJECT_PAPER_TARGET_CHANGED' }); },
       async gatherPaperFacts(id, authority, received) { calls.gather.push(id); assert.deepEqual(received, target); assert.equal(Object.hasOwn(authority, 'callToken'), false); await authority.guard(); authority.assertActive(); if (drift-- > 0) throw Object.assign(new Error('drift'), { code: 'PROJECT_SUMMARY_GRAPH_CHANGED' }); return { facts: structuredClone(facts), asOf }; },
       async withPaperPublication(id, authority, received, callback) { assert.equal(id, p.meta.projectId); assert.deepEqual(received, target); await authority.guard(); authority.assertActive(); if (revoked) throw Object.assign(new Error('changed'), { code: 'PROJECT_PAPER_TARGET_CHANGED' }); return callback({ facts: structuredClone(facts), asOf }); },
+      ...options,
     });
   }
   await open();
@@ -102,6 +112,7 @@ async function fixture(t, { references = false, plan = false } = {}) {
       [method, (p, args, ctx) => service[method](p, args, ctx, { kind: 'paper-source' })])) }; },
     start: () => service.start(p, args, owner, admission),
     replay: event => handler.run(event),
+    abortTask: taskId => handler.abort(taskId),
     dispatch: (q, nonce) => { const row = [...schedules.values()].find(s => s.payload.reportId === q.reportId); return handler.run({ kind: 'schedule', scheduleId: row.scheduleId, input: { ...row.payload, ...(nonce ? { nonce } : {}) } }); },
     complete: text => output.resolve({ ...lastBinding, state: 'completed', modelStopReason: 'stop', cleanupPending: false, finalText: text }),
     terminal: snapshot => { terminalSnapshot = { ...lastBinding, model: null, toolSelection: null, ...snapshot }; output.resolve(terminalSnapshot); },
@@ -112,9 +123,264 @@ async function fixture(t, { references = false, plan = false } = {}) {
     artifact: (q, name) => store.read(`project/reports/${q.reportId}/${name}`),
   };
 }
+test('deferred report startup performs no historical Host work with empty, finished or unfinished history', async t => {
+  for (const count of [0, 16, 2]) await t.test(`${count === 2 ? 'unfinished' : 'finished'}: ${count}`, async t => {
+    const f = await fixture(t);
+    await f.rawService.dispose();
+    const calls = [];
+    for (const name of ['get', 'complete', 'fail', 'getDelivery', 'unschedule']) {
+      const original = f.sdk.tasks[name];
+      f.sdk.tasks[name] = (...args) => { calls.push([name, args[0]]); return original(...args); };
+    }
+    f.sdk.tasks.getSchedule = async id => { calls.push(['getSchedule', id]); return f.schedules.get(id) ?? null; };
+    const history = [];
+    for (let i = 0; i < count; i++) {
+      const reportId = `report-${randomUUID()}`, dir = `project/reports/${reportId}`;
+      const taskId = `historical-task-${i}`, scheduleId = count === 2 ? `historical-schedule-${i}` : null;
+      const nonce = 'f'.repeat(48), body = `Archived summary ${i}\n`;
+      const { projectId } = f.p.meta;
+      const meta = { schemaVersion: 1, projectId, reportId, state: scheduleId ? 'queued' : 'completed', language: 'English',
+        creator, taskId, taskSettlement: 'pending', scheduleId, scheduleCleaned: false, nonce, taskCreating: false,
+        scheduleCreating: false, writerStarting: false, cleanupPending: false, stopRequested: false,
+        ...(scheduleId ? {} : { artifact: `${dir}/report.md`, bytes: Buffer.byteLength(body), sha256: digest(body), leakFindings: [] }) };
+      f.tasks.set(taskId, { taskId, status: 'pending', pluginId: 'hana-math', scope: 'session', handlerKey: 'math-project-report',
+        delivery: 'next-step', parentSessionId: creator.sessionId, parentSessionPath: creator.sessionPath, metadata: { projectId, reportId } });
+      if (scheduleId) f.schedules.set(scheduleId, { scheduleId, pluginId: 'hana-math', scope: 'app', handlerKey: 'math-project-report', payload: { projectId, reportId, nonce } });
+      else await f.store.write(meta.artifact, body);
+      await f.store.write(`${dir}/metadata.json`, JSON.stringify(meta));
+      history.push({ meta, dir, body });
+    }
+    await f.open({ deferHistoricalWork: true });
+    assert.deepEqual(calls, []);
+    for (const { meta, dir } of history) assert.deepEqual(await f.store.readJson(`${dir}/metadata.json`), meta);
+    if (count === 2) {
+      const [{ meta }, { meta: other }] = history;
+      const args = { reportId: meta.reportId };
+      assert.equal(f.rawService.dashboardShutdownIdle(), false);
+      await assert.rejects(f.rawService.status(f.p, args, {}), { code: 'CREATOR_DENIED' });
+      assert.equal((await f.rawService.status(f.p, args, owner)).state, 'queued');
+      await assert.rejects(f.start(), { code: 'PROJECT_SUMMARY_BUSY' });
+      assert.deepEqual(await f.replay({ kind: 'schedule', scheduleId: meta.scheduleId, input: meta }), { status: 'ignored' });
+      assert.deepEqual(await f.abortTask(meta.taskId), { status: 'ignored' });
+      assert.deepEqual(calls, []);
+      f.schedules.get(meta.scheduleId).payload.reportId = other.reportId;
+      const unresolved = await f.rawService.stop(f.p, args, owner);
+      assert.equal(unresolved.state, 'queued');
+      assert.equal(unresolved.recoveryPending, true);
+      assert.deepEqual(calls.splice(0), [['getSchedule', meta.scheduleId]]);
+      f.schedules.get(meta.scheduleId).payload.reportId = meta.reportId;
+      assert.equal((await f.rawService.stop(f.p, args, owner)).state, 'stopped');
+      assert.deepEqual(calls.splice(0), [['getSchedule', meta.scheduleId], ['unschedule', meta.scheduleId],
+        ['get', meta.taskId], ['fail', meta.taskId], ['getDelivery', meta.taskId]]);
+      assert.equal(f.tasks.get(other.taskId).status, 'pending');
+      assert.equal(await f.rawService.dispose().then(r => r.cleanupPending), true);
+      assert.deepEqual(calls, []);
+      await f.open();
+      assert.equal((await f.rawService.status(f.p, { reportId: other.reportId }, owner)).state, 'interrupted');
+      assert.deepEqual(calls.map(([name]) => name), ['unschedule', 'get', 'fail', 'getDelivery']);
+    } else {
+      if (history.length) {
+        const [{ meta, dir, body }, { meta: foreign }] = history;
+        assert.equal((await f.rawService.status(f.p, meta, owner)).state, 'completed');
+        assert.equal((await f.rawService.result(f.p, meta, owner)).report, body);
+        const foreignPath = `another-project/reports/${foreign.reportId}/report.md`;
+        await f.store.write(foreignPath, body);
+        await f.store.write(`${dir}/metadata.json`, JSON.stringify({ ...meta, artifact: foreignPath }), true);
+        await f.rawService.dispose();
+        await f.open({ deferHistoricalWork: true });
+        const stages = f.calls.stages.length;
+        await assert.rejects(f.rawService.result(f.p, meta, owner), { code: 'PROJECT_REPORT_ARTIFACT_INVALID' });
+        assert.equal(f.calls.stages.length, stages);
+      }
+      await f.rawService.dispose();
+      assert.deepEqual(calls, []);
+      await f.open();
+      assert.equal(calls.filter(([name]) => name === 'get').length, count);
+    }
+    assert.deepEqual(f.calls.writer, []);
+    assert.deepEqual(f.calls.gather, []);
+  });
+});
+
+test('deferred report metadata is cold, project-scoped, and shared by concurrent authorized operations', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  await f.rawService.dispose();
+  const projects = new Map(), entries = new Map(), reads = [];
+  const project = id => {
+    const p = { meta: { projectId: id, creator } };
+    projects.set(id, p);
+    return p;
+  };
+  const projectLocation = p => `projects/${p.meta.projectId}`;
+  const selected = project('project-selected'), selectedDir = `${projectLocation(selected)}/reports`;
+  const body = 'Archived summary from the selected project.\n';
+  function seed(p, state) {
+    const reportId = `report-${randomUUID()}`, dir = `${projectLocation(p)}/reports`;
+    let history = entries.get(dir);
+    if (!history) entries.set(dir, history = new Map());
+    const meta = { schemaVersion: 1, projectId: p.meta.projectId, reportId, creator, state, language: 'English',
+      taskId: null, taskCreating: false, scheduleId: null, scheduleCreating: false, scheduleCleaned: false,
+      writerStarting: false, cleanupPending: false, stopRequested: false,
+      taskSettlement: state === 'completed' ? 'confirmed' : 'pending', nonce: 'f'.repeat(48), delivery: null,
+      artifact: `${dir}/${reportId}/report.md`, sha256: digest(body), bytes: Buffer.byteLength(body), leakFindings: [] };
+    history.set(reportId, meta);
+    return meta;
+  }
+  const saved = seed(selected, 'completed'), blocker = seed(selected, 'queued');
+  await f.store.write(saved.artifact, body);
+  for (let i = 0; i < 24; i++) {
+    const p = project(`project-unrelated-${i}`);
+    for (let j = 0; j < 4; j++) seed(p, j === 0 ? 'queued' : 'completed');
+  }
+  const listing = defer(), release = defer(), initiallyAuthorized = defer();
+  const revocableOwner = { ...owner };
+  let holdSelected = false, revoked = false, inventories = 0;
+  t.after(release.resolve);
+  await f.open({ deferHistoricalWork: true, projectLocation, getProject: id => projects.get(id),
+    projects: () => { inventories++; return projects.values(); },
+    async authorizeCreator(_p, ctx) {
+      if (ctx === owner) return;
+      if (ctx === revocableOwner && !revoked) { initiallyAuthorized.resolve(); return; }
+      throw Object.assign(new Error('denied'), { code: 'CREATOR_DENIED' });
+    },
+    store: { ...f.store,
+      async list(dir) {
+        reads.push(['list', dir]);
+        if (holdSelected && dir === selectedDir) { listing.resolve(); await release.promise; }
+        return [...(entries.get(dir)?.keys() ?? await f.store.list(dir))];
+      },
+      async readJson(name) {
+        reads.push(['readJson', name]);
+        const dir = path.posix.dirname(path.posix.dirname(name)), id = path.posix.basename(path.posix.dirname(name));
+        return entries.get(dir)?.has(id) ? structuredClone(entries.get(dir).get(id)) : f.store.readJson(name);
+      },
+    },
+  });
+  assert.equal(reads.length, 0, 'cold construction must not list or read report history');
+  assert.equal(inventories, 0);
+  await assert.rejects(f.rawService.status(selected, saved, {}), { code: 'CREATOR_DENIED' });
+  assert.deepEqual(await f.replay({ kind: 'schedule', input: blocker }), { status: 'ignored' });
+  assert.deepEqual(reads, []);
+  const fresh = project('project-fresh');
+  const request = p => ({ projectId: p.meta.projectId, language: 'English' });
+  const queued = await f.rawService.start(fresh, request(fresh), owner);
+  assert.equal(queued.state, 'queued');
+  assert.deepEqual(reads.splice(0), [['list', `${projectLocation(fresh)}/reports`]]);
+  assert.equal(inventories, 0);
+  const taskCount = f.tasks.size;
+
+  holdSelected = true;
+  const viewing = f.rawService.status(selected, saved, owner);
+  const waiting = assert.rejects(f.rawService.start(selected, request(selected), owner),
+    { code: 'PROJECT_SUMMARY_BUSY', reportId: blocker.reportId });
+  const deniedOnResume = assert.rejects(f.rawService.status(selected, saved, revocableOwner), { code: 'CREATOR_DENIED' });
+  const outcomes = Promise.all([viewing, waiting, deniedOnResume]);
+  try {
+    await Promise.all([listing.promise, initiallyAuthorized.promise]);
+    assert.deepEqual(reads, [['list', selectedDir]]);
+    assert.equal(f.tasks.size, taskCount);
+  } finally { revoked = true; release.resolve(); }
+  const [status] = await outcomes;
+  assert.equal(status.state, 'completed');
+  assert.equal((await f.rawService.result(selected, saved, owner)).report, body);
+  assert.equal((await f.rawService.status(selected, blocker, owner)).recoveryPending, true);
+  assert.equal(f.tasks.size, taskCount);
+  assert.deepEqual(reads, [['list', selectedDir], ['readJson', `${selectedDir}/${saved.reportId}/metadata.json`],
+    ['readJson', `${selectedDir}/${blocker.reportId}/metadata.json`]]);
+  assert.equal(inventories, 0);
+  assert.deepEqual(f.calls.writer, []);
+  assert.deepEqual(f.calls.gather, []);
+});
+
+test('shutdown distinguishes exclusively created projects from unopened report history without reading either', async t => {
+  const f = await fixture(t);
+  await f.rawService.dispose();
+  const bornHere = { meta: { projectId: 'project-fresh', creator } };
+  const rows = [bornHere];
+  await f.open({ deferHistoricalWork: true, projects: () => rows,
+    isFreshProject: p => p === bornHere,
+    store: { ...f.store, list: () => assert.fail('shutdown must not enumerate report history'),
+      readJson: () => assert.fail('shutdown must not load report history') },
+  });
+  assert.equal(f.rawService.dashboardShutdownIdle(), true);
+  rows.push({ meta: { projectId: 'project-parked', creator } });
+  assert.equal(f.rawService.dashboardShutdownIdle(), false);
+  assert.equal((await f.rawService.dispose()).cleanupPending, true);
+});
+
 async function writing(f, q) {
-  const run = f.dispatch(q); await Promise.race([f.started, run.then(() => { throw new Error('writer did not start'); })]); return { run };
+  const run = f.dispatch(q); await Promise.race([f.started, run.then(result => { throw new Error(`writer did not start: ${JSON.stringify(result)}`); })]); return { run };
 }
+const paperMath = (...selector) => ({ kind: 'paper-math-verification', language: 'English', math: selector.length === 1
+  ? { sourceReportId: selector[0] } : { planReportId: selector[0], finalSectionReportId: selector[1] } });
+const mathText = findings => JSON.stringify({ findings, report: 'Synthetic text-only review.' });
+test('paper math review accepts a clean flagged source, persists hashes and derives correct/wrong verdicts without rerunning', async t => {
+  for (const [label, findings, expected] of [
+    ['must-fix', [{ location: 'opaque line', issue: 'opaque missing hypothesis', class: 'must-fix' }], 'wrong'],
+    ['ignorable-only', [{ location: 'opaque line', issue: 'opaque notation', class: 'ignorable' }], 'correct'],
+  ]) await t.test(label, async t => {
+    const f = await fixture(t), start = await completedPaper(f, '[GAP: opaque blocker]', {}), sourceId = start.audit.sourceReportId;
+    const source = f.rawService; const sourceMeta = await f.store.readJson(`project/reports/${sourceId}/metadata.json`);
+    assert.equal(sourceMeta.state, 'completed'); assert.equal(sourceMeta.sourceStatus, 'flagged');
+    const queued = await source.start(f.p, paperMath(sourceId), owner);
+    assert.equal(queued.state, 'queued');
+    const writerRun = f.dispatch(queued); await f.started;
+    const input = f.calls.writer.at(-1);
+    assert.equal(input.kind, 'paper-math-verification');
+    const promptEnvelope = JSON.parse(input.prompt.trimEnd().split('\n').at(-1));
+    assert.equal(promptEnvelope.mainTex, (await f.artifact({ reportId: sourceId }, 'main.tex')).toString('utf8'));
+    assert.equal(promptEnvelope.ledger, (await f.artifact({ reportId: sourceId }, 'REFERENCE_LEDGER.md')).toString('utf8'));
+    f.complete(mathText(findings)); await writerRun;
+    const metadata = await f.metadata(queued);
+    assert.equal(metadata.state, 'completed'); assert.equal(metadata.mathVerdict, expected);
+    assert.equal(Object.keys(metadata.math).sort().join(','), 'contractSha256,finalSectionReportId,ledgerSha256,mainSha256,planReportId,promptSha256,sourceReportId,verifierPromptSha256'.split(',').filter(k => Object.hasOwn(metadata.math, k)).sort().join(','));
+    assert.deepEqual(Object.keys(metadata.math).sort(), ['contractSha256', 'ledgerSha256', 'mainSha256', 'promptSha256', 'sourceReportId', 'verifierPromptSha256'].sort());
+    const review = JSON.parse((await f.artifact(queued, 'MATH_REVIEW.json')).toString('utf8'));
+    assert.deepEqual(Object.keys(review).sort(), ['binding', 'findings', 'kind', 'limitations', 'projectId', 'report', 'reportId', 'schemaVersion', 'verdict'].sort());
+    assert.equal(review.binding.promptSha256, digest(Buffer.from(input.prompt))); assert.equal(review.verdict, expected);
+    const beforeWriters = f.calls.writer.length, first = await source.result(f.p, queued, owner, { kind: 'paper-math-verification' });
+    assert.equal(first.mathVerdict, expected); assert.equal(first.files.length, 1); assert.equal(f.calls.writer.length, beforeWriters);
+    await source.result(f.p, queued, owner, { kind: 'paper-math-verification' }); assert.equal(f.calls.writer.length, beforeWriters);
+  });
+});
+test('paper math review rejects leaked, damaged, running and foreign paper sources before writer start', async t => {
+  const leakFixture = await fixture(t), leaked = await leakFixture.start(), leakedRun = await writing(leakFixture, leaked);
+  leakFixture.complete(validOutput('fact_submit')); await leakedRun;
+  await assert.rejects(leakFixture.rawService.start(leakFixture.p, paperMath(leaked.reportId), owner), { code: 'PROJECT_PAPER_MATH_SOURCE_INVALID' });
+  const f = await fixture(t), cleanGaps = await completedPaper(f, '[GAP: missing condition]', {}), sourceId = cleanGaps.audit.sourceReportId;
+  const sourcePath = `project/reports/${sourceId}/main.tex`;
+  await f.store.write(sourcePath, 'tampered source bytes', true);
+  const prompt = f.calls.writer.length;
+  const drift = await f.rawService.start(f.p, paperMath(sourceId), owner).catch(error => error);
+  assert.equal(drift.code, 'PROJECT_PAPER_MATH_SOURCE_CHANGED');
+  assert.equal(f.calls.writer.length, prompt);
+  const otherProject = { meta: { projectId: 'foreign-project', creator } };
+  await assert.rejects(f.rawService.start(otherProject, paperMath(sourceId), owner), { code: 'PROJECT_REPORT_NOT_FOUND' });
+  await assert.rejects(f.rawService.start(f.p, { ...paperMath(sourceId), extra: true }, owner), { code: 'PROJECT_INVALID_INPUT' });
+  const running = await f.start();
+  await assert.rejects(f.rawService.start(f.p, paperMath(running.reportId), owner), { code: 'PROJECT_PAPER_MATH_SOURCE_INVALID' });
+});
+test('paper math source drift during generation and damaged review archive never expose a verdict', async t => {
+  const f = await fixture(t), source = await completedPaper(f, undefined, {}), sourceId = source.audit.sourceReportId;
+  const q = await f.rawService.start(f.p, paperMath(sourceId), owner), { run } = await writing(f, q);
+  const sourcePath = `project/reports/${sourceId}/main.tex`; await f.store.write(sourcePath, 'changed after prompt admission', true);
+  f.complete(mathText([])); await run;
+  const failed = await f.rawService.status(f.p, q, owner, { kind: 'paper-math-verification' });
+  assert.equal(failed.state, 'failed'); assert.equal(failed.mathVerdict, undefined);
+  const saved = await f.metadata(q); assert.equal(Object.hasOwn(saved, 'mathVerdict'), false); assert.equal(saved.artifacts.review, undefined);
+
+  const second = await fixture(t), secondSource = await completedPaper(second, undefined, {}), secondId = secondSource.audit.sourceReportId;
+  const clean = await second.rawService.start(second.p, paperMath(secondId), owner), work = await writing(second, clean);
+  second.complete(mathText([{ location: 'opaque', issue: 'opaque', class: 'ignorable' }])); await work.run;
+  const archive = `project/reports/${clean.reportId}/MATH_REVIEW.json`;
+  await second.store.write(archive, 'damaged review bytes', true);
+  const status = await second.rawService.status(second.p, clean, owner, { kind: 'paper-math-verification' });
+  assert.equal(status.readError.code, 'PROJECT_PAPER_MATH_REVIEW_INVALID');
+  assert.equal(status.mathVerdict, undefined); assert.equal(status.paperMathGate, 'not-assessed');
+  await assert.rejects(second.rawService.result(second.p, clean, owner, { kind: 'paper-math-verification' }), { code: 'PROJECT_PAPER_MATH_REVIEW_INVALID' });
+});
+// Real sender checkpoint timing, source mutation and cancellation are tested
+// end-to-end in paper-math-transport-flow.test.mjs.
 const planKind = { kind: 'paper-plan' };
 const plannerOutput = `%%%PREAMBLE%%%\nPREAMBLE_SENTINEL\n%%%FRONTMATTER%%%\nFRONTMATTER_SENTINEL\n%%%SECTIONS%%%\n[{"title":"Opaque section","label":"sec:opaque","fact_ids":["${fid}"]}]\n%%%BIBLIOGRAPHY%%%\nBIBLIOGRAPHY_SENTINEL\n`;
 test('M05 integration report kind completes only a plan and delivers three immutable files, never raw or TeX', async t => {
@@ -429,11 +695,13 @@ test('target and captured canonical facts are revalidated after prompt input bef
     assert.equal(status.error, change === 'target' ? 'PROJECT_PAPER_TARGET_CHANGED' : 'PROJECT_SUMMARY_FACT_REVOKED');
   });
 });
-test('reference audit binds immutable completed source hashes and stages only its report', async t => {
+test('reference audit binds immutable completed source hashes across deferred restart and stages only its report', async t => {
   const f = await fixture(t), source = await f.start(), { run } = await writing(f, source);
   f.complete(validOutput('[GAP: audit fixture blocker]')); await run;
   const auditSource = await f.metadata(source);
   assert.equal(auditSource.state, 'completed'); assert.equal(auditSource.sourceStatus, 'flagged');
+  await f.rawService.dispose();
+  await f.open({ deferHistoricalWork: true });
   const q = await f.rawService.start(f.p, { kind: 'reference-audit', language: 'English', audit: { sourceReportId: source.reportId, paperId: 'main' } }, owner);
   const task = f.tasks.get(q.taskId);
   assert.equal(task.metadata.kind, 'reference-audit'); assert.equal(task.metadata.sourceReportId, source.reportId);

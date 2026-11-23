@@ -7,6 +7,12 @@ import { registerMathResearch } from '../packages/hana-math/research-tools.mjs';
 
 const PROJECT = 'project-fixture';
 const REPORT = 'report-01234567-89ab-cdef-0123-456789abcdef';
+const PLAN = 'report-11234567-89ab-cdef-0123-456789abcdef';
+const SECTION = 'report-21234567-89ab-cdef-0123-456789abcdef';
+const CHILD = 'report-31234567-89ab-cdef-0123-456789abcdef';
+const MATH = 'paper-math-verification';
+const mathMethods = { paper_verify_math: 'paperVerifyMath', paper_verify_math_status: 'paperVerifyMathStatus',
+  paper_verify_math_result: 'paperVerifyMathResult', paper_verify_math_stop: 'paperVerifyMathStop' };
 const context = { sessionPath: '/fixture/creator.jsonl', callToken: 'host-fixture-token', messageId: null, messageText: null };
 const methods = { paper: 'paper', paper_status: 'paperStatus', paper_result: 'paperResult', paper_stop: 'paperStop' };
 const planMethods = { paper_plan: 'paperPlan', paper_plan_status: 'paperPlanStatus', paper_plan_result: 'paperPlanResult', paper_plan_stop: 'paperPlanStop' };
@@ -27,7 +33,7 @@ async function fixture(t) {
   const unexpected = async () => { assert.fail('Unexpected legacy service, result, finalize or staging call'); };
   const service = Object.fromEntries(['run', 'status', 'setupStatus', 'setToolMode', 'result', 'stop', 'invoke', 'recordSubmissionInputRejection'].map(name => [name, unexpected]));
   const projects = Object.fromEntries(['create', 'list', 'status', 'assign', 'start', 'stop', 'result', 'invoke', 'handles', 'goal', 'mainGoal', 'finalize'].map(name => [name, unexpected]));
-  for (const method of [...Object.values(methods), ...Object.values(planMethods), ...Object.values(auditMethods), ...Object.values(verifyMethods), ...Object.values(revisionMethods), 'summary', 'paperSubgraph']) projects[method] = async (...args) => {
+  for (const method of [...Object.values(methods), ...Object.values(planMethods), ...Object.values(auditMethods), ...Object.values(verifyMethods), ...Object.values(revisionMethods), ...Object.values(mathMethods), 'summary', 'paperSubgraph']) projects[method] = async (...args) => {
     assert.equal(args.length, 2);
     calls.push({ method, args: args[0], context: args[1] });
     if (controls.error) throw controls.error;
@@ -35,7 +41,7 @@ async function fixture(t) {
   };
   registration = await registerMathResearch({ dataDir,
     tools: { async register(tool) { tools.set(tool.name, tool); return () => {}; } },
-    resources: { stage: unexpected },
+    resources: { stage: input => (controls.stage ?? unexpected)(input) },
   }, service, projects);
   const tool = tools.get('math_project');
   return { tool, tools, projects, calls, controls, execute: input => tool.execute({ ...input, context }) };
@@ -80,6 +86,84 @@ test('M05 integration public plan schemas and dispatch preserve creator context 
   let reads = 0; const input = { action: 'paper_plan', projectId: PROJECT, context };
   Object.defineProperty(input, 'brief', { enumerable: true, get() { reads++; return 'bad'; } }); assert.equal((await f.tool.execute(input)).isError, true); assert.equal(reads, 0);
   for (const text of [/phase-1 linear section-plan preview/, /not section ordering/, /not claims about Host hard limits/, /not raw-response.txt/]) assert.match(f.tool.description, text);
+});
+
+test('whole-paper math actions use exact, mutually exclusive selectors and preserve Host context', async t => {
+  const f = await fixture(t), schema = f.tool.parameters;
+  const start = { action: 'paper_verify_math', projectId: PROJECT };
+  const source = { ...start, reportId: REPORT }, stitched = { ...start, planReportId: PLAN, finalSectionReportId: SECTION };
+  const childRead = action => ({ action, projectId: PROJECT, reportId: CHILD });
+  assert.equal(schema.oneOf.filter(v => v.properties.action.const === start.action).length, 2);
+  f.controls.reply = { projectId: PROJECT, kind: MATH, reportId: CHILD, state: 'queued' };
+  for (const input of [source, stitched, ...Object.keys(mathMethods).slice(1).map(childRead)]) {
+    const { action, ...args } = input;
+    assert.ok(accepts(schema, input), JSON.stringify(input));
+    assert.equal((await f.execute(input)).isError, false);
+    assert.deepEqual(f.calls.at(-1), { method: mathMethods[action], args, context });
+    assert.equal(f.calls.at(-1).context, context);
+  }
+  const before = f.calls.length;
+  for (const input of [start, { ...source, ...stitched }, { ...start, planReportId: PLAN }, { ...start, finalSectionReportId: SECTION },
+    { ...source, planReportId: PLAN }, { ...source, finalSectionReportId: SECTION }, { ...source, sourceReportId: REPORT },
+    { ...source, reportId: '../outside' }, { ...stitched, planReportId: REPORT.toUpperCase() }, { ...stitched, finalSectionReportId: null },
+    { ...source, path: '/private/foreign' }, { ...source, text: 'user text' }, { ...source, ledger: {} },
+    { ...source, factIds: ['a'.repeat(16)] }, { ...source, verificationReportId: REPORT }, { ...source, language: 'English' },
+    ...Object.keys(mathMethods).slice(1).flatMap(action => [{ ...stitched, action }, { ...childRead(action), ledger: 'spoof' }])]) {
+    assert.equal(accepts(schema, input), false, JSON.stringify(input));
+    const response = await f.execute(input);
+    assert.equal(response.details.error.code, 'RESEARCH_TOOL_INVALID_INPUT');
+  }
+  let accessed = false;
+  const raw = { ...stitched, context };
+  Object.defineProperty(raw, 'finalSectionReportId', { enumerable: true, get() { accessed = true; return SECTION; } });
+  assert.equal((await f.tool.execute(raw)).isError, true);
+  assert.equal(accessed, false);
+  assert.equal(f.calls.length, before);
+  assert.match(f.tool.description, /MATH_REVIEW\.json/);
+});
+
+test('whole-paper math reads distinguish saved failure from delivery failure and reject foreign receipts', async t => {
+  const f = await fixture(t);
+  const historical = { projectId: PROJECT, reportId: CHILD, kind: MATH, state: 'failed', error: 'REVIEW_FAILED',
+    taskId: 'report-task', taskSettlement: 'confirmed', cleanupPending: false };
+  f.controls.reply = historical;
+  const run = action => f.execute({ action, projectId: PROJECT, reportId: CHILD });
+  assert.equal((await run('paper_verify_math_status')).isError, false);
+  f.controls.reply = { ...historical, status: 'failed', saved: true, files: [], diagnosis: { responseSaved: true, error: historical.error } };
+  assert.equal((await run('paper_verify_math_result')).isError, false);
+  f.controls.reply = { ...f.controls.reply, status: 'delivery-failed', readError: { code: 'PROJECT_REPORT_EXPORT_FAILED' } };
+  assert.equal((await run('paper_verify_math_result')).isError, true);
+  for (const patch of [{ kind: 'reference-verification' }, { projectId: 'project-foreign' }, { reportId: REPORT }]) {
+    f.controls.reply = { ...historical, ...patch, secret: 'do not disclose' };
+    const result = await run('paper_verify_math_status');
+    assert.equal(result.details.error.code, 'RESEARCH_RESULT_INVALID');
+    assert.doesNotMatch(result.content[0].text, /do not disclose/);
+  }
+  f.controls.reply = { ...historical, reportId: REPORT, state: 'queued', error: null };
+  assert.equal((await f.execute({ action: 'paper_verify_math', projectId: PROJECT, reportId: REPORT })).details.error.code, 'RESEARCH_RESULT_INVALID');
+});
+
+test('public stitch still stages only main.tex and never projects internal ledger', async t => {
+  const f = await fixture(t), bytes = Buffer.from('synthetic frozen TeX'), staged = [];
+  let checked = 0, foreign = false;
+  f.projects.paperStitch = async () => ({ bytes, ledger: Buffer.from('internal-ledger'), sessionId: 'creator-stable',
+    summary: { projectId: PROJECT, planReportId: PLAN, finalSectionReportId: SECTION, sectionCount: 1, ledger: 'private-summary-ledger' },
+    async checkDelivery() { checked++; } });
+  f.controls.stage = async input => {
+    assert.deepEqual(await fs.readFile(input.path), bytes); staged.push(input);
+    return { resource: { kind: 'session-file', fileId: 'artifact', sessionId: foreign ? 'foreign' : 'creator-stable' } };
+  };
+  const request = { action: 'paper_stitch', projectId: PROJECT, planReportId: PLAN, finalSectionReportId: SECTION };
+  const response = await f.execute(request);
+  assert.equal(response.isError, false);
+  assert.deepEqual(staged.map(({ name, mime, deliverAs }) => ({ name, mime, deliverAs })),
+    [{ name: 'main.tex', mime: 'text/x-tex', deliverAs: 'attachment' }]);
+  assert.equal(checked, 1);
+  assert.doesNotMatch(response.content[0].text, /ledger|internal|private-summary/);
+  foreign = true;
+  const refused = await f.execute(request);
+  assert.equal(refused.details.error.code, 'PROJECT_PAPER_STITCH_EXPORT_FAILED');
+  assert.equal(Object.hasOwn(refused.details, 'resource'), false);
 });
 
 test('operator-notes public schema and runtime keep mutually exclusive citation and direct-notes variants', async t => {

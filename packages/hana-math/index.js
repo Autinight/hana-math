@@ -47,26 +47,28 @@ export default defineApp(async sdk => {
       // Constructors bind their original handlers to the exact registrations
       // above; all other SDK capabilities continue to go to the real SDK.
       const runtimeSdk = { ...sdk, tasks: { ...sdk.tasks, registerHandler: boot.attachHandler } };
-      probes = createContextProbe(runtimeSdk, services.contexts);
+      // A new App instance owns new work. Never make a project wait for an
+      // inventory/cleanup of every previous run (including in the background).
+      const deferHistoricalWork = true;
+      probes = createContextProbe(runtimeSdk, services.contexts, { deferHistoricalWork });
       await boot.own(() => probes.dispose());
       await probes.recoveryReady; assertPreparing();
       const literature = createLiteratureService(runtimeSdk), sessions = createResearchSessions(runtimeSdk);
       const sessionOwner = await boot.own(() => sessions.dispose());
       assertPreparing();
       research = await createResearchService(runtimeSdk, { contexts: services.contexts, profiles: services.profiles,
-        createCore: instance.createCore, sessions, literature, onRecoveryProgress: boot.onRecoveryProgress });
+        createCore: instance.createCore, sessions, literature, onRecoveryProgress: boot.onRecoveryProgress, deferHistoricalWork });
       sessionOwner.transfer(); await boot.own(() => research.dispose());
       assertPreparing();
       const summaryWriter = createSummaryWriter({ sdk: runtimeSdk, sessions: createResearchSessions(runtimeSdk), profiles: services.profiles });
       const writerOwner = await boot.own(() => summaryWriter.dispose());
       assertPreparing();
       projects = await createProjectService(runtimeSdk, { contexts: services.contexts, profiles: services.profiles,
-        research, createCore: instance.createCore, literature, createMainSession: createProjectMainSession, summaryWriter });
+        research, createCore: instance.createCore, literature, createMainSession: createProjectMainSession, summaryWriter, deferHistoricalWork });
       writerOwner.transfer(); await boot.own(() => projects.dispose());
       enableGoalAlarms();
-      // Only the assembled Goal owner can accept a fresh alarm while it checks
-      // prior consent, bindings, deadlines and budgets. Other doors stay shut.
-      await projects.activateRestarts();
+      // Do not automatically resume a previous research Goal on App load.
+      // This instance can accept newly authorized work once its handlers exist.
     });
   } catch (error) {
     await boot.dispose();

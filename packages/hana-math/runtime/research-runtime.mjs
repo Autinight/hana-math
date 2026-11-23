@@ -104,7 +104,7 @@ async function json(root, file, max = LIMIT, owned = false, observeFile, windows
   try { return await read(handle); } finally { await handle.close(); }
 }
 // Private evidence for the original request, independent of ids and disk markers.
-const completedReadScratch = new WeakMap(), projectScratchOptions = new WeakSet();
+const completedReadScratch = new WeakMap(), completedDashboardBusy = new WeakMap(), projectScratchOptions = new WeakSet();
 const dashboardOptions = new WeakSet(), dashboardMemoryOptions = new WeakSet(), dashboardViewOptions = new WeakMap();
 const dashboardKinds = new Set(['conclusion', 'example', 'counterexample', 'proof_attempt', 'plan', 'direction',
   'obstacle', 'dead_end', 'verification', 'elaboration', 'master_guidance']);
@@ -209,6 +209,28 @@ export function takeProjectReadScratch(bridge, attempt, operation, value) {
     const owned = state; state = null;
     if (owned) owned.withScratchLifetime(() => retireScratch(owned), owned.scratchTenure);
   };
+}
+// Only the trusted caller may take this after settling and persisting the
+// failed task. Cleanup of the settled call (abort/dispose) is not a revocation.
+export function takeDashboardBusyFrame(bridge, attempt, operation, error) {
+  const proof = completedDashboardBusy.get(attempt);
+  if (!proof || proof.bridge !== bridge || proof.operation !== operation || proof.error !== error) return null;
+  completedDashboardBusy.delete(attempt);
+  let accept = proof.accept;
+  return () => {
+    const rearm = accept; accept = null;
+    return rearm?.() ?? false;
+  };
+}
+function exactKeys(value, keys) {
+  return object(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+}
+function dashboardBusyEnvelope(envelope) {
+  // Called only after checking schemaVersion, requestId and ok === false.
+  // The release dispatcher refuses pre-mutation on project lock contention.
+  return exactKeys(envelope, ['schemaVersion', 'requestId', 'ok', 'error'])
+    && exactKeys(envelope.error, ['code', 'message'])
+    && envelope.error.code === 'busy' && envelope.error.message === 'project is busy';
 }
 // Only local admission faults can mint this evidence for the exact call promise.
 const ipcRefusals = new WeakMap();
@@ -502,12 +524,16 @@ async function bound(promise, ms) {
   try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(fault('CLEANUP_FAILED', 'Cleanup deadline exceeded')), ms); })]); }
   finally { clearTimeout(timer); }
 }
+const managedDashboardFactories = new WeakSet();
+export const supportsManagedDashboardReads = createCore => managedDashboardFactories.has(createCore);
+
 // Composition used by the App entry and the isolated end-to-end fixture.
 // The host supplies one dedicated child per App instance. No startup IO.
 export function createAppResearchCore(sdk, { packageRoot = ROOT, timeoutMs, cleanupTimeoutMs } = {}) {
   const owner = createManagedReadOwner(sdk);
-  return Object.freeze({ createCore: ({ taskId } = {}) => createResearchRuntime(sdk, { packageRoot, timeoutMs, cleanupTimeoutMs, taskId, managedReadOwner: owner }),
-    dispose: () => owner.dispose() });
+  const createCore = ({ taskId } = {}) => createResearchRuntime(sdk, { packageRoot, timeoutMs, cleanupTimeoutMs, taskId, managedReadOwner: owner });
+  if (process.platform === 'darwin' && process.arch === 'arm64') managedDashboardFactories.add(createCore);
+  return Object.freeze({ createCore, dispose: () => owner.dispose() });
 }
 export function createResearchRuntime(sdk, { packageRoot = ROOT, platform = process.platform, arch = process.arch, timeoutMs = 20000, cleanupTimeoutMs = 3000, taskId, withExclusiveReadScratch, managedReadOwner } = {}) {
   const prepareRead = managedReadOwner === undefined ? null : managedReadOwnerFor(managedReadOwner, sdk);
@@ -559,7 +585,14 @@ export function createResearchRuntime(sdk, { packageRoot = ROOT, platform = proc
   }
   function rpc(s, method) {
     if (s.rpc[method]) return s.rpc[method];
-    const promise = Promise.resolve().then(() => sdk.runtime[method](s.id)).then((info) => status(s, info));
+    const promise = Promise.resolve().then(() => sdk.runtime[method](s.id)).then((info) => {
+      const current = status(s, info);
+      // A latched terminal start/watch status can mask a stale GET. Require
+      // the final GET itself to confirm a clean exit for busy-frame evidence.
+      if (s.viewGuard && method === 'get' && s.phase === 'get')
+        s.finalGetExited = info.state === 'exited' && info.exitCode === 0 && info.signal == null;
+      return current;
+    });
     s.rpc[method] = promise; s.pendingRpc.add(promise);
     promise.finally(() => {
       if (s.rpc[method] === promise) s.rpc[method] = null;
@@ -714,7 +747,7 @@ export function createResearchRuntime(sdk, { packageRoot = ROOT, platform = proc
   async function execute(s, request, signal) {
     const race = (p) => Promise.race([p, s.interrupted]);
     const abort = () => s.cancel(fault('CANCELLED', 'Host cancelled research call'));
-    let timer, scratchValue;
+    let timer, scratchValue, busyError;
     s.preparing = true;
     try {
       if (disposed) throw fault('DISPOSED', 'Bridge disposed');
@@ -805,6 +838,7 @@ export function createResearchRuntime(sdk, { packageRoot = ROOT, platform = proc
         e.indeterminate = envelope.error?.mutationState === 'indeterminate';
         const diagnostic = checkedDiagnostic(member(envelope, 'diagnostic'), member(envelope.error, 'code'), s.operation);
         if (diagnostic && !s.cancelled) checkedRejections.set(e, { requestId: s.requestId, operation: s.operation, value: diagnostic });
+        if (s.viewGuard && s.frame && s.finalGetExited && final.signal == null && dashboardBusyEnvelope(envelope)) busyError = e;
         throw e;
       }
       if (!Object.hasOwn(envelope, 'result')) throw fault('INVALID_RESULT', 'Missing result');
@@ -820,8 +854,13 @@ export function createResearchRuntime(sdk, { packageRoot = ROOT, platform = proc
       clearTimeout(timer); signal?.removeEventListener('abort', abort);
       const result = await cleanup(s);
       if (s.frame) {
-        if (scratchValue && !s.error && !s.cancelled && !signal?.aborted && s.startOutcome === 'acknowledged' && s.terminal && result.confirmed) {
+        const settled = !s.cancelled && !signal?.aborted && s.startOutcome === 'acknowledged' && s.terminal && result.confirmed;
+        if (settled && scratchValue && !s.error) {
           completedReadScratch.set(s.invocation.promise, { s, value: scratchValue, releaseFrame: s.frame.accept });
+        } else if (settled && busyError && s.error === busyError) {
+          // Leave the pinned frame waiting for validation; taking evidence
+          // alone does not rearm it and never changes the failed outcome.
+          completedDashboardBusy.set(s.invocation.promise, { bridge: s.invocation.bridge, operation: s.operation, error: busyError, accept: s.frame.accept });
         } else s.frame.fence();
       }
       if (!s.error && !result.confirmed) {

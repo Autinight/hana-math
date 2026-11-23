@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { constants } from 'node:fs';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
@@ -228,6 +229,101 @@ test('terminal graph and memory carry one canonical witness through confirmed ma
     assert.equal(g.f.tasks.get(finished.taskId).status, 'completed');
   }
   assert.doesNotMatch(JSON.stringify(rows), new RegExp(graph.inventoryRevision));
+});
+
+async function withHeldProjectLock(g, callback) {
+  const lock = path.join(g.f.dataDir, 'context/projects', g.p.projectId, 'research/control/project.lock');
+  const code = `import fcntl, os, select, sys
+with os.fdopen(os.open(sys.argv[1], os.O_RDWR | os.O_NOFOLLOW), 'r+') as fd:
+ fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+ print('held', flush=True)
+ if not select.select([sys.stdin], [], [], 15)[0]: sys.exit(4)
+ assert sys.stdin.readline().strip() == 'release'
+ fcntl.flock(fd, fcntl.LOCK_UN)
+ print('released', flush=True)`;
+  const child = spawn(g.packagedPython, ['-I', '-S', '-B', '-c', code, lock], { stdio: ['pipe', 'pipe', 'pipe'], timeout: 16000 });
+  const held = defer(), closed = once(child, 'close');
+  let stdout = '', stderr = '';
+  child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; if (stdout.startsWith('held\n')) held.resolve(true); });
+  child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+  // A premature exit may also close stdin before the cleanup write.
+  child.stdin.on('error', () => {});
+  try {
+    assert.equal(await Promise.race([held.promise, closed.then(() => false)]), true, stderr);
+    return await callback();
+  } finally {
+    child.stdin.end('release\n');
+    assert.deepEqual(await closed, [0, null], stderr);
+    assert.equal(stdout, 'held\nreleased\n');
+  }
+}
+async function assertPublishedBusy(read) {
+  const state = await fs.readFile(path.join(read.input.cwd, 'state.frame'));
+  assert.equal(state[8], 3, 'ordinary published frame, not a malformed-frame refusal');
+  const frame = await fs.readFile(path.join(read.input.cwd, 'result.frame'));
+  const result = JSON.parse(frame.subarray(0, state.readUInt32BE(33)));
+  assert.deepEqual(result, { schemaVersion: 1, requestId: read.request.requestId, ok: false,
+    error: { code: 'busy', message: 'project is busy' } });
+}
+
+for (const settlement of ['confirmed', 'unconfirmed']) test(`dashboard project lock busy with ${settlement} failed task settlement`, async t => {
+  const g = await setup(t);
+  const read = await g.f.service.authorizeDashboardView({ projectId: g.p.projectId }, origin);
+  const guard = () => true;
+  await read({ view: 'overview' }, guard);
+  const initial = g.reads[0];
+  assert.equal(initial.generation, 1);
+  const originalFiles = (await fingerprint(initial.input.cwd)).map(({ name, id }) => ({ name, id }));
+  const originalFail = g.f.sdk.tasks.fail;
+  let failures = 0;
+  g.f.sdk.tasks.fail = async (id, ...args) => {
+    if (id === g.reads[1]?.input.taskId) {
+      failures++;
+      if (settlement === 'unconfirmed') return structuredClone(g.f.tasks.get(id));
+    }
+    return originalFail(id, ...args);
+  };
+  try {
+    await withHeldProjectLock(g, async () => {
+      const before = g.starts.length;
+      await assert.rejects(read({ view: 'overview' }, guard), { code: 'RESEARCH_RUNTIME_REJECTED' });
+      assert.equal(g.starts.length, before + 1, 'a busy read must neither succeed nor immediately retry');
+      assert.equal(g.reads.length, 2);
+      const blocked = g.reads[1];
+      assert.equal(blocked.input.cwd, initial.input.cwd);
+      assert.equal(blocked.generation, 2);
+      await assertPublishedBusy(blocked);
+      const audit = await g.record(blocked);
+      assert.equal(audit.outcome.state, 'failed');
+      assert.equal(audit.cleanup.confirmed, true);
+      assert.equal(audit.settlement.confirmed, settlement === 'confirmed');
+      assert.equal(g.f.tasks.get(blocked.input.taskId).status, settlement === 'confirmed' ? 'failed' : 'pending');
+      assert.ok(failures >= 1);
+    });
+    if (settlement === 'confirmed') {
+      const recovered = await read({ view: 'channels' }, guard);
+      assert.equal(recovered.channels.length, 11);
+      assert.equal(g.reads.length, 3);
+      const next = g.reads[2];
+      assert.equal(next.input.cwd, initial.input.cwd);
+      assert.equal(next.generation, 3);
+      assert.deepEqual((await fingerprint(next.input.cwd)).map(({ name, id }) => ({ name, id })), originalFiles);
+      assert.equal(g.f.tasks.get(g.reads[1].input.taskId).status, 'failed', 'the next success cannot settle the old task again');
+      await g.audit(next);
+    } else {
+      const blocked = g.reads[1], oldSlot = await fingerprint(blocked.input.cwd);
+      const bridge = g.bridge('test-direct-dashboard-fence');
+      try {
+        await assert.rejects(bridge.call(blocked.request.context, 'dashboard_memory', { view: 'overview' }, undefined,
+          projectDashboardViewOptions('dashboard_memory', undefined, guard)), { code: 'RESEARCH_RUNTIME_READ_SLOT_FENCED' });
+      } finally { await bridge.dispose(); }
+      assert.equal(g.reads.length, 2, 'an unconfirmed task may not start another child on this slot');
+      assert.deepEqual(await fingerprint(blocked.input.cwd), oldSlot);
+    }
+    assert.deepEqual(await g.beforeHistory(), g.beforeOld);
+  } finally {
+    g.f.sdk.tasks.fail = originalFail; // Enable regular teardown of the unconfirmed fixture task.
+  }
 });
 
 test('live dashboard checks view and creator again in FIFO and before publishing data', async t=>{

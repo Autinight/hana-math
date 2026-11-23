@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import entry from '../packages/hana-math/index.js';
@@ -30,7 +31,7 @@ async function until(read) {
   while (performance.now() < deadline) { const value = await read(); if (value) return value; await delay(3); }
   assert.fail('Fixture observation did not settle');
 }
-async function applyFixture(t, { breakProbe=false, failRegistration=false, callbackDuringRegistration=false } = {}) {
+async function applyFixture(t, { breakProbe=false, failRegistration=false, callbackDuringRegistration=false, onFinalRegistration } = {}) {
   const dataDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'math-bootstrap-fixture-')));
   const hold = deferred(), entered = deferred();
   t.after(async () => { hold.resolve(); await fs.rm(dataDir,{recursive:true,force:true}); });
@@ -43,12 +44,40 @@ async function applyFixture(t, { breakProbe=false, failRegistration=false, callb
     cleanupErrors:[],sessions:[],submissions:[],verifiedFactIds:[],pendingMutations:[],coreTaskId:null,coreTaskCreatePending:false,
     coreTaskSettlementPending:false,runtimeCleanupPending:false,runtimeCleanupError:null,taskId,delivery });
   const file = path.join(runDir,'run.json'); await fs.writeFile(file,record);
+  // Hold a real local service-assembly step, not a Host query over old runs.
+  // Reach READY with zero old-run enumeration, opens, reconciliation or replay.
+  if (callbackDuringRegistration) {
+    const list = fs.readdir, open = fs.open, runsDir = path.dirname(runDir);
+    t.mock.method(fs,'readdir',async (dir,...args) => {
+      assert.notEqual(dir,runsDir,'startup must not enumerate historical research');
+      if (dir === path.join(dataDir,'research/projects')) { entered.resolve(); await hold.promise; }
+      return list(dir,...args);
+    });
+    t.mock.method(fs,'open',(...args) => { assert.notEqual(args[0],file,'startup must not read the old run'); return open(...args); });
+    syncBuiltinESMExports(); // ContextStore uses named fs/promises bindings.
+    t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  }
   if (breakProbe) await fs.writeFile(path.join(dataDir,'context'), 'not a trusted directory');
   const tools = new Map(), handlers = new Map(), routes = new Map(), calls = [], registrationRefusals = [];
   let registrationStatus;
   let registrars = 0;
-  const ctx = { dataDir, models:{}, media:{}, providers:{}, hooks:{}, resources:{}, runtime:{start:forbidden},
-    storage:{global:{}, agent:forbidden}, logger:{warn:forbidden,info:forbidden,error(_message,value){calls.push(['bootstrap-error',value]);}},
+  const mutations = [], panelReads = [];
+  const mutation = name => (...args) => { mutations.push([name,args]); forbidden(); };
+  const panel = (method = 'GET') => routes.get('/panel')({ req: { raw: new Request('http://fixture.invalid/panel', { method }) },
+    json: value => Response.json(value) });
+  const agent = (id,name,roleId) => ({ id,name,state:'active',deletedAt:null,visibility:'plugin_private',ownerPluginId:'hana-math',
+    plugin:{ownerPluginId:'hana-math',visibility:'plugin_private',kind:'role',roleId} });
+  const readAgents = args => {
+    panelReads.push(['agents.list',args]);
+    return {agents:[{id:'fixture-assistant',name:'Named assistant',isPrimary:true,state:'active',deletedAt:null,ownerPluginId:null,visibility:'public'},
+      agent('fixture-worker','Saved worker','worker'),agent('hana-math-verifier','Recovered verifier','verifier'),
+      {...agent('foreign','Not public','worker'),ownerPluginId:'other-app'}]};
+  };
+  const readRoles = () => { panelReads.push(['roles.list']); return {roles:['main','worker','verifier','explorer']
+    .map(roleId=>({appId:'hana-math',roleId,agent:{name:`Preset ${roleId}`}}))}; };
+  const ctx = { dataDir, models:{}, media:{}, providers:{}, hooks:{}, resources:{write:mutation('resources.write')}, runtime:{start:forbidden},
+    storage:{global:{async get(key,fallback) { panelReads.push(['storage.get',key]); return key==='profile.role.worker' ? {agentId:'fixture-worker'} : fallback; },
+      set:mutation('storage.global.set')}, agent:mutation('storage.agent')}, logger:{warn:forbidden,info:forbidden,error(_message,value){calls.push(['bootstrap-error',value]);}},
     launchArgs:{async get() { return false; }}, documents:{read:forbidden,requestView:forbidden},
     tasks:{ create:forbidden, schedule:forbidden, unschedule:forbidden, fail:forbidden, complete:forbidden,
       async get(id){assert.equal(id,taskId); calls.push('get'); return task;},
@@ -61,15 +90,26 @@ async function applyFixture(t, { breakProbe=false, failRegistration=false, callb
         }
         return receipt();
       },
-      async listSchedules(){calls.push('listSchedules'); entered.resolve(); await hold.promise; return [];},
+      async listSchedules(){calls.push('listSchedules'); return [];},
       async list(){calls.push('list');return [task];}, },
-    bus:{ async request(verb, args) { assert.equal(verb,'session:list'); assert.deepEqual(args,{scope:'own',lifecycle:'all',ownerPluginId:'hana-math'}); calls.push('session:list'); return {sessions:[]}; } },
+    bus:{ async request(verb, args) {
+      if (verb==='agent:list') return readAgents(args);
+      if (verb==='role:list') return readRoles();
+      if (verb==='session:list') {
+        assert.deepEqual(args,{scope:'own',lifecycle:'all',ownerPluginId:'hana-math'}); calls.push('session:list'); return {sessions:[]};
+      }
+      return mutation(`unexpected bus ${verb}`)(args);
+    } },
     tools:{ async register(tool) { assert.ok(!tools.has(tool.name)); tools.set(tool.name,tool);
       if (tool.name === 'math_context') registrationStatus = await tool.execute({action:'status'});
-      if (failRegistration && tool.name==='math_goal_main') throw Error('synthetic registry failure'); return receipt(); } },
-    routes:{ async register(register) { assert.equal(++registrars,1); register({ get(route,fn){routes.set(route,fn);}, post(route,fn){routes.set(route,fn);} }); return receipt(); } },
+      if (tool.name==='math_goal_main') {
+        if (onFinalRegistration) await onFinalRegistration({panel,ctx});
+        if (failRegistration) throw Error('synthetic registry failure');
+      }
+      return receipt(); } },
+    routes:{ async register(register) { assert.equal(++registrars,1); register({ get(route,fn){routes.set(route,fn);}, post(route,fn){routes.set(`POST ${route}`,fn);} }); return receipt(); } },
   };
-  return { ctx, tools, handlers, routes, calls, hold, entered, file, record, registrationRefusals,
+  return { ctx, tools, handlers, routes, calls, hold, entered, file, record, registrationRefusals, panel, panelReads, mutations,
     get registrationStatus() { return registrationStatus; },
     catcher: name => tools.get(name).execute({action:'status'}), apply:()=>entry.apply(ctx) };
 }
@@ -79,7 +119,7 @@ function wakeFixture(tools = {}) {
   return { shell, boot:createMathBootstrap(sdk) };
 }
 
-test('real apply cannot deadlock on callbacks during registration, and rejects rather than queues through recovery', {timeout:3500}, async t => {
+test('real apply rejects rather than queues through assembly and reaches READY without touching historical runs', {timeout:3500}, async t => {
   const f = await applyFixture(t,{callbackDuringRegistration:true});
   await f.apply();
   assert.deepEqual(f.registrationStatus, toolReply({error:{code:errors.pending},
@@ -88,7 +128,7 @@ test('real apply cannot deadlock on callbacks during registration, and rejects r
   assert.deepEqual(f.registrationRefusals,methods.flatMap((key,i)=>i===3 ? [[key,'run']] : [[key,'run'],[key,'abort']]));
   assert.ok(f.tools.has('math_project')); assert.ok(f.tools.has('math_dashboard_view'));
   await f.entered.promise;
-  assert.deepEqual(f.calls,['listSchedules']);
+  assert.deepEqual(f.calls,[]);
   const event = {kind:'schedule',scheduleId:'fixture-old',input:{runId:'run-fixture',nonce:'stale'}};
   for (const handler of f.handlers.values()) {
     await assert.rejects(handler.run(event),{code:errors.pending});
@@ -101,25 +141,44 @@ test('real apply cannot deadlock on callbacks during registration, and rejects r
   }
   const during = await f.catcher('math_context');
   const progress = during.details.readiness;
-  // A progress receipt may include the in-flight read but cannot count later calls.
-  assert.ok(progress?.listQueries === 0 || progress?.listQueries === 1);
-  readReceipt(progress, {state:'preparing',ready:false,...zeroProgress,listQueries:progress.listQueries});
+  readReceipt(progress, {state:'preparing',ready:false,...zeroProgress});
   assert.deepEqual(during, toolReply({error:{code:errors.pending},readiness:progress}));
   const discovery = await f.routes.get('/workspace-monitor/current')({});
   assert.equal(discovery.status,200); assert.equal(discovery.headers.get('cache-control'),'no-store');
   assert.deepEqual(await discovery.json(),{state:'unavailable'});
-  const panel = await f.routes.get('/panel')({});
-  assert.equal(panel.status,503); assert.equal(panel.headers.get('cache-control'),'no-store');
-  assert.deepEqual(await panel.json(),{error:{code:errors.pending}});
+  const panel = await f.panel();
+  assert.equal(panel.status,200);
+  const {assistants,roles} = await panel.json();
+  assert.equal(assistants.state,'ready'); assert.equal(roles.state,'ready');
+  assert.deepEqual(assistants.items.map(row=>[row.id,row.name]),[['fixture-assistant','Named assistant']]);
+  assert.deepEqual(roles.items.map(row=>[row.id,row.name,row.agentId]),[
+    ['main','Preset main',null], ['worker','Saved worker','fixture-worker'],
+    ['verifier','Recovered verifier','hana-math-verifier'], ['explorer','Preset explorer',null],
+  ]);
+  assert.deepEqual(f.panelReads.filter(([operation])=>operation==='agents.list'),[
+    ['agents.list',{scope:'all',lifecycle:'active'}], ['agents.list',{lifecycle:'all'}],
+  ]);
+  assert.deepEqual(f.mutations,[]);
+  const reads = f.panelReads.length;
+  assert.equal((await f.panel('HEAD')).status,503);
+  assert.equal(f.panelReads.length,reads);
+  for (const route of ['/editor/assistant/:id','POST /editor/assistant/:id','/editor/role/:id','POST /editor/role/:id','/live-dashboard/activate','/live-dashboard/api/overview','/workspace-monitor/api/overview']) {
+    const handler = f.routes.get(route);
+    assert.equal(typeof handler,'function',route);
+    const refused = await handler({});
+    assert.equal(refused.status,503,route);
+    assert.deepEqual(await refused.json(),{error:{code:errors.pending}});
+  }
+  assert.deepEqual(f.mutations,[]);
   await assert.rejects(f.apply(),{code:'HANA_MATH_DUPLICATE_SETUP'});
-  assert.deepEqual(f.calls,['listSchedules']);
+  assert.deepEqual(f.calls,[]);
   f.hold.resolve();
   const status = await until(async () => {
     const result = await f.catcher('math_context');
     if (!result.isError) return result;
   });
   const readiness = readReceipt(status.details.result.readiness,
-    {state:'ready',ready:true,reconciledRuns:1,listQueries:3,getQueries:1,deliveryQueries:1,historicalSessionAbortAttempts:0});
+    {state:'ready',ready:true,...zeroProgress});
   assert.deepEqual(status, toolReply({ action:'status', result:{
     checkpoint:'CP2B', actions:['status','role_status','core_check','prepare','inspect','probe','probe_status','probe_stop'],
     core:'use_core_check', roleReading:'use_probe_status', modelSource:'saved-role', roleModels:'use_role_status',
@@ -127,7 +186,8 @@ test('real apply cannot deadlock on callbacks during registration, and rejects r
     verificationEvidence:'query_actual_run_and_facts', readiness,
   } },false));
   assert.deepEqual(await f.handlers.get('math-research-once').run(event),{status:'ignored'},'the existing owner adjudicates only this fresh callback');
-  assert.deepEqual(f.calls,['listSchedules','list','session:list','get','getDelivery']);
+  assert.deepEqual(f.calls,[]);
+  t.mock.restoreAll(); syncBuiltinESMExports();
   assert.equal(await fs.readFile(f.file,'utf8'),f.record);
   const invalid = await f.tools.get('math_context').execute({action:'status',projectId:'opaque-extra'});
   assert.deepEqual(invalid, toolReply({error:{code:'MATH_CONTEXT_INVALID_INPUT',message:'The action contains unsupported arguments.'}}));
@@ -151,6 +211,35 @@ test('failed registration never starts history; failed preparation is unavailabl
   await assert.rejects(broken.handlers.get('math-project-setup').run({kind:'schedule'}),{code:errors.unavailable});
   assert.equal(broken.calls.filter(row=>Array.isArray(row)&&row[0]==='bootstrap-error').length,1);
   assert.ok(broken.calls.every(Array.isArray),'probe failure prevents historical research reconciliation');
+});
+
+for (const closing of ['failed','disposed']) test(`real apply suppresses a late panel reply after ${closing}`, {timeout:3500}, async t => {
+  const inPanel = deferred(), release = deferred();
+  let pending;
+  const f = await applyFixture(t, {breakProbe:closing==='failed',failRegistration:closing==='disposed',
+    async onFinalRegistration({panel,ctx}) {
+      const request = ctx.bus.request;
+      ctx.bus.request = async (verb,args) => {
+        if (verb==='agent:list' && args.lifecycle==='active') { inPanel.resolve(); await release.promise; }
+        return request(verb,args);
+      };
+      pending = panel();
+      // Do not let registration or the preparation failure pass the pending GET.
+      assert.equal(await Promise.race([inPanel.promise.then(()=>true),pending.then(()=>false)]),true);
+    } });
+  try {
+    if (closing==='disposed') await assert.rejects(f.apply(),/synthetic registry failure/);
+    else await f.apply();
+    await until(async () => (await f.catcher('math_context')).details.readiness?.state===closing);
+    release.resolve();
+    const late = await pending;
+    assert.equal(late.status,503); assert.equal(late.headers.get('cache-control'),'no-store');
+    assert.deepEqual(await late.json(),{error:{code:errors.unavailable}});
+    const reads = f.panelReads.length;
+    assert.equal((await f.panel()).status,503);
+    assert.equal(f.panelReads.length,reads);
+    assert.deepEqual(f.mutations,[]);
+  } finally { release.resolve(); }
 });
 
 const goalKey = 'math-project-main-control';

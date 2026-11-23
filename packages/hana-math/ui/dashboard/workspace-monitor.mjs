@@ -4,18 +4,20 @@ const PREFIX = '/workspace-monitor';
 const GENERATION = 'x-hana-math-monitor-generation';
 export const WORKSPACE_POLL_INTERVAL_MS = 8000;
 const LABEL = { idle: '当前没有正在推进的研究', unavailable: '研究状态暂不可用', unsupported: '当前版本无法连接实时研究看板',
-  pending: '正在确认研究状态', active: '正在跟踪研究', snapshot: '只读快照' };
+  pending: '正在确认研究状态', active: '正在跟踪研究', snapshot: '只读快照', saved: '当前已保存结果（只读）' };
 const TABS = { overview: '/api/overview', graph: '/api/factgraph', memory: '/api/channels' };
 const channelNames = new Set(liveChannels);
 const object = v => !!v && typeof v === 'object' && !Array.isArray(v) && !Object.hasOwn(v, 'error');
-const readable = scope => scope.state === 'active' || scope.state === 'snapshot';
+const readable = scope => scope.state === 'active' || scope.state === 'snapshot' || scope.state === 'saved';
+const epochMs = value => Number.isSafeInteger(value) && value > 0 && value <= 8.64e15;
 const same = (a, b) => !!a && !!b && a.state === b.state && a.projectId === b.projectId && a.generation === b.generation
-  && (a.state !== 'snapshot' || a.endedAt === b.endedAt && a.projectName === b.projectName);
+  && (a.state !== 'snapshot' || a.endedAt === b.endedAt && a.projectName === b.projectName)
+  && (a.state !== 'saved' || a.asOf === b.asOf);
 const refusal = () => new Error('Workspace monitor unavailable');
 const STAGE = { sdk: 'SDK 就绪', discovery: '发现 GET', business: '业务读取', verify: '最终代次复核' };
 const SDK_NOT_READY = `${LABEL.unavailable} · SDK 未就绪，尚未发请求`;
 const REASON = { missing: '未收到 HTTP 响应', invalid: '响应无法使用',
-  unavailable: '服务返回不可用', deadline: '超过时限', other: '未完成' };
+  unavailable: '服务返回不可用', deadline: '超过时限', other: '未完成', busy: '项目正忙，看板会自动重试' };
 const httpCode = value => Number.isInteger(value) && value >= 100 && value <= 599 ? value : null;
 function failureText(stage, reason, code = null) {
   if (reason === 'sdk') return SDK_NOT_READY;
@@ -33,9 +35,14 @@ function discovery(value) {
   if (!readable(value) || !id(value.projectId) || !id(value.generation)) throw refusal();
   const { state, projectId, generation } = value;
   if (state === 'active') return Object.freeze({ state, projectId, generation });
+  if (state === 'saved') {
+    if (!exact(value, ['state', 'projectId', 'generation', 'asOf']) || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(projectId)
+      || generation.includes(',') || !epochMs(value.asOf)) throw refusal();
+    return Object.freeze({ state, projectId, generation, asOf: value.asOf });
+  }
   const named = Object.hasOwn(value, 'projectName'), { endedAt, projectName } = value;
   if (!exact(value, ['state', 'projectId', 'generation', 'endedAt', ...(named ? ['projectName'] : [])])
-    || !Number.isSafeInteger(endedAt) || endedAt <= 0 || endedAt > 8.64e15 || (named && typeof projectName !== 'string')) throw refusal();
+    || !epochMs(endedAt) || (named && typeof projectName !== 'string')) throw refusal();
   return Object.freeze({ state, projectId, generation, endedAt, ...(named ? { projectName } : {}) });
 }
 
@@ -72,7 +79,7 @@ export function createWorkspaceMonitor(transport, { clear, render, status, graph
 
   function publish(state, detail, showFailure = true) {
     // Keep the first failure across retries, not just across promise races.
-    if (state === 'idle' || state === 'active' || state === 'snapshot') firstFailure = null;
+    if (state === 'idle' || readable({ state })) firstFailure = null;
     else firstFailure ??= detail ?? null;
     const text = (showFailure && firstFailure) || LABEL[state];
     if (lastStatus?.state === state && lastStatus.text === text) return;
@@ -98,7 +105,20 @@ export function createWorkspaceMonitor(transport, { clear, render, status, graph
     } catch { throw control.fail('missing'); }
     if (!alive(l) || signal.aborted) throw refusal();
     const code = httpCode(response?.status);
-    if (!response?.ok) throw code === null ? control.fail('missing') : control.fail('http', code);
+    if (!response?.ok) {
+      if (response?.ok === false && code === 409 && control.stage === 'business' && generation !== undefined) {
+        let busy = false;
+        try {
+          const value = await response.json();
+          busy = exact(value, ['state', 'reason']) && value.state === 'unavailable' && value.reason === 'project_busy';
+        } catch { /* Untyped or unreadable conflict stays a generic 409. */ }
+        // Parsing shares the existing deadline. A late body/rejection cannot
+        // classify an expired or suspended read or schedule another poll.
+        if (!alive(l) || signal.aborted) throw refusal();
+        if (busy) { control.busy = true; throw control.fail('busy'); }
+      }
+      throw code === null ? control.fail('missing') : control.fail('http', code);
+    }
     try {
       const result = await response.json();
       if (!alive(l) || signal.aborted) throw refusal();
@@ -171,7 +191,7 @@ export function createWorkspaceMonitor(transport, { clear, render, status, graph
     l.running = true;
     l.queued = false;
     const abort = l.abort = new AbortController();
-    const control = { again: false, stage: 'sdk', first: null,
+    const control = { again: false, busy: false, stage: 'sdk', first: null,
       note(reason, code) { this.first ??= failureText(this.stage, reason, code); },
       fail(reason, code) { this.note(reason, code); return refusal(); } };
     // Latch the deadline before abort listeners can report a second cause.
@@ -189,7 +209,7 @@ export function createWorkspaceMonitor(transport, { clear, render, status, graph
       l.abort = undefined;
       l.running = false;
       if (!alive(l)) return;
-      if (l.queued || control.again) enqueue(l);
+      if (!control.busy && (l.queued || control.again)) enqueue(l);
       else l.poll = setTimer(() => { l.poll = undefined; enqueue(l); }, interval);
     });
   }

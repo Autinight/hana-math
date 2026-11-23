@@ -71,7 +71,7 @@ async function fixture(t, behavior = {}, seed = {}) {
     async verifyCompletion(ctx, input) { callbacks.push({ name: 'verify', ctx, input }); assert.strictEqual(ctx, main); return behavior.verify ? behavior.verify(input) : { verified: true, projectId: input.projectId, factIds: [...input.factIds] }; },
     async stopWorkers(ctx, input) { callbacks.push({ name: 'stopWorkers', ctx, input }); assert.ok(ctx === creator || ctx === main); return behavior.stopWorkers ? behavior.stopWorkers(input) : { requested: true, cleanupPending: false }; },
   };
-  service = await createMainControlService(sdk, dependencies);
+  service = await createMainControlService(sdk, { ...dependencies, ...seed.options });
   t.after(async () => { for (const release of releases) release(); await flush(); await service.dispose(); });
   const f = { service, sdk, store, files, schedules, calls, callbacks, writes, clock, creator, main,
     gate() { const gate = deferred(); releases.push(() => gate.resolve()); return gate; },
@@ -89,6 +89,150 @@ async function fixture(t, behavior = {}, seed = {}) {
   };
   return f;
 }
+
+test('deferred historical alarm cannot hold startup or fresh admission', { timeout: 4000 }, async t => {
+  const before = await fixture(t), freshId = 'project-fresh', key = `${BASE}/${PROJECT}.json`;
+  const old = await before.start({ restartAuthorization: { resume: 'preserve-budget' }, maxAutomaticContinues: 3 });
+  const image = before.files.get(key), schedules = new Map(before.schedules);
+  const staleEvent = { kind: 'schedule', scheduleId: old.alarm.id, input: schedules.get(old.alarm.id).payload };
+  await before.service.dispose(); // Retain the pre-disposal crash image, with no live old owner.
+  const entered = deferred(), release = deferred(), reads = [];
+  const opening = fixture(t, { read: (_row, name) => reads.push(name), async getSchedule(id) {
+    if (id === staleEvent.scheduleId) { entered.resolve('historical alarm lookup'); await release.promise; }
+  } }, { files: [[key, image]], schedules, options: { deferHistoricalWork: true } });
+  try {
+    const outcome = await Promise.race([opening.then(() => 'ready'), entered.promise]);
+    assert.equal(outcome, 'ready', 'fresh admission must be reachable while the old alarm lookup is held');
+    const f = await opening;
+    assert.deepEqual(reads, []);
+    assert.deepEqual(f.service.monitorLifecycle(PROJECT), { state: 'unknown' });
+    assert.equal(f.service.diagnostic(PROJECT).state, 'unknown');
+    assert.throws(() => f.service.admit(PROJECT), { code: 'MAIN_CONTROL_WORK_DENIED' });
+    assert.equal(f.service.assertAdmission(f.service.admit(freshId)), true);
+    assert.deepEqual(before.rawHandler(staleEvent), { status: 'ignored' });
+    assert.deepEqual(f.rawHandler(staleEvent), { status: 'ignored' });
+    await f.service.activateRestarts();
+    const fresh = await f.service.start({ projectId: freshId, authorized: true, maxAutomaticContinues: 2 }, f.creator);
+    assert.equal(fresh.state, 'active');
+    const freshStatus = () => f.service.status({ projectId: freshId }, f.creator);
+    await until(async () => (await freshStatus()).send?.state === 'accepted');
+    const s = await freshStatus();
+    await f.service.acknowledge({ ...f.args(s), projectId: freshId, controlAt: s.due.control.at, auditAt: s.due.audit.at }, f.main);
+    f.end();
+    await until(async () => (await freshStatus()).continuationBudget.reserved === 1 && f.count('send') === 2);
+    assert.deepEqual((await freshStatus()).continuationBudget, { limit: 2, reserved: 1 });
+    assert.equal(f.count('schedule'), 1);
+    assert.deepEqual(reads, []);
+    assert.deepEqual(await f.service.prepareProject(PROJECT), { state: 'loaded' });
+    const historical = await f.status();
+    assert.equal(historical.managed, true);
+    assert.equal(historical.state, 'blocked');
+    assert.equal(historical.historicalDeferred, true);
+    assert.deepEqual(historical.continuationBudget, old.continuationBudget);
+    assert.deepEqual(reads, [key]);
+    assert.deepEqual(f.rawHandler(staleEvent), { status: 'ignored' });
+    assert.equal(f.count('getSchedule'), 0);
+    assert.equal(f.count('unschedule'), 0);
+    await f.service.dispose();
+    assert.equal(f.files.get(key), image);
+    assert.equal(f.calls.some(c => c.name === 'unschedule' && c.input.id === old.alarm.id), false);
+  } finally {
+    release.resolve();
+    await opening;
+  }
+});
+
+test('deferred resume confirms only its own alarm, fences concurrent requests, and preserves spent budget', { timeout: 4000 }, async t => {
+  const before = await fixture(t), sibling = 'project-neighbor', key = `${BASE}/${PROJECT}.json`, otherKey = `${BASE}/${sibling}.json`;
+  await before.start({ maxAutomaticContinues: 3 });
+  await before.ack(); before.end();
+  await until(() => before.count('send') === 2);
+  const old = await before.settled(), image = before.files.get(key), schedules = new Map(before.schedules);
+  assert.deepEqual(old.continuationBudget, { limit: 3, reserved: 1 });
+  const stale = { kind: 'schedule', scheduleId: old.alarm.id, input: schedules.get(old.alarm.id).payload };
+  const otherImage = JSON.stringify({ ...JSON.parse(image), projectId: sibling });
+  await before.service.dispose();
+  const entered = deferred(), release = deferred(), reads = [];
+  const f = await fixture(t, { read: (_row, name) => reads.push(name), async getSchedule(id) {
+    if (id === old.alarm.id) { entered.resolve(); await release.promise; }
+  } }, { options: { deferHistoricalWork: true }, files: [[key, image], [otherKey, otherImage]], schedules });
+  const args = { projectId: PROJECT };
+  await assert.rejects(f.service.resume(args, f.main), { code: 'MAIN_CONTROL_FORBIDDEN' });
+  assert.deepEqual(reads, []);
+  await assert.rejects(f.service.start({ ...args, authorized: true }, f.creator), { code: 'MAIN_CONTROL_ALREADY_EXISTS' });
+  await assert.rejects(f.service.resume({ ...args, maxAutomaticContinues: 5 }, f.creator), { code: 'MAIN_CONTROL_HISTORICAL_BUDGET_MISMATCH' });
+  await assert.rejects(f.service.stop(args, f.creator), { code: 'MAIN_CONTROL_HISTORY_DEFERRED' });
+  assert.equal(f.files.get(key), image);
+  const resumed = f.service.resume(args, f.creator);
+  try {
+    await Promise.race([entered.promise, resumed.then(() => assert.fail('resume bypassed held schedule lookup'))]);
+    await assert.rejects(f.service.resume(args, f.creator), { code: 'MAIN_CONTROL_RESUME_IN_PROGRESS' });
+    assert.equal(f.service.assertAdmission(f.service.admit('project-unrelated')), true);
+    assert.deepEqual(f.rawHandler(stale), { status: 'ignored' });
+    assert.equal(f.count('send'), 0);
+    assert.equal(f.files.get(key), image);
+  } finally { release.resolve(); await resumed; }
+  const active = await f.settled();
+  assert.equal(active.state, 'active');
+  assert.equal(active.goalId, old.goalId);
+  assert.equal(active.generation, old.generation + 1);
+  assert.notEqual(active.alarm.token, old.alarm.token);
+  assert.deepEqual(active.continuationBudget, old.continuationBudget);
+  assert.deepEqual(f.rawHandler(stale), { status: 'ignored' });
+  assert.deepEqual(before.rawHandler(stale), { status: 'ignored' });
+  assert.deepEqual(f.calls.filter(c => ['getSchedule', 'unschedule'].includes(c.name)), [
+    { name: 'getSchedule', input: { id: old.alarm.id } }, { name: 'unschedule', input: { id: old.alarm.id } },
+  ]);
+  assert.equal(f.count('send'), 1);
+  assert.match(f.calls.find(c => c.name === 'send').input.text, /Old runs are not replayed/);
+  assert.deepEqual(reads, [key]);
+  assert.equal(f.files.get(otherKey), otherImage);
+});
+
+for (const concern of ['schedule-receipt', 'pending-send', 'dispose']) test(`deferred resume fails closed on ${concern}`, { timeout: 4000 }, async t => {
+  const before = await fixture(t), key = `${BASE}/${PROJECT}.json`;
+  const old = await before.start({ maxAutomaticContinues: 3 }), meta = JSON.parse(before.files.get(key));
+  const schedules = new Map(before.schedules), entered = deferred(), release = deferred();
+  if (concern === 'schedule-receipt') schedules.get(old.alarm.id).payload.token = 'foreign-token';
+  if (concern === 'pending-send') meta.send.state = 'pending';
+  const image = JSON.stringify(meta);
+  await before.service.dispose();
+  const f = await fixture(t, { async getSchedule() { if (concern === 'dispose') { entered.resolve(); await release.promise; } } },
+    { options: { deferHistoricalWork: true }, files: [[key, image]], schedules });
+  const result = f.service.resume({ projectId: PROJECT }, f.creator);
+  if (concern === 'dispose') try {
+    await Promise.race([entered.promise, result.then(() => assert.fail('resume bypassed held schedule lookup'))]);
+    await f.service.dispose();
+  } finally { release.resolve(); await assert.rejects(result, { code: 'MAIN_CONTROL_DISPOSED' }); }
+  else await assert.rejects(result, { code: concern === 'pending-send' ? 'MAIN_CONTROL_SEND_UNSETTLED' : 'MAIN_CONTROL_SCHEDULE_UNCONFIRMED' });
+  await f.service.dispose();
+  assert.equal(f.files.get(key), image);
+  assert.equal(f.count('getSchedule'), concern === 'pending-send' ? 0 : 1);
+  for (const name of ['unschedule', 'send', 'schedule', 'subscribe']) assert.equal(f.count(name), 0, name);
+});
+
+test('deferred completed Goal remains readable with its original negative archive witness and unchanged journal', async t => {
+  const before = await fixture(t), key = `${BASE}/${PROJECT}.json`;
+  const s = await before.start({ maxAutomaticContinues: 3 });
+  const done = await before.service.complete({ ...before.args(s), factIds: ['0123456789abcdef'] }, before.main);
+  const image = before.files.get(key), witness = before.service.dashboardCompletionSeal(PROJECT);
+  assert.match(witness, /^[0-9a-f]{64}$/);
+  await before.service.dispose();
+  const f = await fixture(t, {}, { options: { deferHistoricalWork: true }, files: [[key, image]] });
+  assert.deepEqual(f.service.monitorLifecycle(PROJECT), { state: 'unknown' });
+  assert.equal(f.service.dashboardCompletionSeal(PROJECT), null);
+  const [prepared, other] = await Promise.all([f.service.prepareProject(PROJECT), f.service.prepareProject('project-absent')]);
+  assert.deepEqual(prepared, { state: 'loaded' });
+  assert.deepEqual(other, { state: 'absent' });
+  assert.deepEqual(f.service.monitorLifecycle(PROJECT), { state: 'completed' });
+  assert.equal(f.service.dashboardCompletionSeal(PROJECT), witness);
+  const historical = await f.status();
+  for (const field of ['goalId', 'generation', 'revision', 'completion', 'continuationBudget', 'ack', 'due']) assert.deepEqual(historical[field], done[field]);
+  await assert.rejects(f.service.resume({ projectId: PROJECT }, f.creator), { code: 'MAIN_CONTROL_NOT_RESUMABLE' });
+  await f.service.dispose();
+  assert.equal(f.files.get(key), image);
+  assert.deepEqual(f.calls.map(c => c.name), ['registerHandler', 'disposeHandler']);
+});
 
 test('explicit creator authorization; real ctx only; public actor/SID/token overrides are rejected without writes', async t => {
   const f = await fixture(t); const valid = { projectId: PROJECT, authorized: true };

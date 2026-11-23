@@ -1,7 +1,7 @@
 // Project main Goal controller, wired through ProjectService and math_goal.
 // Authority callbacks receive the original Host ctx. Timer/event callbacks never
 // manufacture an actor, callToken or session context. No LoopManager/worker task.
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { createContextStore } from './context-service.mjs';
 import { readResearchSessionInfo } from './research-session-info.mjs';
 import { nativeExplorationGuidance, nativeExplorationState, explorerProjection } from './native-exploration.mjs';
@@ -80,15 +80,19 @@ function validateRecord(m, projectId) {
  * observeWorkerStopScope({projectId, main, scope}) -> scalar target states,
  * synchronous loaded-memory observation only; neither callback receives ctx.
  * recoveryReadiness({projectId, main}) -> {ready:true}, readonly and ctx-free
+ * deferHistoricalWork: index journal names at startup, load one project on demand,
+ * and require explicit creator resume of a previous Goal. prepareProject is a
+ * trusted local read for callers that already selected/authorized the project.
  * No callback is invoked with a synthetic ctx. Optional store/clock are fixtures
  * or trusted infrastructure. This implementation does not create a root task.
  */
 export async function createMainControlService(sdk, { authorize, getMainBinding, verifyCompletion, stopWorkers, recoveryReadiness,
-  captureWorkerStopScope, observeWorkerStopScope, nextMonitorActivation,
+  captureWorkerStopScope, observeWorkerStopScope, nextMonitorActivation, onDashboardTerminal, deferHistoricalWork = false,
   store = createContextStore(sdk.dataDir), clock = { now: () => Date.now(), setTimeout, clearTimeout } } = {}) {
   check([authorize, getMainBinding, verifyCompletion, stopWorkers].every(f => typeof f === 'function')
     && ['now', 'setTimeout', 'clearTimeout'].every(k => typeof clock[k] === 'function'), 'MAIN_CONTROL_DEPENDENCY_MISSING');
   const goals = new Map(), damaged = new Set(), tickets = new WeakMap(), restartCandidates = new Map();
+  const historicalIds = new Set(), historicalReads = new Map();
   let disposed = false, restartActivation, disposal;
   const restartAllowed = p => p.meta.restartAuthorization?.resume === 'preserve-budget';
   const workerStopSettled = (p, options) => p.meta.workerStop.state === 'not-requested'
@@ -117,6 +121,22 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
     if (!active(p, generation)) return;
     // Observation is process-local, and cannot affect lifecycle on failure.
     try { p.monitorActivation = { generation, order: nextMonitorActivation?.(), startedAt: now() }; } catch { /* unavailable */ }
+  }
+  function refreshDashboardTerminal(projectId) {
+    if (typeof onDashboardTerminal !== 'function' || disposed) return;
+    const p = goals.get(projectId), stamp = p?.monitorCompletion;
+    if (!stamp || p.dashboardTerminalNotified || p.dashboardTerminalChecking
+      || p.dashboardSendCommit || p.alarm?.dashboardCleanupSaving) return;
+    p.dashboardTerminalChecking = true;
+    try {
+      if (!monitorLifecycle(projectId)?.terminal) return;
+      p.dashboardTerminalNotified = true;
+      setImmediate(() => {
+        if (disposed) return;
+        try { Promise.resolve(onDashboardTerminal(projectId)).catch(() => {}); } catch { /* advisory */ }
+      });
+    } catch { /* Observation/delivery cannot change the Goal result. */ }
+    finally { p.dashboardTerminalChecking = false; }
   }
   function workerStopReconciliation(p, { disposeCheck = false } = {}) {
     const receipt = p.meta.workerStop;
@@ -155,18 +175,49 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
         currentGeneration: epoch, targets, reasons: [...new Set(targets.flatMap(target => target.reasons))] };
     } catch { return unknown(current() ? 'WORKER_STOP_OBSERVATION_FAILED' : 'WORKER_STOP_OBSERVATION_CHANGED'); }
   }
+  const visibleState = p => p.historical && ['active', 'stopping'].includes(p.meta.state) ? 'blocked' : p.meta.state;
   function view(p) {
-    const reconciliation = workerStopReconciliation(p);
-    return { managed: true, ...copy(p.meta), workerStopReconciliation: reconciliation, persistenceFailed: p.failed, sendInFlight: Boolean(p.sendJob),
-      goalCleanupPending: p.meta.state !== 'active' && (Boolean(p.sendJob) || p.meta.send?.state === 'unknown' || Boolean(p.arming)
+    const reconciliation = workerStopReconciliation(p), state = visibleState(p);
+    return { managed: true, ...copy(p.meta), ...(p.historical ? { historicalDeferred: true, state } : {}),
+      workerStopReconciliation: reconciliation, persistenceFailed: p.failed, sendInFlight: Boolean(p.sendJob),
+      goalCleanupPending: state !== 'active' && (Boolean(p.sendJob) || p.meta.send?.state === 'unknown'
+        || p.historical && p.meta.send?.state === 'pending' || Boolean(p.arming)
         || Boolean(p.alarm && (!p.alarm.meta.cleanup.removed || p.alarm.creating))),
       workerCleanupKnown: typeof p.meta.workerStop.cleanupPending === 'boolean',
-      ...(p.meta.state === 'completed' ? { completionSemantics: {
+      ...(state === 'completed' ? { completionSemantics: {
         decisionBy: 'bound-main', appCheck: 'canonical-fact-existence', targetCoverage: 'not-checked-by-app',
         operatorFinalize: { performedByThisAction: false, observedState: 'unknown' },
       } } : {}) };
   }
-  function get(id) { check(!damaged.has(id), 'MAIN_CONTROL_RECORD_INVALID'); const p = goals.get(id); check(p, 'MAIN_CONTROL_NOT_FOUND'); return p; }
+  function get(id) {
+    check(!damaged.has(id), 'MAIN_CONTROL_RECORD_INVALID');
+    const p = goals.get(id);
+    check(p || !historicalIds.has(id), 'MAIN_CONTROL_HISTORY_DEFERRED');
+    check(p, 'MAIN_CONTROL_NOT_FOUND'); return p;
+  }
+  async function prepareProject(projectId) {
+    check(!disposed, 'MAIN_CONTROL_DISPOSED');
+    check(typeof projectId === 'string' && PROJECT.test(projectId), 'MAIN_CONTROL_INVALID_INPUT');
+    if (damaged.has(projectId)) return { state: 'invalid' };
+    if (goals.has(projectId)) return { state: 'loaded' };
+    if (!historicalIds.has(projectId)) return { state: 'absent' };
+    if (!historicalReads.has(projectId)) {
+      const load = Promise.resolve().then(async () => {
+        let meta;
+        try { meta = await bounded(store.readJson(location(projectId))); validateRecord(meta, projectId); }
+        catch (error) {
+          check(!disposed, 'MAIN_CONTROL_DISPOSED');
+          if (code(error) === 'MAIN_CONTROL_TIMEOUT') throw error;
+          damaged.add(projectId); return { state: 'invalid' };
+        }
+        check(!disposed, 'MAIN_CONTROL_DISPOSED');
+        goals.set(projectId, { ...wrap(meta), historical: true });
+        return { state: 'loaded' };
+      }).finally(() => historicalReads.delete(projectId));
+      historicalReads.set(projectId, load);
+    }
+    return historicalReads.get(projectId);
+  }
   async function auth(action, args, ctx, allowed) {
     check(!disposed, 'MAIN_CONTROL_DISPOSED');
     check(object(ctx) && text(ctx.callToken) && text(ctx.sessionPath), 'MAIN_CONTROL_CALLER_UNBOUND');
@@ -280,7 +331,12 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
         if (sending.state === 'accepted') for (const k of ['control', 'audit']) {
           if (p.meta.due[k]?.generation === generation && p.meta.due[k].at === sending.points[k]) p.meta.due[k].notified = true;
         }
-        await save(p);
+        // A raw send receipt can arrive after the bounded sendJob has cleared.
+        // Do not wake the dashboard until the acceptance is durably recorded.
+        p.dashboardSendCommit = sending;
+        try { await save(p); }
+        finally { if (p.dashboardSendCommit === sending) p.dashboardSendCommit = null; }
+        refreshDashboardTerminal(p.meta.projectId);
         check(sending.state === 'accepted' || sending.notSent, sending.state === 'rejected' ? 'MAIN_CONTROL_SEND_REJECTED' : 'MAIN_CONTROL_SEND_UNKNOWN');
       }, async error => {
         sending.state = 'unknown'; sending.settledAt = now(); sending.late = !active(p, generation); sending.error = code(error);
@@ -301,7 +357,11 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
       }
     }).catch(error => { if (active(p, generation)) return block(p, error); });
     p.sendJob = job; track(p, job);
-    job.finally(() => { if (p.sendJob === job) p.sendJob = null; if (active(p) && wanted(p)) kick(p); }).catch(() => {});
+    job.finally(() => {
+      if (p.sendJob === job) p.sendJob = null;
+      refreshDashboardTerminal(p.meta.projectId);
+      if (active(p) && wanted(p)) kick(p);
+    }).catch(() => {});
   }
   function cancelAlarmCallback(alarm) {
     alarm?.cancelCallback?.();
@@ -332,7 +392,7 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
       && (!alarm.receivedId || alarm.receivedId === value.scheduleId), 'MAIN_CONTROL_SCHEDULE_UNCONFIRMED');
     alarm.receivedId = value.scheduleId; return value;
   }
-  function cleanupAlarm(p, alarm) {
+  function cleanupAlarm(p, alarm, guard) {
     cancelAlarmCallback(alarm);
     if (!alarm || alarm.meta.cleanup.removed) return Promise.resolve();
     if (alarm.cleaning) return alarm.cleaning;
@@ -341,9 +401,12 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
     const id = alarm.meta.id;
     const job = Promise.resolve().then(async () => {
       alarm.meta.cleanup = { state: 'pending', removed: false, scheduleId: id, error: null }; await save(p);
-      const receipt = await bounded(Promise.resolve().then(() => sdk.tasks.unschedule(id)));
+      const receipt = await bounded(Promise.resolve().then(() => { guard?.(); return sdk.tasks.unschedule(id); }));
       check(receipt?.ok === true && !receipt.error, 'MAIN_CONTROL_UNSCHEDULE_UNCONFIRMED');
-      alarm.meta.id = null; alarm.meta.cleanup = { state: 'confirmed', removed: true, scheduleId: id, error: null }; await save(p);
+      alarm.dashboardCleanupSaving = true;
+      alarm.meta.id = null; alarm.meta.cleanup = { state: 'confirmed', removed: true, scheduleId: id, error: null };
+      try { await save(p); } finally { alarm.dashboardCleanupSaving = false; }
+      refreshDashboardTerminal(p.meta.projectId);
     }).catch(async error => { alarm.meta.cleanup.state = 'failed'; alarm.meta.cleanup.error = code(error); await save(p).catch(() => {}); throw error; });
     alarm.cleaning = track(p, job); return alarm.cleaning;
   }
@@ -373,6 +436,7 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
     }).catch(error => { if (p.meta.generation === generation) return block(p, error); });
     p.arming = job; track(p, job);
     job.finally(() => { if (p.arming === job) p.arming = null;
+      refreshDashboardTerminal(p.meta.projectId);
       if (active(p) && p.alarm?.meta.cleanup.removed && !p.alarm.creating && !p.alarm.callbackPending) arm(p);
     }).catch(() => {});
     return job;
@@ -446,8 +510,14 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
     check(args.authorized === true, 'MAIN_CONTROL_AUTHORIZATION_REQUIRED');
     if (Object.hasOwn(args, 'maxAutomaticContinues')) check(time(args.maxAutomaticContinues), 'MAIN_CONTROL_INVALID_INPUT');
     await auth('start', args, ctx, ['creator']);
+    if (deferHistoricalWork) {
+      check(!disposed, 'MAIN_CONTROL_DISPOSED');
+      check(!damaged.has(args.projectId), 'MAIN_CONTROL_RECORD_INVALID');
+      check(!historicalIds.has(args.projectId) && !goals.has(args.projectId), 'MAIN_CONTROL_ALREADY_EXISTS');
+    }
     const mainBinding = await bounded(Promise.resolve().then(() => getMainBinding(ctx, { projectId: args.projectId })));
     const main = binding(mainBinding);
+    if (deferHistoricalWork) check(!disposed, 'MAIN_CONTROL_DISPOSED');
     check(!damaged.has(args.projectId), 'MAIN_CONTROL_RECORD_INVALID'); check(!goals.has(args.projectId), 'MAIN_CONTROL_ALREADY_EXISTS');
     const n = now(), p = wrap({ schemaVersion: 1, projectId: args.projectId, goalId: `goal-${randomUUID()}`, revision: 0, generation: 1,
       state: 'active', authorization: { explicit: true, at: n },
@@ -462,7 +532,8 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
   }
   function assertResumable(p) {
     check(!disposed, 'MAIN_CONTROL_DISPOSED');
-    check(['paused', 'stopped', 'blocked'].includes(p.meta.state) && !p.failed, 'MAIN_CONTROL_NOT_RESUMABLE');
+    check((['paused', 'stopped', 'blocked'].includes(p.meta.state) || p.historical && p.meta.state === 'active')
+      && !p.failed, 'MAIN_CONTROL_NOT_RESUMABLE');
     check(!p.sendJob && !['pending', 'unknown'].includes(p.meta.send?.state) && !p.arming, 'MAIN_CONTROL_SEND_UNSETTLED');
     check(!['pending', 'unknown'].includes(p.meta.workerStop.state), 'MAIN_CONTROL_WORKER_STOP_UNCONFIRMED');
   }
@@ -470,26 +541,61 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
     fields(args, ['projectId', 'maxAutomaticContinues']);
     if (Object.hasOwn(args, 'maxAutomaticContinues')) check(time(args.maxAutomaticContinues), 'MAIN_CONTROL_INVALID_INPUT');
     await auth('resume', args, ctx, ['creator']);
+    if (deferHistoricalWork) await prepareProject(args.projectId);
     const p = get(args.projectId);
+    check(!p.resumingHistorical, 'MAIN_CONTROL_RESUME_IN_PROGRESS');
+    if (!p.historical) return resumeGoal(p, args, ctx);
+    p.resumingHistorical = true;
+    try { return await resumeGoal(p, args, ctx); }
+    finally { p.resumingHistorical = false; }
+  }
+  async function resumeGoal(p, args, ctx) {
     assertResumable(p);
-    const generation = p.meta.generation;
+    const historical = p.historical, generation = p.meta.generation;
+    const guard = () => {
+      check(p.meta.generation === generation && !p.failed, 'MAIN_CONTROL_STALE');
+      assertResumable(p);
+    };
+    if (historical) {
+      check(Number.isSafeInteger(generation + 1), 'MAIN_CONTROL_NOT_RESUMABLE');
+      check(!Object.hasOwn(args, 'maxAutomaticContinues') || args.maxAutomaticContinues === p.meta.continuationBudget?.limit,
+        'MAIN_CONTROL_HISTORICAL_BUDGET_MISMATCH');
+      check(workerStopSettled(p), 'MAIN_CONTROL_WORKER_STOP_UNCONFIRMED');
+      if (p.alarm?.meta.cleanup.removed) {
+        const { id, creation, cleanup } = p.alarm.meta;
+        check(id === null && creation === 'confirmed' && cleanup.state === 'confirmed', 'MAIN_CONTROL_CLEANUP_UNCONFIRMED');
+      }
+      check(typeof recoveryReadiness === 'function', 'MAIN_CONTROL_RECOVERY_UNAVAILABLE');
+    }
     const mainBinding = await bounded(Promise.resolve().then(() => getMainBinding(ctx, { projectId: args.projectId })));
     const main = binding(mainBinding);
     check(['sessionId', 'sessionPath', 'agentId', 'cwd', 'kind'].every(k => main[k] === p.meta.main[k]), 'MAIN_CONTROL_BINDING_MISMATCH');
-    await reconcileAlarm(p); check(p.meta.generation === generation && !p.failed, 'MAIN_CONTROL_STALE');
+    if (historical) {
+      guard();
+      const readiness = await bounded(Promise.resolve().then(() => recoveryReadiness({ projectId: args.projectId, main: copy(main) })));
+      guard();
+      check(readiness?.ready === true, 'MAIN_CONTROL_RECOVERY_NOT_READY');
+    }
+    await reconcileAlarm(p, historical ? guard : undefined);
     // Awaited adapters can change settlement without changing the inactive epoch.
-    assertResumable(p);
+    guard();
     check(!p.alarm || p.alarm.meta.cleanup.removed && !p.alarm.creating, 'MAIN_CONTROL_CLEANUP_UNCONFIRMED');
+    if (historical) {
+      check(workerStopSettled(p), 'MAIN_CONTROL_WORKER_STOP_UNCONFIRMED');
+      p.historical = false;
+    }
     p.meta.main = main;
-    delete p.meta.restartIntent; restartCandidates.delete(p); p.restartGuard = null; p.recoveryReview = false;
+    delete p.meta.restartIntent; restartCandidates.delete(p); p.recoveryReview = Boolean(historical);
+    p.restartGuard = historical ? generation + 1 : null;
     p.meta.generation++;
     p.meta.state = 'active';
     p.meta.error = null;
     p.meta.waiting = false;
     p.meta.waitReason = null;
     p.meta.continueRequested = false;
-    // Only this authorized new epoch resets reservations; legacy omission stays absent.
-    if (Object.hasOwn(args, 'maxAutomaticContinues') || Object.hasOwn(p.meta, 'continuationBudget')) {
+    // Explicit same-process resume retains its existing refresh semantics.
+    // The first resume of a deferred Goal carries forward its reservations.
+    if (!historical && (Object.hasOwn(args, 'maxAutomaticContinues') || Object.hasOwn(p.meta, 'continuationBudget'))) {
       p.meta.continuationBudget = { limit: args.maxAutomaticContinues ?? p.meta.continuationBudget.limit, reserved: 0 };
     }
     const n = now();
@@ -576,7 +682,7 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
     const activation = p.monitorActivation, endedAt = p.meta.completion?.at;
     const completing = state === 'completed' && activation?.generation === p.meta.generation
       && active(p) && !p.meta.error && !['unknown', 'rejected'].includes(p.meta.send?.state);
-    if (state === 'completed') p.monitorCompletionAttempted = true;
+    if (state === 'completed') { p.monitorCompletionAttempted = true; p.dashboardCompletionSaving = true; }
     delete p.meta.restartIntent; restartCandidates.delete(p); p.restartGuard = null; p.recoveryReview = false;
     p.ready = false; p.meta.generation++; p.meta.state = state; p.meta.waiting = true; p.meta.continueRequested = false;
     const generation = p.meta.generation;
@@ -609,15 +715,21 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
       if (state === 'stopping' && p.meta.generation === generation && p.meta.state === 'stopping') p.meta.state = 'stopped';
     }
     await clean; await save(p);
+    if (state === 'completed') p.dashboardCompletionSaving = false;
     if (completing && !disposed && !p.failed && p.meta.state === 'completed' && p.meta.generation === generation) {
       p.monitorCompletion = { activation, generation, endedAt };
+      refreshDashboardTerminal(p.meta.projectId);
     }
     return view(p);
   }
+  function checkCanDeactivate(p) {
+    check(p.meta.state !== 'completed', 'MAIN_CONTROL_COMPLETED');
+    check(!p.historical, 'MAIN_CONTROL_HISTORY_DEFERRED');
+  }
   async function pause(args, ctx) { fields(args, ['projectId']); await auth('pause', args, ctx, ['creator', 'main']); const p = get(args.projectId);
-    check(p.meta.state !== 'completed', 'MAIN_CONTROL_COMPLETED'); return deactivate(p, 'paused', ctx); }
+    checkCanDeactivate(p); return deactivate(p, 'paused', ctx); }
   async function stop(args, ctx) { fields(args, ['projectId', 'force']); check(args.force === undefined || typeof args.force === 'boolean', 'MAIN_CONTROL_INVALID_INPUT');
-    await auth('stop', args, ctx, ['creator', 'main']); const p = get(args.projectId); check(p.meta.state !== 'completed', 'MAIN_CONTROL_COMPLETED'); return deactivate(p, 'stopping', ctx, args.force === true); }
+    await auth('stop', args, ctx, ['creator', 'main']); const p = get(args.projectId); checkCanDeactivate(p); return deactivate(p, 'stopping', ctx, args.force === true); }
   async function complete(args, ctx) {
     fields(args, ['projectId', 'goalId', 'generation', 'factIds'], ['projectId', 'goalId', 'generation', 'factIds']);
     check(Array.isArray(args.factIds) && args.factIds.length > 0 && args.factIds.length <= 64 && args.factIds.every(id => typeof id === 'string' && FACT.test(id))
@@ -637,28 +749,32 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
     return deactivate(p, 'completed', ctx);
   }
   async function status(args, ctx) { fields(args, ['projectId']); await auth('status', args, ctx, ['creator', 'main']);
+    if (deferHistoricalWork) await prepareProject(args.projectId);
     check(!damaged.has(args.projectId), 'MAIN_CONTROL_RECORD_INVALID'); return goals.has(args.projectId) ? view(get(args.projectId)) : { projectId: args.projectId, managed: false }; }
   function admit(projectId) {
     check(!disposed && typeof projectId === 'string' && PROJECT.test(projectId), 'MAIN_CONTROL_INVALID_INPUT');
     check(!damaged.has(projectId), 'MAIN_CONTROL_RECORD_INVALID'); const p = goals.get(projectId);
-    check(!p || active(p), 'MAIN_CONTROL_WORK_DENIED'); const ticket = Object.freeze({ projectId, goalId: p?.meta.goalId ?? null, generation: p?.meta.generation ?? null });
+    check(p ? active(p) : !historicalIds.has(projectId), 'MAIN_CONTROL_WORK_DENIED');
+    const ticket = Object.freeze({ projectId, goalId: p?.meta.goalId ?? null, generation: p?.meta.generation ?? null });
     tickets.set(ticket, { p, generation: p?.meta.generation }); return ticket;
   }
   function assertAdmission(ticket) {
     const stamp = tickets.get(ticket); check(stamp && goals.get(ticket.projectId) === stamp.p && (!stamp.p || active(stamp.p, stamp.generation)), 'MAIN_CONTROL_WORK_DENIED');
     check(!disposed, 'MAIN_CONTROL_DISPOSED'); return true;
   }
-  async function reconcileAlarm(p) {
+  async function reconcileAlarm(p, guard) {
     const alarm = p.alarm; cancelAlarmCallback(alarm); if (!alarm || alarm.meta.cleanup.removed) return;
     check(!alarm.creating && alarm.meta.id, 'MAIN_CONTROL_SCHEDULE_UNSETTLED');
-    const receipt = await bounded(Promise.resolve().then(() => sdk.tasks.getSchedule(alarm.meta.id)));
+    const receipt = await bounded(Promise.resolve().then(() => { guard?.(); return sdk.tasks.getSchedule(alarm.meta.id); }));
+    guard?.();
     if (receipt === null) { alarm.meta.cleanup = { state: 'confirmed', removed: true, scheduleId: alarm.meta.id, error: null }; alarm.meta.id = null; alarm.meta.creation = 'confirmed'; await save(p); return; }
-    scheduleReceipt(p, alarm, receipt); await cleanupAlarm(p, alarm);
+    scheduleReceipt(p, alarm, receipt); await cleanupAlarm(p, alarm, guard);
   }
   await store.mkdir(BASE);
   for (const name of await store.list(BASE)) {
     if (!name.endsWith('.json') || !PROJECT.test(name.slice(0, -5))) continue;
     const projectId = name.slice(0, -5);
+    if (deferHistoricalWork) { historicalIds.add(projectId); continue; }
     let meta; try { meta = await store.readJson(location(projectId)); validateRecord(meta, projectId); } catch { damaged.add(projectId); continue; }
     const p = wrap(meta); goals.set(projectId, p);
     const intent = meta.restartIntent;
@@ -676,7 +792,7 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
   }
   const registration = await bounded(sdk.tasks.registerHandler(HANDLER, { run: event => {
     const input = event?.input, p = goals.get(input?.projectId), alarm = p?.alarm;
-    if (disposed || event.kind !== 'schedule' || !alarm || !text(event.scheduleId) || input.goalId !== p.meta.goalId
+    if (disposed || event?.kind !== 'schedule' || !alarm || p.historical || !text(event.scheduleId) || input.goalId !== p.meta.goalId
       || input.generation !== alarm.meta.generation || input.token !== alarm.meta.token || alarm.fired
       || !active(p, input.generation)) return { status: 'ignored' };
     // Reserve synchronously, including delivery before the creation receipt.
@@ -717,6 +833,7 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
   // No creator context is available here. Only startup candidates and the
   // trusted readonly adapter may authorize a new control epoch.
   function activateRestarts() {
+    if (deferHistoricalWork) return Promise.resolve({ activated: true });
     if (!restartActivation) restartActivation = (async () => {
       const candidates = [...restartCandidates]; restartCandidates.clear();
       for (const [p, { generation, goalId }] of candidates) {
@@ -767,6 +884,7 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
     disposal = (async () => {
     disposed = true; const errors = [], eligible = [];
     for (const p of goals.values()) {
+      if (p.historical) continue;
       cancelAlarmCallback(p.alarm);
       const priorActive = p.meta.state === 'active';
       delete p.meta.restartIntent; restartCandidates.delete(p); p.restartGuard = null;
@@ -802,7 +920,7 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
       p.meta.restartIntent = { goalId, generation, priorActive: true };
       try { await save(p); } catch (error) { errors.push({ code: code(error) }); }
     }
-    return { disposed: true, errors, cleanupPending: errors.length > 0 || [...goals.values()].some(p => view(p).goalCleanupPending) };
+    return { disposed: true, errors, cleanupPending: errors.length > 0 || [...goals.values()].some(p => !p.historical && view(p).goalCleanupPending) };
     })();
     return disposal;
   }
@@ -810,22 +928,24 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
   // stop observer is synchronous, scalar-only and reads loaded memory only.
   function diagnostic(projectId) {
     if (damaged.has(projectId)) return { state: 'invalid', error: { code: 'MAIN_CONTROL_RECORD_INVALID' } };
-    const p = goals.get(projectId); if (!p) return null;
-    const reconciliation = workerStopReconciliation(p);
+    const p = goals.get(projectId);
+    if (!p) return historicalIds.has(projectId) ? { state: 'unknown', error: { code: 'MAIN_CONTROL_HISTORY_DEFERRED' } } : null;
+    const reconciliation = workerStopReconciliation(p), state = visibleState(p);
     const m = p.meta, candidate = restartCandidates.get(p), intent = m.restartIntent;
     const priorActive = candidate?.goalId === m.goalId && candidate.generation === m.generation
       || intent?.goalId === m.goalId && intent.generation === m.generation && intent.priorActive === true;
-    return { state: m.state, generation: m.generation, waitReason: m.waitReason ?? null, workerStopReconciliation: reconciliation,
+    return { state, generation: m.generation, waitReason: m.waitReason ?? null, workerStopReconciliation: reconciliation,
       error: m.error ? { code: code({ code: m.error }) } : null, budgetExhausted: budgetExhausted(p),
       restartAuthorization: m.restartAuthorization?.resume ?? 'none', priorActive: priorActive ? true : 'unknown',
       sendState: m.send === null ? 'none' : ['pending', 'unknown', 'accepted', 'rejected'].includes(m.send?.state) ? m.send.state : 'unknown',
-      cleanupPending: p.failed || m.state !== 'active' && (Boolean(p.sendJob) || Boolean(p.arming)
+      cleanupPending: p.failed || state !== 'active' && (Boolean(p.sendJob) || Boolean(p.arming)
+        || p.historical && ['pending', 'unknown'].includes(m.send?.state)
         || Boolean(p.alarm && (!p.alarm.meta.cleanup.removed || p.alarm.creating))) };
   }
   function monitorLifecycle(projectId) {
     if (disposed || damaged.has(projectId)) return { state: 'unknown' };
     const p = goals.get(projectId);
-    if (!p) return null;
+    if (!p) return historicalIds.has(projectId) ? { state: 'unknown' } : null;
     if (p.failed) return { state: 'unknown' };
     const { state, generation, error } = p.meta;
     if (state === 'completed') {
@@ -853,6 +973,25 @@ export async function createMainControlService(sdk, { authorize, getMainBinding,
   const api = Object.fromEntries(Object.entries(actions).map(([name, fn]) => [name, async (args, ctx) => {
     check(object(args), 'MAIN_CONTROL_INVALID_INPUT'); return fn(copy(args), ctx);
   }]));
-  return { ...api, admit, assertAdmission, activateRestarts, diagnostic, monitorLifecycle, dispose,
+  // Negative archive witness only. Unlike monitorCompletion, the business
+  // evidence below survives loading a journal; it never confers publication.
+  function dashboardCompletionSeal(projectId) {
+    if (disposed || damaged.has(projectId)) return null;
+    const p = goals.get(projectId), m = p?.meta, completion = m?.completion;
+    if (!p || p.failed || p.dashboardCompletionSaving || m.state !== 'completed' || m.error
+      || !/^goal-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(m.goalId) || m.generation < 2
+      || p.sendJob || p.dashboardSendCommit || (m.send !== null && m.send?.state !== 'accepted') || p.arming
+      || p.alarm && (p.alarm.creating || p.alarm.dashboardCleanupSaving || p.alarm.meta.creation !== 'confirmed'
+        || p.alarm.meta.id !== null || p.alarm.meta.cleanup.state !== 'confirmed' || p.alarm.meta.cleanup.removed !== true)
+      || m.workerStop.state !== 'requested' || m.workerStop.generation !== m.generation || !workerStopSettled(p)
+      || !time(completion?.at) || completion.at < m.authorization.at || !Array.isArray(completion.factIds)
+      || !completion.factIds.length || completion.factIds.length > 64 || !completion.factIds.every(id => typeof id === 'string' && FACT.test(id))
+      || new Set(completion.factIds).size !== completion.factIds.length) return null;
+    return createHash('sha256').update(JSON.stringify(['dashboard-goal-completion-v1', projectId, m.goalId,
+      m.generation, completion.at, [...completion.factIds].sort()])).digest('hex');
+  }
+  // Project can also signal an external worker-stop settlement edge. This only
+  // re-observes the existing in-process completion stamp; it cannot mint one.
+  return { ...api, prepareProject, admit, assertAdmission, activateRestarts, diagnostic, monitorLifecycle, refreshDashboardTerminal, dashboardCompletionSeal, dispose,
     async invoke(action, args, ctx) { check(Object.hasOwn(api, action), 'MAIN_CONTROL_INVALID_ACTION'); return api[action](args, ctx); } };
 }

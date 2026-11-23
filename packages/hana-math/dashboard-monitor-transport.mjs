@@ -8,6 +8,8 @@ const PREFIX = '/workspace-monitor';
 const GENERATION = 'x-hana-math-monitor-generation';
 const routes = new Map(livePaths.map(path => [dashboardSelection(path), path]));
 const unavailable = Object.freeze({ state: 'unavailable' });
+// Backend identity only; a copied JSON body or an error.code is not a receipt.
+export const workspaceProjectBusy = Object.freeze({ state: 'unavailable', reason: 'project_busy' });
 const idle = Object.freeze({ state: 'idle' });
 const refused = () => Object.assign(new Error('Workspace monitor unavailable'), { code: 'WORKSPACE_MONITOR_UNAVAILABLE' });
 const response = (value, status = 200) => Response.json(value, { status, headers: dashboardHeaders });
@@ -71,7 +73,10 @@ export function createWorkspaceDashboard({ workspaceMonitor, lookupReader } = {}
       const data = await packet.json();
       recheck();
       return data;
-    } catch { return unavailable; }
+    } catch (error) {
+      if (error === workspaceProjectBusy && observe(guard) === current && scope === selected) return workspaceProjectBusy;
+      return unavailable;
+    }
   }
   return Object.freeze({ current: observe, read });
 }
@@ -103,7 +108,7 @@ export function createWorkspaceMonitorTransport(dashboard, channel) {
         const route = path.slice(PREFIX.length), input = new Headers(headers);
         if (route === '/current') {
           if ([...input].length) return response(unavailable, 400);
-          const current = dashboard.current(active);
+          const current = await dashboard.current(active);
           check(active());
           return response(current);
         }
@@ -112,8 +117,8 @@ export function createWorkspaceMonitorTransport(dashboard, channel) {
         if (!selection) return response(unavailable, 404);
         const generation = input.get(GENERATION);
         const data = await dashboard.read(selection, generation, active);
-        check(active() && data !== unavailable && dashboard.current(active).generation === generation);
-        return response(data);
+        check(active() && data !== unavailable && (await dashboard.current(active)).generation === generation && active());
+        return response(data, data === workspaceProjectBusy ? 409 : 200);
       } catch { return response(unavailable, 403); }
     },
     dispose() {
