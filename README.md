@@ -2,7 +2,12 @@
 
 Hana Math 将 [Danus](https://github.com/frenzymath/Danus) 的数学研究流程接入 HanaAgent：main 分派任务，worker 提交候选证明，独立 verifier 审阅，被接受的事实进入项目事实图。模型核验不等于形式化证明。
 
-这是开发仓库提交 `2084f4f`（版本 `0.36.1`）的公开源码快照，使用独立 Git 历史。它包含 Hana Math 的应用代码、Python 引擎、构建脚本和软件测试。使用说明见 [Hana Math 用户指南](packages/hana-math/README.md)，引擎说明见 [engine/README.md](engine/README.md)。源码中已有 Windows 适配工作，不代表 Windows 安装包已经通过真机验收。
+这是 Hana Math **0.36.8**（源码 `ef2361f`）的公开快照，使用独立 Git 历史。它包含 App 源码、Python 引擎、构建脚本和软件测试。
+
+- [开始使用](packages/hana-math/README.md)：研究、看板、报告、论文导出与全文数学审稿。
+- [Python 引擎](engine/README.md)：运行环境与开发说明。
+
+全文审稿意见绑定到指定稿件和引用账本。软件测试不代表已用真实模型验收；论文 TeX 编译和 Windows 真机运行未在本版本验证。
 
 ## 使用与构建边界
 
