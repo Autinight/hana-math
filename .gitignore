@@ -5,3 +5,25 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# Local development records from before the GitHub migration.
+/CHANGELOG.md
+/dev-state.md
+/docs/README.md
+/docs/danus-parity.md
+/docs/live-runs.md
+/docs/open-issues.md
+/docs/roadmap.md
+/docs/testing.md
+/docs/archive/
+/docs/design/
+/docs/reviews/
+
+# Host SDK and local UI assets supplied by the development environment.
+/packages/hana-math/sdk/
+/packages/hana-math/ui/assets/app-ui.css
+/packages/hana-math/ui/assets/app-ui.js
+/packages/hana-math/ui/assets/sdk.js
+/packages/hana-math/ui/assets/avatars/preset.png
+/packages/hana-math/ui/assets/avatars/shiraha.png
+/packages/hana-math/ui/assets/avatars/xiaojingyu.png
