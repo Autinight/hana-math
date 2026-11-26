@@ -66,7 +66,7 @@ test('production index and project dependencies import and register through the 
   assert.deepEqual(tools.get('math_dashboard_view').view, { providerId: 'app:hana-math/live-dashboard' });
   const { LIVE_ACTIVATE, LIVE_ROUTE, livePaths } = await import(new URL('ui/dashboard/live-protocol.mjs', appRoot));
   assert.deepEqual(routes, [['GET', '/panel'], ['GET', '/editor/assistant/:id'], ['POST', '/editor/assistant/:id'], ['GET', '/editor/role/:id'], ['POST', '/editor/role/:id'],
-    ...[LIVE_ACTIVATE, ...livePaths.map(p => LIVE_ROUTE + p)].map(p => ['GET', p]),
+    ...[LIVE_ACTIVATE, ...livePaths.map(p => LIVE_ROUTE + p), `${LIVE_ROUTE}/api/fact/:factId`].map(p => ['GET', p]),
     ['GET', '/workspace-monitor/current'],
     ['GET', '/workspace-monitor/api/overview'],
     ['GET', '/workspace-monitor/api/factgraph'],
@@ -81,7 +81,8 @@ test('production index and project dependencies import and register through the 
     ['GET', '/workspace-monitor/api/channel/dead_end'],
     ['GET', '/workspace-monitor/api/channel/verification'],
     ['GET', '/workspace-monitor/api/channel/elaboration'],
-    ['GET', '/workspace-monitor/api/channel/master_guidance']]);
+    ['GET', '/workspace-monitor/api/channel/master_guidance'],
+    ['GET', '/workspace-monitor/api/fact/:factId']]);
   assert.ok(calls.some(([name]) => name === 'tasks.registerHandler'));
   assert.equal(calls.some(([name]) => name === 'bus.request'), false, 'Setup must not query a session');
   await awaitBusinessReady(tools.get('math_context'));
@@ -90,10 +91,10 @@ test('production index and project dependencies import and register through the 
   const rejected = await tools.get('fact_submit').execute({ statement: 'PRIVATE opaque fixture', proof: '', context: origin });
   assert.equal(rejected.isError, true); assert.equal(rejected.details.error.code, 'RESEARCH_TOOL_INVALID_INPUT');
   assert.doesNotMatch(JSON.stringify(rejected), /PRIVATE/);
-  assert.deepEqual(await fs.readdir(path.join(dataDir, 'research/runs')), [], 'Unauthorized input must not create run metadata');
+  assert.deepEqual(await fs.readdir(path.join(dataDir, 'research/runs')).catch(e => e.code === 'ENOENT' ? [] : Promise.reject(e)), [], 'Unauthorized input must not create run metadata');
 });
 
-for (const failRegistration of [false, true]) test(`D04 production entry activates a seeded candidate only after successful tool registration: fail=${failRegistration}`, async t => {
+for (const failRegistration of [false, true]) test(`D04 production entry defers historical Goals on App load without scanning or mutating seeded state: fail=${failRegistration}`, async t => {
   const entry = await import(new URL('index.js', appRoot));
   const dataDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'math-restart-entry-')));
   t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
@@ -125,9 +126,9 @@ for (const failRegistration of [false, true]) test(`D04 production entry activat
     await setup;
     await awaitBusinessReady(tools.get('math_context'));
   }
-  assert.equal(reads.length > 0, !failRegistration);
-  // A failed registry must not even consume the existing restart intent.
-  assert.equal(JSON.parse(await fs.readFile(goalFile)).state, failRegistration ? 'active' : 'blocked');
+  // Production entry sets deferHistoricalWork=true and never auto-resumes prior Goals on load.
+  assert.equal(reads.length, 0);
+  assert.equal(JSON.parse(await fs.readFile(goalFile)).state, 'active');
   assert.ok(tools.has('math_project'));
 });
 

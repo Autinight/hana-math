@@ -33,8 +33,8 @@ async function restartFixture(t, behavior = {}, authorized = true) {
   return { f, p, run, stopped, active };
 }
 async function publicRejected(f, p) {
-  await assert.rejects(status(f, p), { code: 'MAIN_CONTROL_DISPOSED' });
-  await assert.rejects(f.service.mainGoal('status', { projectId: p.projectId }, p.context), { code: 'MAIN_CONTROL_DISPOSED' });
+  await assert.rejects(status(f, p), { code: 'PROJECT_DISPOSED' });
+  await assert.rejects(f.service.mainGoal('status', { projectId: p.projectId }, p.context), { code: 'PROJECT_DISPOSED' });
   await assert.rejects(f.service.doctor({ projectId: p.projectId }, p.context), { code: 'PROJECT_DISPOSED' });
 }
 

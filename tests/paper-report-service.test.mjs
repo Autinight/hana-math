@@ -1791,3 +1791,94 @@ test('no-op metadata save failure retains uncertainty, never a successful result
   await assert.rejects(f.rawService.result(f.p, q, owner, revisionKind), { code: 'PROJECT_REPORT_NOT_READY' });
   assert.deepEqual(Object.keys((await f.metadata(q)).artifacts), ['response']); assert.equal(f.calls.stages.length, 0);
 });
+
+test('in-memory handle stop clears stale recoveryStop and recoveryError receipts on both clean and failing handle stops', async t => {
+  const planKind = { kind: 'paper-plan' };
+  for (const mode of ['stale-recovery-stop', 'stale-recovery-error']) await t.test(mode, async t => {
+    const f = await fixture(t, { plan: true });
+    const origStart = f.writer.start;
+    const boundReached = defer(), releaseHandle = defer(), handleAssigned = defer();
+    let handleStops = 0, assigned = false;
+    if (mode === 'stale-recovery-error') {
+      // Streaming session forces confirmResearchSessionStop to invoke sessions.abort, recording recoveryError.
+      f.sdk.sessions.context = async ({ sessionId }) => ({ sessionId, isStreaming: true, isCompacting: false, pendingMessageCount: 1 });
+      f.sdk.sessions.abort = async () => { throw Object.assign(new Error('abort failed'), { code: 'HOST_UNAVAILABLE' }); };
+    }
+    f.writer.start = async input => {
+      const origOnBound = input.onBound;
+      let boundDone = false;
+      const wrapped = await origStart({
+        ...input,
+        async onBound(binding) {
+          const out = await origOnBound(binding);
+          boundDone = true;
+          return out;
+        },
+        async onUpdate(snapshot) {
+          const out = await input.onUpdate(snapshot);
+          if (boundDone) {
+            boundReached.resolve();
+            await releaseHandle.promise;
+          }
+          return out;
+        },
+      });
+      return {
+        done: wrapped.done,
+        async stop() {
+          handleStops++;
+          if (mode === 'stale-recovery-error') throw Object.assign(new Error('handle stop failed'), { code: 'HOST_UNAVAILABLE' });
+          const res = await wrapped.stop();
+          // Keep cleanupPending true on the catch-path stop so the explicit second stop() enters
+          // stopInternal()'s in-memory `if (r.handle)` branch and must delete the stale recoveryStop receipt.
+          return handleStops === 1 ? { ...res, cleanupPending: true } : res;
+        },
+      };
+    };
+    const origWrite = f.store.write;
+    f.store.write = async (name, bytes, ...rest) => {
+      await origWrite(name, bytes, ...rest);
+      if (!assigned && name.endsWith('/metadata.json')) {
+        const meta = JSON.parse(bytes);
+        if (meta.writerStarting === false && meta.writer?.sessionId && (meta.recoveryStop || meta.recoveryError)) {
+          assigned = true;
+          handleAssigned.resolve();
+        }
+      }
+    };
+    t.after(() => releaseHandle.resolve());
+
+    const q = await f.start();
+    const run = f.dispatch(q);
+    await boundReached.promise;
+
+    // First stop runs while r.meta.writer.sessionId exists but r.handle is not yet assigned,
+    // recording a recoveryStop or recoveryError receipt on the report metadata.
+    const firstStop = await f.rawService.stop(f.p, q, owner, planKind);
+    assert.equal(firstStop.cleanupPending, true);
+    if (mode === 'stale-recovery-stop') {
+      assert.deepEqual(firstStop.sessionStop, { outcome: 'aborted', confirmed: true, error: null });
+      assert.equal((await f.metadata(q)).recoveryStop, 'aborted');
+    } else {
+      assert.deepEqual(firstStop.sessionStop, { outcome: null, confirmed: false, error: 'HOST_UNAVAILABLE' });
+      assert.equal((await f.metadata(q)).recoveryError, 'HOST_UNAVAILABLE');
+    }
+
+    // Allow summaryWriter.start() to return the handle so r.handle is assigned, then call stop() again.
+    releaseHandle.resolve();
+    await handleAssigned.promise;
+    await run;
+    const secondStop = await f.rawService.stop(f.p, q, owner, planKind);
+
+    assert.equal(handleStops >= 1, true);
+    assert.equal(secondStop.sessionStop, null);
+    assert.equal(secondStop.cleanupPending, mode === 'stale-recovery-error');
+    const saved = await f.metadata(q);
+    assert.equal(Object.hasOwn(saved, 'recoveryStop'), false);
+    assert.equal(Object.hasOwn(saved, 'recoveryError'), false);
+    if (mode === 'stale-recovery-stop') {
+      assert.equal(secondStop.writer?.stopEvidence, undefined);
+      assert.equal(saved.cleanupPending, false);
+    }
+  });
+});

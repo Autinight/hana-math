@@ -46,7 +46,7 @@ test('math_project follow actions have exact schemas and advertise explicit loca
   assert.match(description, /Never infer consent or migrate an older project without it/);
   assert.match(description, /do not select an arbitrary dashboard target, start, stop or resume a Goal or worker, or change \.hanamathboard document permissions/);
   const readme = await readFile(new URL('../packages/hana-math/README.md', import.meta.url), 'utf8');
-  for (const text of ['让 Σ 以后也跟踪这个项目', '不再让 Σ 跟踪这个项目', '不代表已安装版支持']) assert.ok(readme.includes(text));
+  for (const text of ['math_project dashboard_follow', 'dashboard_unfollow', '只传 `projectId`', '授权不启动、停止或恢复研究']) assert.ok(readme.includes(text));
 });
 
 test('follow and unfollow forward only projectId and the original Host context', async t => {

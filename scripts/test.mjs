@@ -1,4 +1,4 @@
-import { readdirSync } from 'node:fs';
+import { readdirSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -55,7 +55,11 @@ export function runTests(args = process.argv.slice(2), {
   return result;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function sameEntry(a, b) {
+  try { return realpathSync(a) === realpathSync(b); } catch { return path.resolve(a) === path.resolve(b); }
+}
+
+if (process.argv[1] && sameEntry(process.argv[1], fileURLToPath(import.meta.url))) {
   try {
     const result = runTests();
     if (result.signal) process.kill(process.pid, result.signal);
