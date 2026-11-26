@@ -66,6 +66,7 @@ test('production index and project dependencies import and register through the 
   assert.deepEqual(tools.get('math_dashboard_view').view, { providerId: 'app:hana-math/live-dashboard' });
   const { LIVE_ACTIVATE, LIVE_ROUTE, livePaths } = await import(new URL('ui/dashboard/live-protocol.mjs', appRoot));
   assert.deepEqual(routes, [['GET', '/panel'], ['GET', '/editor/assistant/:id'], ['POST', '/editor/assistant/:id'], ['GET', '/editor/role/:id'], ['POST', '/editor/role/:id'],
+    ['GET', '/settings/tex'], ['POST', '/settings/tex'], ['POST', '/settings/tex/test'],
     ...[LIVE_ACTIVATE, ...livePaths.map(p => LIVE_ROUTE + p), `${LIVE_ROUTE}/api/fact/:factId`].map(p => ['GET', p]),
     ['GET', '/workspace-monitor/current'],
     ['GET', '/workspace-monitor/api/overview'],

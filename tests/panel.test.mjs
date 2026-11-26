@@ -160,7 +160,7 @@ test('manifest contributes Math settings and exactly one primary dashboard page 
   const manifest = JSON.parse(read('manifest.json'));
   assert.equal(manifest.version, JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version); assert.equal(manifest.id, 'hana-math'); assert.equal(manifest.manifestVersion, 2);
   assert.deepEqual(manifest.network, { allowedHosts: ['leansearch.net'], methods: ['POST'], allowLocalhost: false, defaultTimeoutMs: 20000, maxResponseBytes: 1048576 });
-  assert.deepEqual(manifest.capabilities, ['app/agents.read', 'app/agents.manage', 'app/resources.read', 'app/resources.write', 'app/runtime.execute', 'app/runtime.native', 'app/runtime.network', 'app/tools.expose-to-model', 'app/tasks.manage', 'app/session.start-turn', 'app/session.switch-model', 'app/session.thinking-level', 'app/session.tools.configure', 'app/session.stage-file', 'app/sessions.home']);
+  assert.deepEqual(manifest.capabilities, ['app/agents.read', 'app/agents.manage', 'app/resources.read', 'app/resources.write', 'app/runtime.execute', 'app/runtime.native', 'app/runtime.network', 'app/process.spawn', 'app/tools.expose-to-model', 'app/tasks.manage', 'app/session.start-turn', 'app/session.switch-model', 'app/session.thinking-level', 'app/session.tools.configure', 'app/session.stage-file', 'app/sessions.home']);
   assert.deepEqual(Object.keys(manifest.contributes), ['settings', 'cards', 'previewers', 'cliFlags']);
   assert.deepEqual(manifest.contributes.cards, [{
     id: 'research-dashboard-page', title: '研究看板', face: { image: 'assets/cover.svg' },

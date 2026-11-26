@@ -28,10 +28,11 @@ export const validOverrideReason = value => typeof value === 'string' && value.i
 
 export function snapshotPaperDeliveryRequest(input, { tool = false, code = 'PROJECT_INVALID_INPUT' } = {}) {
   const base = ['projectId', ...(tool ? ['action'] : []), 'mathReviewReportId'];
-  const result = plainData(input, [...base, 'reportId', 'planReportId', 'finalSectionReportId', 'override', 'allowUncompiledTex'], base, code);
+  const result = plainData(input, [...base, 'reportId', 'planReportId', 'finalSectionReportId', 'compileReportId', 'override', 'allowUncompiledTex'], base, code);
   if (tool && result.action !== 'paper_deliver') fail(code);
   if (typeof result.projectId !== 'string' || !PROJECT_ID.test(result.projectId)
     || typeof result.mathReviewReportId !== 'string' || !REPORT_ID.test(result.mathReviewReportId)) fail(code);
+  if (Object.hasOwn(result, 'compileReportId') && (typeof result.compileReportId !== 'string' || !REPORT_ID.test(result.compileReportId))) fail(code);
   if (Object.hasOwn(result, 'reportId')) {
     if (Object.hasOwn(result, 'planReportId') || Object.hasOwn(result, 'finalSectionReportId')
       || typeof result.reportId !== 'string' || !REPORT_ID.test(result.reportId)) fail(code);

@@ -197,6 +197,90 @@ export function mountMathPanel(root, { request }) {
   }
   makeGroup('assistant', '助手'); makeGroup('role', '子代理 Agent');
 
+  // LaTeX compiler path settings section (settings-only; models cannot mutate).
+  const texSection = node('section', 'member-group tex-group');
+  texSection.setAttribute('aria-label', 'LaTeX 编译');
+  texSection.hidden = true;
+  const texHeading = node('h2', 'group-heading', 'LaTeX 编译');
+  const texDesc = node('p', 'tex-desc', '配置本机 pdflatex 或 pdftex 可执行文件位置，供论文编译与交付生成 PDF。留空时自动按系统常用路径查找。');
+  const texRow = node('div', 'tex-row');
+  const texInput = node('input', 'tex-input');
+  texInput.type = 'text';
+  texInput.autocomplete = 'off';
+  texInput.spellcheck = false;
+  texInput.setAttribute('aria-label', 'TeX 编译器路径');
+  texInput.placeholder = '留空自动查找，例如 /Library/TeX/texbin/pdflatex';
+  const texActions = node('div', 'tex-actions');
+  const texSaveHost = node('div');
+  const texTestHost = node('div');
+  texActions.append(texSaveHost, texTestHost);
+  texRow.append(texInput, texActions);
+  const texStatus = node('p', 'tex-status'); texStatus.setAttribute('role', 'status');
+  texSection.append(texHeading, texDesc, texRow, texStatus);
+  shell.appendChild(texSection);
+
+  let texBusy = false;
+  function setTexStatus(text, isError = false) {
+    texStatus.textContent = text;
+    texStatus.className = isError ? 'tex-status is-error' : 'tex-status';
+  }
+  const texSaveBtn = control(texSaveHost, 'Button', { size: 'sm', variant: 'primary', children: '保存路径', onClick: () => void saveTex() });
+  const texTestBtn = control(texTestHost, 'Button', { size: 'sm', variant: 'secondary', children: '测试编译', onClick: () => void testTex() });
+  function syncTexButtons() {
+    texInput.disabled = texBusy;
+    texSaveBtn.update({ size: 'sm', variant: 'primary', children: '保存路径', disabled: texBusy, onClick: () => void saveTex() });
+    texTestBtn.update({ size: 'sm', variant: 'secondary', children: '测试编译', disabled: texBusy, onClick: () => void testTex() });
+  }
+  function renderTexState(tex) {
+    if (!tex) return;
+    texSection.hidden = false;
+    if (tex.defaultHint) texInput.placeholder = `留空自动查找，例如 ${tex.defaultHint}`;
+    texInput.value = tex.configuredPath || '';
+    if (tex.available && tex.resolvedPath) {
+      setTexStatus(`${tex.mode === 'custom' ? '自定义路径可用' : '自动探测可用'}：${tex.resolvedPath}`, false);
+    } else if (tex.error?.message) {
+      setTexStatus(tex.error.message, true);
+    } else {
+      setTexStatus('尚未检测到可用的 pdflatex。', true);
+    }
+  }
+  async function saveTex() {
+    if (!alive || texBusy) return;
+    texBusy = true; syncTexButtons(); setTexStatus('正在保存并检测…', false);
+    try {
+      const data = await call('/settings/tex', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ compilerPath: texInput.value.trim() || null }),
+      });
+      if (!alive) return;
+      renderTexState(data.tex);
+    } catch (error) {
+      if (alive) setTexStatus(error.detail?.message || error.message || '保存失败，请检查路径后重试。', true);
+    } finally { if (alive) { texBusy = false; syncTexButtons(); } }
+  }
+  async function testTex() {
+    if (!alive || texBusy) return;
+    texBusy = true; syncTexButtons(); setTexStatus('正在测试编译最小样例…', false);
+    try {
+      const data = await call('/settings/tex/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ compilerPath: texInput.value.trim() || null }),
+      });
+      if (!alive) return;
+      const r = data.result;
+      if (r?.ok) {
+        setTexStatus(`测试编译通过（${r.pdfBytes} 字节 PDF）\n编译器：${r.resolvedPath}${r.version ? `\n${r.version}` : ''}`, false);
+      } else {
+        const msg = r?.error?.message || '测试编译失败';
+        setTexStatus(r?.logExcerpt ? `${msg}\n${r.logExcerpt.slice(0, 400)}` : msg, true);
+      }
+    } catch (error) {
+      if (alive) setTexStatus(error.detail?.message || error.message || '测试编译失败。', true);
+    } finally { if (alive) { texBusy = false; syncTexButtons(); } }
+  }
+
   function renderGroup(group, section) {
     const version = group.version = (group.version || 0) + 1;
     group.unavailable = false;
@@ -253,6 +337,7 @@ export function mountMathPanel(root, { request }) {
       if (!alive) return;
       renderGroup(groups.get('assistant'), data.assistants);
       renderGroup(groups.get('role'), data.roles);
+      if (data?.tex) renderTexState(data.tex);
     } catch {
       if (alive) for (const group of groups.values()) renderGroup(group, null);
     }

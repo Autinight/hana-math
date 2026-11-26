@@ -121,7 +121,7 @@ function jobUnsettled(value) {
     || value.finalizing !== false || value.coreTaskCreatePending !== false || value.coreTaskSettlementPending !== false || value.recoveryUnsettled === true;
 }
 
-export async function createProjectService(sdk, { contexts, profiles, research, createCore, literature, createMainSession = createProjectMainSession, summaryWriter, deferHistoricalWork = false } = {}) {
+export async function createProjectService(sdk, { contexts, profiles, research, createCore, literature, createMainSession = createProjectMainSession, summaryWriter, texCompiler = null, deferHistoricalWork = false } = {}) {
   check(contexts?.prepare && contexts?.prepareProjectWorkspace && contexts?.assignWorkerTask && profiles && research?.startWorkerRun
     && research?.projectWorkerStatus && research?.stopProjectWorker && typeof createCore === 'function' && literature?.search
     && typeof createMainSession === 'function', 'PROJECT_DEPENDENCY_MISSING');
@@ -1888,6 +1888,16 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     args = snapshotPaperSectionRequest(args, { read: true });
     return reports.stop(get(contextId(args.projectId)), args, ctx, paperMathKind);
   }
+  async function paperCompile(args, ctx) {
+    args = snapshotPlanData(args);
+    const source = args && Object.hasOwn(args, 'reportId');
+    args = source ? snapshotPaperSectionRequest(args, { read: true }) : snapshotPaperStitchRequest(args);
+    const p = get(contextId(args.projectId));
+    check(await authorize(p, ctx) === 'creator', 'PROJECT_SUMMARY_DENIED'); live(p);
+    const selector = source ? { reportId: args.reportId }
+      : { planReportId: args.planReportId, finalSectionReportId: args.finalSectionReportId };
+    return reports.compilePaper(p, selector, ctx);
+  }
   async function paperDeliver(args, ctx, options) {
     args = snapshotPaperDeliveryRequest(args);
     const p = get(contextId(args.projectId));
@@ -1984,7 +1994,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     authorizeCreator: async (p, ctx) => { check(await authorize(p, ctx) === 'creator', 'PROJECT_SUMMARY_DENIED'); },
     projects: () => projects.values(), getProject: get, assertLive: live, gatherFacts: gatherSummaryFacts, withReportPublication,
     gatherPaperFacts, gatherGapFillFacts, withPaperPublication, paperRunnerIpcScope, assertPaperTarget, withPaperTarget,
-    readInput: p => store.readJson(location(p, 'input.json')), track, projectLocation: p => `${BASE}/${p.meta.projectId}`, literature });
+    readInput: p => store.readJson(location(p, 'input.json')), track, projectLocation: p => `${BASE}/${p.meta.projectId}`, literature, texCompiler });
   const registration = await bounded(sdk.tasks.registerHandler(HANDLER, { run: async event => {
     const p = projects.get(event?.input?.projectId);
     if (closing || event?.kind !== 'schedule' || !p || !p.nonce || p.nonce !== event.input.nonce || p.setup || p.meta.state !== 'queued') return { status: 'ignored' };
@@ -2610,7 +2620,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
   return Object.freeze({ create, operatorRead, operatorSave, list, status, ipcUsage, assign, start, stop, result: (args, ctx) => result(args, ctx, null, true), graph, dashboardSnapshot, workerModels, finalize, summary, summaryStatus, summaryResult, summaryStop, paperSubgraph, paper, paperStatus, paperResult, paperStop,
     paperAudit, paperAuditStatus, paperAuditResult, paperAuditStop, paperVerify, paperVerifyStatus, paperVerifyResult, paperVerifyStop,
     paperVerifyMath, paperVerifyMathStatus, paperVerifyMathResult, paperVerifyMathStop,
-    paperDeliver, paperChapterTreeStitch,
+    paperCompile, paperDeliver, paperChapterTreeStitch,
     paperPlan, paperPlanStatus, paperPlanResult, paperPlanStop, paperSection, paperSectionStatus, paperSectionResult, paperSectionStop, paperStitch, paperStartIpcRefusal,
     paperRevise, paperRevisionStatus, paperRevisionResult, paperRevisionStop, dashboardOverview, readDashboard, authorizeDashboardView, dashboardFollow, dashboardUnfollow,
     verificationReads, recheck, doctor, invoke, handles, goal, mainGoal, workspaceMonitor, workspaceDashboard,

@@ -268,6 +268,24 @@ const specs = Object.freeze({
     artifactNames: Object.freeze({ response: 'raw-response.txt', audit: 'REFERENCE_AUDIT.md' }),
     deliveredRoles: Object.freeze(['audit']),
   }),
+  'paper-compile': Object.freeze({
+    label: 'Math paper TeX compilation',
+    startValid: () => false,
+    persistedValid: meta => {
+      const c = meta.compile;
+      return object(c) && typeof c.paperId === 'string' && paperId(c.paperId)
+        && ['passed', 'failed'].includes(c.compileStatus)
+        && typeof c.mainSha256 === 'string' && sha256(c.mainSha256)
+        && typeof c.ledgerSha256 === 'string' && sha256(c.ledgerSha256)
+        && typeof c.receiptSha256 === 'string' && sha256(c.receiptSha256)
+        && typeof c.logSha256 === 'string' && sha256(c.logSha256)
+        && (c.compileStatus !== 'passed' || (typeof c.pdfSha256 === 'string' && sha256(c.pdfSha256) && typeof c.flsSha256 === 'string' && sha256(c.flsSha256)));
+    },
+    recordFields: payload => ({ kind: 'paper-compile', compile: structuredClone(payload) }),
+    taskFields: meta => ({ kind: 'paper-compile', paperId: meta.compile.paperId, mainSha256: meta.compile.mainSha256, compileStatus: meta.compile.compileStatus }),
+    artifactNames: Object.freeze({ pdf: 'main.pdf', log: 'COMPILE_LOG.txt', fls: 'main.fls', receipt: 'COMPILE_RECEIPT.json' }),
+    deliveredRoles: Object.freeze(['pdf', 'log']),
+  }),
 });
 export function resolveReportKind(kind) {
   if (kind === undefined) return 'summary';

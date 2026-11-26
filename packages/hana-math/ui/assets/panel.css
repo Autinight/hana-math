@@ -37,6 +37,15 @@ html, body { margin: 0; min-height: 100%; background: var(--math-bg); color: var
 .role-group { min-height: 184px; padding: 0 12px 8px; border: 1px dashed var(--math-border); border-radius: 16px; }
 .role-group legend { padding: 0 10px; margin-inline-start: 2px; font-weight: 400; }
 .role-group .member-cluster { padding-top: 20px; }
+.tex-group { margin-top: 18px; padding: 14px 16px 16px; border: 1px solid var(--math-border); border-radius: 14px; background: var(--math-surface); }
+.tex-desc { margin: 6px 0 12px; font-size: 12px; line-height: 1.6; color: var(--math-muted); }
+.tex-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.tex-input { flex: 1 1 260px; min-width: 0; height: 32px; padding: 4px 10px; border: 1px solid var(--math-border); border-radius: 8px; background: var(--bg-input, var(--math-bg)); color: var(--math-text); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tex-input:focus-visible { outline: none; border-color: var(--math-accent); }
+.tex-actions { display: flex; flex: none; gap: 8px; }
+.tex-status { margin: 10px 0 0; font-size: 12px; line-height: 1.6; color: var(--math-muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+.tex-status.is-error { color: var(--danger, var(--coral, #b45042)); }
+.tex-status:empty { display: none; }
 .theme-status, .panel-error { margin: 12px 24px; font-size: 12px; line-height: 1.6; color: var(--math-muted); }
 .math-editor { width: min(1600px, 84vw, calc(100vw - 64px)); max-width: none; height: calc(100dvh - 48px); max-height: none; margin: auto; padding: 0; border: 1px solid var(--math-border); border-radius: 12px; background: var(--math-bg); color: var(--math-text); box-shadow: 0 12px 36px rgb(0 0 0 / 18%); overflow: hidden; }
 .math-editor[open] { display: flex; flex-direction: column; }

@@ -12,6 +12,7 @@ import { createProjectMainSession } from './project-main-session.mjs';
 import { createSummaryWriter } from './report-writer.mjs';
 import { createContextProbe } from './context-probe.mjs';
 import { createMathBootstrap } from './bootstrap.mjs';
+import { createPaperCompileService } from './paper-compile-service.mjs';
 
 export const name = 'hana-math';
 const startedRoots = new Set();
@@ -29,12 +30,13 @@ export default defineApp(async sdk => {
     boot.assertReady(); return target()[method](...args);
   } });
   const view = createDashboardView(boot.guardedSdk, delegate(() => projects));
+  const texCompiler = createPaperCompileService(boot.guardedSdk);
   try {
     await boot.own(() => instance.dispose());
     await boot.own(() => view.dispose());
     const services = await registerMathContext(boot.guardedSdk, { probes: delegate(() => probes), readReadiness: boot.readReadiness });
     await boot.registerHandlers();
-    await registerPanel(boot.guardedSdk, view, delegate(() => projects.workspaceDashboard));
+    await registerPanel(boot.guardedSdk, view, delegate(() => projects.workspaceDashboard), texCompiler);
     if (!view.supported) await sdk.logger.warn('Math live dashboard disabled: Host documents API unavailable.');
     await view.registerTool();
     await registerMathResearch(boot.guardedSdk, delegate(() => research), delegate(() => projects));
@@ -64,7 +66,7 @@ export default defineApp(async sdk => {
       const writerOwner = await boot.own(() => summaryWriter.dispose());
       assertPreparing();
       projects = await createProjectService(runtimeSdk, { contexts: services.contexts, profiles: services.profiles,
-        research, createCore: instance.createCore, literature, createMainSession: createProjectMainSession, summaryWriter, deferHistoricalWork });
+        research, createCore: instance.createCore, literature, createMainSession: createProjectMainSession, summaryWriter, texCompiler, deferHistoricalWork });
       writerOwner.transfer(); await boot.own(() => projects.dispose());
       enableGoalAlarms();
       // Do not automatically resume a previous research Goal on App load.

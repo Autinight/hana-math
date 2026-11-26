@@ -93,7 +93,7 @@ async function bounded(promise) {
 
 export async function createProjectReportService({ sdk, store, summaryWriter, authorizeCreator, projects, getProject,
   assertLive, gatherFacts, withReportPublication, gatherPaperFacts, gatherGapFillFacts, withPaperPublication, paperRunnerIpcScope, assertPaperTarget, readInput, track, projectLocation, literature,
-  deferHistoricalWork = false, isFreshProject = () => false }) {
+  texCompiler = null, deferHistoricalWork = false, isFreshProject = () => false }) {
   const records = new Map(), active = new Map(), damaged = new Set(), admitting = new Set();
   const deferredByProject = new Map(), historyPreparation = new WeakMap(), mathReviewChecks = new WeakMap();
   let disposed = false, registration;
@@ -2136,7 +2136,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   }
   function getKind(p, id, options) {
     const expected = options?.kind ?? 'summary';
-    check(['summary', 'paper-source', 'reference-audit', 'reference-verification', 'paper-revision', 'paper-plan', 'paper-section', 'paper-math-verification', 'paper-chapter-tree'].includes(expected), 'PROJECT_INVALID_INPUT');
+    check(['summary', 'paper-source', 'reference-audit', 'reference-verification', 'paper-revision', 'paper-plan', 'paper-section', 'paper-math-verification', 'paper-chapter-tree', 'paper-compile'].includes(expected), 'PROJECT_INVALID_INPUT');
     const r = get(p, id);
     check((r.meta.kind ?? 'summary') === expected, 'PROJECT_REPORT_KIND_MISMATCH');
     return r;
@@ -2560,6 +2560,152 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     return start(p, { kind: 'paper-revision', language: 'English', revision: {
       verificationReportId: parent.meta.reportId, paperId: parent.meta.verification.paperId } }, ctx);
   }
+  async function readPaperCompileEvidence(p, compileReportId, expectedMainSha256) {
+    const cr = getKind(p, compileReportId, { kind: 'paper-compile' });
+    check(cr.meta.state === 'completed' && cr.meta.compile?.compileStatus === 'passed'
+      && cr.meta.compile.mainSha256 === expectedMainSha256
+      && cr.meta.artifacts?.pdf && cr.meta.artifacts?.log && cr.meta.artifacts?.fls && cr.meta.artifacts?.receipt,
+    'PROJECT_PAPER_DELIVERY_COMPILE_MISMATCH');
+    const readChecked = async (role, maxBytes) => {
+      const a = cr.meta.artifacts[role];
+      const bytes = await store.read(a.artifact);
+      check(bytes.length === a.bytes && bytes.length <= maxBytes && hash(bytes) === a.sha256, 'PROJECT_PAPER_DELIVERY_COMPILE_MISMATCH');
+      return bytes;
+    };
+    const [receiptBytes, logBytes, flsBytes, pdfBytes] = await Promise.all([
+      readChecked('receipt', 2 * 1024 * 1024),
+      readChecked('log', 2 * 1024 * 1024),
+      readChecked('fls', 2 * 1024 * 1024),
+      readChecked('pdf', 64 * 1024 * 1024),
+    ]);
+    let receipt;
+    try { receipt = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(receiptBytes)); }
+    catch { throw failure('PROJECT_PAPER_DELIVERY_COMPILE_MISMATCH'); }
+    check(receipt && receipt.schemaVersion === 1 && receipt.sourceSha256 === expectedMainSha256
+      && typeof receipt.cwd === 'string' && Array.isArray(receipt.readRoots) && receipt.pass === 2,
+    'PROJECT_PAPER_DELIVERY_COMPILE_MISMATCH');
+    return {
+      sourceSha256: expectedMainSha256,
+      cwd: receipt.cwd,
+      readRoots: receipt.readRoots,
+      pass: 2,
+      logBytes,
+      flsBytes,
+      pdfBytes,
+    };
+  }
+  async function compilePaper(p, args, ctx) {
+    check(texCompiler && typeof texCompiler.compileTex === 'function', 'PROJECT_PAPER_COMPILE_UNAVAILABLE');
+    await authorizeCreator(p, ctx);
+    assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
+    if (deferHistoricalWork === true) await prepareHistory(p, () => authorizeCreator(p, ctx));
+    const authority = { authorize: () => authorizeCreator(p, ctx), guard: () => { assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); } };
+    const manuscript = await resolveAnyManuscript(p, args, authority, 'PROJECT_PAPER_COMPILE_SOURCE_INVALID');
+    const compiled = await texCompiler.compileTex({
+      sourceBytes: manuscript.mainBytes,
+      sourceSha256: manuscript.mainSha256,
+    });
+    await manuscript.assertUnchanged();
+    await authorizeCreator(p, ctx);
+    assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
+    const reportId = `report-${randomUUID()}`;
+    const passed = compiled.ok === true;
+    const receipt = {
+      schemaVersion: 1,
+      kind: 'paper-compile-receipt',
+      projectId: p.meta.projectId,
+      reportId,
+      paperId: manuscript.paperId,
+      manuscriptSelector: { ...manuscript.selector },
+      sourceSha256: manuscript.mainSha256,
+      ledgerSha256: manuscript.ledgerSha256,
+      compileStatus: passed ? 'passed' : 'failed',
+      pass: compiled.pass ?? 2,
+      executable: compiled.executable ?? null,
+      mode: compiled.mode ?? null,
+      version: compiled.version ?? null,
+      cwd: compiled.cwd ?? null,
+      readRoots: Array.isArray(compiled.readRoots) ? [...compiled.readRoots] : [],
+      pdfSha256: passed ? compiled.checked.pdfSha256 : null,
+      pdfBytes: passed ? compiled.checked.pdfBytes : 0,
+      logSha256: hash(compiled.logBytes),
+      flsSha256: passed ? compiled.checked.flsSha256 : null,
+      errorCode: passed ? null : (compiled.errorCode || 'PAPER_COMPILE_FAILED'),
+      message: passed ? null : (compiled.message || 'TeX compilation failed'),
+      compiledAt: Date.now(),
+    };
+    const receiptBytes = Buffer.from(JSON.stringify(receipt, null, 2) + '\n', 'utf8');
+    const dir = directory(p, reportId);
+    await store.mkdir(dir, true);
+    const writeArtifact = async (role, name, bytes, mime) => {
+      const artifact = `${dir}/${name}`;
+      await store.write(artifact, bytes);
+      return { role, name, artifact, mime, bytes: bytes.length, sha256: hash(bytes) };
+    };
+    const artifacts = {};
+    const logMeta = await writeArtifact('log', 'COMPILE_LOG.txt', compiled.logBytes, 'text/plain');
+    artifacts.log = { name: logMeta.name, artifact: logMeta.artifact, mime: logMeta.mime, bytes: logMeta.bytes, sha256: logMeta.sha256 };
+    const receiptMeta = await writeArtifact('receipt', 'COMPILE_RECEIPT.json', receiptBytes, 'application/json');
+    artifacts.receipt = { name: receiptMeta.name, artifact: receiptMeta.artifact, mime: receiptMeta.mime, bytes: receiptMeta.bytes, sha256: receiptMeta.sha256 };
+    let pdfMeta = null;
+    if (passed) {
+      const flsMeta = await writeArtifact('fls', 'main.fls', compiled.flsBytes, 'text/plain');
+      artifacts.fls = { name: flsMeta.name, artifact: flsMeta.artifact, mime: flsMeta.mime, bytes: flsMeta.bytes, sha256: flsMeta.sha256 };
+      pdfMeta = await writeArtifact('pdf', 'main.pdf', compiled.pdfBytes, 'application/pdf');
+      artifacts.pdf = { name: pdfMeta.name, artifact: pdfMeta.artifact, mime: pdfMeta.mime, bytes: pdfMeta.bytes, sha256: pdfMeta.sha256 };
+    }
+    const r = wrap({
+      schemaVersion: 1, projectId: p.meta.projectId, reportId, kind: 'paper-compile',
+      compile: {
+        paperId: manuscript.paperId,
+        compileStatus: passed ? 'passed' : 'failed',
+        mainSha256: manuscript.mainSha256,
+        ledgerSha256: manuscript.ledgerSha256,
+        receiptSha256: receiptMeta.sha256,
+        logSha256: logMeta.sha256,
+        ...(passed ? { pdfSha256: pdfMeta.sha256, flsSha256: artifacts.fls.sha256 } : {}),
+      },
+      artifacts,
+      state: passed ? 'completed' : 'failed',
+      ...(passed ? {} : { error: receipt.errorCode }),
+      language: 'English',
+      creator: copy(p.meta.creator), createdAt: receipt.compiledAt, completedAt: receipt.compiledAt,
+      taskId: null, taskCreating: false, scheduleId: null, scheduleCreating: false, scheduleCleaned: true,
+      nonce: randomBytes(24).toString('hex'), writerStarting: false, writer: null,
+      cleanupPending: false, stopRequested: false, taskSettlement: 'confirmed', delivery: null,
+      sha256: passed ? pdfMeta.sha256 : logMeta.sha256,
+      bytes: passed ? pdfMeta.bytes : logMeta.bytes,
+    });
+    await save(p, r);
+    records.set(key(p, reportId), r);
+    const toStage = passed ? [pdfMeta, logMeta] : [logMeta];
+    const files = [];
+    for (const item of toStage) {
+      const staged = await sdk.resources.stage({ path: store.absolute(item.artifact), name: item.name, mime: item.mime, deliverAs: 'attachment' });
+      const resource = staged?.resource;
+      check(staged?.ok !== false && !staged?.error && resource?.kind === 'session-file'
+        && typeof resource.fileId === 'string' && resource.fileId && typeof p.meta.creator?.sessionId === 'string'
+        && resource.sessionId === p.meta.creator.sessionId, 'PROJECT_REPORT_STAGE_INVALID');
+      files.push({ role: item.role, name: item.name, bytes: item.bytes, sha256: item.sha256,
+        resource: { kind: 'session-file', fileId: resource.fileId, sessionId: resource.sessionId } });
+    }
+    return {
+      projectId: p.meta.projectId,
+      reportId,
+      kind: 'paper-compile',
+      state: r.meta.state,
+      compileStatus: receipt.compileStatus,
+      mainSha256: manuscript.mainSha256,
+      ledgerSha256: manuscript.ledgerSha256,
+      executable: receipt.executable,
+      version: receipt.version,
+      pdfBytes: receipt.pdfBytes,
+      pdfSha256: receipt.pdfSha256,
+      error: receipt.errorCode,
+      logExcerpt: compiled.logExcerpt || '',
+      files,
+    };
+  }
   async function deliver(p, args, ctx, { compileEvidence = null } = {}) {
     args = snapshotPaperDeliveryRequest(args);
     await authorizeCreator(p, ctx);
@@ -2570,9 +2716,11 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     const mathReport = getKind(p, args.mathReviewReportId, { kind: 'paper-math-verification' });
     check(cleanMathCompletion(mathReport), 'PROJECT_PAPER_DELIVERY_REVIEW_INVALID');
     const checkedReview = await readPaperMathReview(p, mathReport);
+    const resolvedCompileEvidence = compileEvidence ?? (args.compileReportId
+      ? await readPaperCompileEvidence(p, args.compileReportId, manuscript.mainSha256) : null);
     const evaluated = evaluatePaperDelivery({
       projectId: p.meta.projectId, manuscript, mathReview: checkedReview.review,
-      compileEvidence, override: args.override ?? null, allowUncompiledTex: args.allowUncompiledTex === true,
+      compileEvidence: resolvedCompileEvidence, override: args.override ?? null, allowUncompiledTex: args.allowUncompiledTex === true,
     });
     if (!evaluated.texDeliverable) return { ...evaluated.manifest, files: [] };
     const deliveryId = `delivery-${randomUUID()}`;
@@ -2585,8 +2733,8 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       ['review', 'MATH_REVIEW.json', checkedReview.bytes, 'application/json'],
       ['manifest', 'DELIVERY_MANIFEST.json', manifestBytes, 'application/json'],
     ];
-    if (evaluated.deliverOk && compileEvidence?.pdfBytes) {
-      deliverables.push(['pdf', 'main.pdf', Buffer.from(compileEvidence.pdfBytes), 'application/pdf']);
+    if (evaluated.deliverOk && resolvedCompileEvidence?.pdfBytes) {
+      deliverables.push(['pdf', 'main.pdf', Buffer.from(resolvedCompileEvidence.pdfBytes), 'application/pdf']);
     }
     const written = [];
     for (const [role, name, bytes, mime] of deliverables) {
@@ -2825,5 +2973,5 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   function dashboardShutdownIdle() {
     return !disposed && active.size === 0 && deferredByProject.size === 0 && damaged.size === 0 && !hasUnopenedHistory();
   }
-  return Object.freeze({ start, status, result, stop, audit, revise, stitch, deliver, chapterTreeStitch, handlesLiterature, invokeLiterature, dispose, dashboardShutdownIdle });
+  return Object.freeze({ start, status, result, stop, audit, revise, stitch, compilePaper, deliver, chapterTreeStitch, handlesLiterature, invokeLiterature, dispose, dashboardShutdownIdle });
 }
