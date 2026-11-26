@@ -14,6 +14,8 @@ for (const [label, findings, verdict] of [
 ]) test(`strict JSON derives ${verdict} from ${label}`, () => {
   assert.deepEqual(parsePaperMathReport(` \n\t${encode(findings, 'Review: "text" and \\command.')}\r\n`),
     { findings, report: 'Review: "text" and \\command.', verdict });
+  assert.deepEqual(parsePaperMathReport(`\`\`\`json\n${encode(findings, 'Fenced review.')}\n\`\`\``),
+    { findings, report: 'Fenced review.', verdict });
 });
 
 test('math review refuses ambiguous or invalid JSON instead of salvaging a verdict', () => {
@@ -23,7 +25,7 @@ test('math review refuses ambiguous or invalid JSON instead of salvaging a verdi
     '{"findings":[],"repor\\u0074":"one","report":"two"}',
     '{"findings":[{"location":"x","issue":"x","cl\\u0061ss":"must-fix","class":"ignorable"}],"report":"x"}',
     '{"findings":[],"report":"\\ud800"}', encode([], '\0'), '{"findings":[],"report":"x",}',
-    `${encode([])}\n${encode([])}`, `\`\`\`json\n${encode([])}\n\`\`\``, `Commentary\n${encode([])}`,
+    `${encode([])}\n${encode([])}`, `Commentary\n\`\`\`json\n${encode([])}\n\`\`\``, `Commentary\n${encode([])}`,
     JSON.stringify({ findings: [], report: 'x', verdict: 'correct' }), encode([[finding]]), encode(null),
     encode([{ ...finding, class: 'critical' }]), encode([{ ...finding, location: 1 }]), encode([{ ...finding, issue: '' }]),
     encode([{ ...finding, file: 'manuscript.tex' }]), encode([{ ...finding, location: '\u00e9'.repeat(2049) }]),

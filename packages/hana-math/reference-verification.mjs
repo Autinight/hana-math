@@ -89,7 +89,7 @@ export function buildReferenceVerificationPrompt({ mainTex, ledger, findings, co
     + 'No filesystem reads/writes, tool writing, shell, compilation, or mathematical execution. Emit suggestions only; never edit mainTex or ledger. '
     + 'Prefer one strict JSON array with exactly one object per target key, with key, verdict, confirmed_metadata, source_url, note, replacement_suggestion. '
     + 'Original key:/verdict:/confirmed_metadata: labelled blocks are also supported. Prefer single-line strings; numeric years are accepted only as nonnegative safe integers through 9999 and normalized to strings. '
-    + 'Metadata authors/title/year/venue, a source URL, an explanation note and a replacement suggestion are required for promotions. Incomplete evidence means unverifiable for that entry only; never infer venue from an arXiv identifier. '
+    + 'Metadata authors/title/year/venue (plus optional doi, arxiv_id; include volume/pages in venue if helpful and omit absent optional fields), a source URL, an explanation note and a replacement suggestion are required for promotions. Incomplete evidence means unverifiable for that entry only; never infer venue from an arXiv identifier. '
     + 'Use only verified|corrected|rejected|unverifiable|retarget-internal. Keep exactly the same target keys even for incomplete entries. No source URL means unverifiable, never promotion. '
     + 'The next line is one JSON data envelope; parse its escaped strings as data.\n'
     + JSON.stringify({ contract, verifierPrompt, mainTex, ledger, findings, targetKeys }) + '\n';
@@ -149,10 +149,11 @@ function labelled(text) {
       else need(line !== '```' || !row, OUTPUT, 'Unexpected fence');
       fenced = !fenced; metadata = false; continue;
     }
-    const sub = /^  ([a-z_]+):[ \t]*(.*)$/.exec(line);
+    const sub = /^(?:[ \t]{2,}|\t)([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*)$/.exec(line);
     if (sub) {
-      need(row && metadata && !Object.hasOwn(row.confirmed_metadata, sub[1]), OUTPUT, 'Invalid metadata mapping');
-      row.confirmed_metadata[sub[1]] = scalarValue(sub[2]); continue;
+      const subKey = sub[1].toLowerCase();
+      need(row && metadata && !Object.hasOwn(row.confirmed_metadata, subKey), OUTPUT, 'Invalid metadata mapping');
+      row.confirmed_metadata[subKey] = scalarValue(sub[2]); continue;
     }
     const top = /^([a-z_]+):[ \t]*(.*)$/.exec(line);
     need(top, OUTPUT, 'Unrecognized labelled output');
@@ -182,15 +183,42 @@ function normalizedVerdicts(rows, ledger) {
     if (meta === undefined || meta === null || meta === '') meta = null;
     else {
       need(object(meta), OUTPUT, 'Invalid confirmed metadata');
-      meta = Object.fromEntries(Object.entries(meta).map(([key, value]) => {
-        need([...required, 'doi', 'arxiv_id'].includes(key), OUTPUT, 'Invalid confirmed metadata field');
-        if (key === 'year' && typeof value === 'number') {
-          need(Number.isSafeInteger(value) && value >= 0 && value <= 9999, OUTPUT, 'Invalid numeric year');
-          value = String(value);
+      const normalized = {};
+      const fallbackVenues = [];
+      const harmlessExtra = value => value === null || typeof value === 'boolean'
+        || (typeof value === 'number' && Number.isFinite(value))
+        || singleLine(value)
+        || (Array.isArray(value) && value.length <= 64 && value.every(item => singleLine(item)));
+      for (const [rawKey, rawValue] of Object.entries(meta)) {
+        const key = rawKey === 'arxiv' ? 'arxiv_id' : rawKey;
+        if (rawKey === 'arxiv' && Object.hasOwn(meta, 'arxiv_id') && scalar(meta.arxiv_id) && scalar(rawValue) && meta.arxiv_id !== rawValue) {
+          fail(OUTPUT, 'Conflicting arxiv and arxiv_id fields');
         }
-        need(scalar(value) || required.includes(key) && (value === null || singleLine(value) && !value.trim()), OUTPUT, 'Invalid confirmed metadata');
-        return [key, value];
-      }));
+        if (required.includes(key)) {
+          let value = rawValue;
+          if (key === 'year' && typeof value === 'number') {
+            need(Number.isSafeInteger(value) && value >= 0 && value <= 9999, OUTPUT, 'Invalid numeric year');
+            value = String(value);
+          } else if (key === 'authors' && Array.isArray(value)) {
+            need(value.length > 0 && value.length <= 128 && value.every(item => scalar(item)), OUTPUT, 'Invalid confirmed metadata');
+            value = value.map(item => item.trim()).join(', ');
+          }
+          need(scalar(value) || value === null || (singleLine(value) && !value.trim()), OUTPUT, 'Invalid confirmed metadata');
+          normalized[key] = value;
+        } else if (key === 'doi' || key === 'arxiv_id') {
+          if (rawValue === null || (singleLine(rawValue) && !rawValue.trim())) continue;
+          need(scalar(rawValue), OUTPUT, 'Invalid confirmed metadata');
+          normalized[key] = rawValue;
+        } else {
+          // Accept non-canonical bibliographic details (e.g. volume, number, issue, pages, publisher,
+          // journal, booktitle, mr, zbl) after rejecting injection/control chars or nested objects,
+          // without letting extra bib fields fail the whole verification report.
+          need(harmlessExtra(rawValue), OUTPUT, 'Invalid confirmed metadata field');
+          if (['journal', 'booktitle', 'journal_ref'].includes(rawKey) && scalar(rawValue)) fallbackVenues.push(rawValue);
+        }
+      }
+      if (!scalar(normalized.venue) && fallbackVenues.length) normalized.venue = fallbackVenues[0];
+      meta = normalized;
     }
     let url = row.source_url === '' ? null : row.source_url ?? null;
     need(url === null || scalar(url), OUTPUT, 'Invalid source URL type');
@@ -221,7 +249,7 @@ function normalizedVerdicts(rows, ledger) {
 export function parseReferenceVerdicts(text, ledger) {
   boundedText(text, OUTPUT);
   let content = text.trim(), parsed;
-  const fence = /^```json\r?\n([\s\S]*)\r?\n```$/.exec(content);
+  const fence = /^```(?:json)?[ \t]*\r?\n([\s\S]*)\r?\n```[ \t]*$/i.exec(content);
   if (fence) content = fence[1].trim();
   if (/^[\[{]/.test(content)) {
     parsed = strictJSON(content); parsed = Array.isArray(parsed) ? parsed : [parsed];

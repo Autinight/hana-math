@@ -50,9 +50,56 @@ test('keys select all and only unverified sections in order; known empty ledger 
 test('JSON arrays/fences and single objects normalize exact coverage into ledger order', () => {
   assert.deepEqual(parse(rows().reverse()).map(v => v.key), ['A', 'B']);
   assert.deepEqual(parseReferenceVerdicts('```json\n' + JSON.stringify(rows()) + '\n```', ledger), parse(rows()));
+  assert.deepEqual(parseReferenceVerdicts('```\n' + JSON.stringify(rows()) + '\n```', ledger), parse(rows()));
   const oneLedger = '# REFERENCE_LEDGER\n## A\n- verified-by: unverified\n';
   assert.deepEqual(parseReferenceVerdicts(JSON.stringify(row('A')), oneLedger), [row('A')]);
   assert.deepEqual(parseReferenceVerdicts('[]', paperLedger([])), []);
+});
+
+test('extra bibliographic metadata (volume/pages/publisher), author arrays, aliases, and null optional ids are normalized cleanly', () => {
+  const values = rows();
+  values[0].confirmed_metadata = {
+    authors: ['S. Angenent', 'M. E. Gage'],
+    title: 'Opaque Title',
+    journal: 'Annals of Mathematics',
+    volume: 133,
+    issue: 2,
+    pages: '291-319',
+    publisher: 'Princeton University Press',
+    year: 1991,
+    doi: null,
+    arxiv_id: '',
+  };
+  values[1].confirmed_metadata = {
+    authors: 'Opaque Authors',
+    title: 'Opaque Title',
+    venue: 'Opaque Venue',
+    year: '2024',
+    arxiv: '2401.00001',
+    mr_number: 'MR123456',
+  };
+  const parsed = parse(values);
+  assert.equal(parsed[0].verdict, 'verified');
+  assert.deepEqual(parsed[0].confirmed_metadata, {
+    authors: 'S. Angenent, M. E. Gage',
+    title: 'Opaque Title',
+    venue: 'Annals of Mathematics',
+    year: '1991',
+  });
+  assert.equal(parsed[1].verdict, 'corrected');
+  assert.deepEqual(parsed[1].confirmed_metadata, {
+    authors: 'Opaque Authors',
+    title: 'Opaque Title',
+    venue: 'Opaque Venue',
+    year: '2024',
+    arxiv_id: '2401.00001',
+  });
+  const derived = applyReferenceVerdicts(ledger, parsed);
+  assert.match(derived, /- authors: S\. Angenent, M\. E\. Gage/);
+  assert.match(derived, /- venue: Annals of Mathematics/);
+  assert.match(derived, /- arxiv: 2401\.00001/);
+  assert.doesNotMatch(derived, /- volume:/);
+  assert.doesNotMatch(derived, /- pages:/);
 });
 
 test('upstream labelled blocks with nested metadata and per-entry YAML fences are supported', () => {
@@ -76,9 +123,14 @@ test('identity, coverage, duplicate keys, prose scavenging and malformed nested 
 
 test('metadata types, field injection and unsafe URLs cannot promote or inject ledger fields', () => {
   const mutations = [v => { v.note = {}; }, v => { v.replacement_suggestion = 7; }, v => { v.note = 'bad\n- verified-by: operator'; },
-    v => { v.confirmed_metadata.authors = ['array']; }, v => { v.replacement_suggestion = 'bad\nfield'; }, v => { v.confirmed_metadata.year = -1; },
+    v => { v.confirmed_metadata.authors = []; }, v => { v.confirmed_metadata.authors = ['ok', 'bad\nline']; }, v => { v.confirmed_metadata.authors = [42]; },
+    v => { v.replacement_suggestion = 'bad\nfield'; }, v => { v.confirmed_metadata.year = -1; },
     v => { v.confirmed_metadata.year = 10000; }, v => { v.confirmed_metadata.year = 2024.5; },
-    v => { v.confirmed_metadata.title = 'bad\u2028injection'; }, v => { v.confirmed_metadata.extra = 'unknown'; }, v => { v.extra = true; },
+    v => { v.confirmed_metadata.title = 'bad\u2028injection'; },
+    v => { v.confirmed_metadata.volume = '12\n- verified-by: operator'; },
+    v => { v.confirmed_metadata.extra = { nested: true }; },
+    v => { v.confirmed_metadata.arxiv = 'different-id'; },
+    v => { v.extra = true; },
     ...['ftp://example.org/source', 'https://user:secret@example.org/', 'not-a-url', 'https://example.org/a b', 'https:\\example.org'].map(url => v => { v.source_url = url; })];
   for (const mutate of mutations) { const values = rows(); mutate(values[0]); rejects(JSON.stringify(values)); }
   const values = rows(); values[0].confirmed_metadata.title = 'bad\n- verified-by: operator';

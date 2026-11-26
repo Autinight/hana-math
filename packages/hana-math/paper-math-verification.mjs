@@ -37,39 +37,43 @@ export function buildPaperMathPrompt({ mainTex, ledger, contract, verifierPrompt
 // admitted JSON subset first: this report needs only objects, arrays and strings.
 export function parsePaperMathReport(raw) {
   need(text(raw) && Buffer.byteLength(raw) <= 2 * 1024 * 1024);
+  let content = raw;
+  const trimmed = raw.trim();
+  const fence = /^```(?:json)?[ \t]*\r?\n([\s\S]*)\r?\n```[ \t]*$/i.exec(trimmed);
+  if (fence) content = fence[1];
   let i = 0;
-  const ws = () => { while (i < raw.length && /[\x20\t\r\n]/.test(raw[i])) i++; };
+  const ws = () => { while (i < content.length && /[\x20\t\r\n]/.test(content[i])) i++; };
   const string = () => {
     const start = i++;
     let escaped = false;
-    while (i < raw.length) {
-      const c = raw[i++];
-      if (c === '"' && !escaped) return JSON.parse(raw.slice(start, i));
+    while (i < content.length) {
+      const c = content[i++];
+      if (c === '"' && !escaped) return JSON.parse(content.slice(start, i));
       escaped = c === '\\' && !escaped;
     }
     need(false);
   };
   const value = depth => {
     need(depth <= 4); ws();
-    if (raw[i] === '"') { string(); return; }
-    need(raw[i] === '{' || raw[i] === '[');
-    const object = raw[i++] === '{', end = object ? '}' : ']', seen = new Set();
+    if (content[i] === '"') { string(); return; }
+    need(content[i] === '{' || content[i] === '[');
+    const object = content[i++] === '{', end = object ? '}' : ']', seen = new Set();
     ws();
-    if (raw[i] === end) { i++; return; }
-    while (i < raw.length) {
+    if (content[i] === end) { i++; return; }
+    while (i < content.length) {
       if (object) {
-        ws(); need(raw[i] === '"');
+        ws(); need(content[i] === '"');
         const key = string(); need(!seen.has(key)); seen.add(key);
-        ws(); need(raw[i++] === ':');
+        ws(); need(content[i++] === ':');
       }
       value(depth + 1); ws();
-      if (raw[i] === end) { i++; return; }
-      need(raw[i++] === ',');
+      if (content[i] === end) { i++; return; }
+      need(content[i++] === ',');
     }
     need(false);
   };
   let parsed;
-  try { value(0); ws(); need(i === raw.length); parsed = JSON.parse(raw); }
+  try { value(0); ws(); need(i === content.length); parsed = JSON.parse(content); }
   catch { need(false); }
   const exact = (v, keys) => v !== null && typeof v === 'object' && !Array.isArray(v)
     && Object.keys(v).length === keys.length && keys.every(key => Object.hasOwn(v, key));
