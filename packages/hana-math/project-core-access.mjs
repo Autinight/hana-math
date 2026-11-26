@@ -2,7 +2,7 @@
 // Task completion is resource accounting, never a mathematical verdict.
 import { randomUUID, createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
-import { runtimeFailureInfo, runtimeManagedIpcRefusal, takeProjectReadScratch, takeDashboardBusyFrame, projectReadScratchOptions, projectDashboardFactgraphOptions,
+import { runtimeFailureInfo, runtimeManagedIpcRefusal, takeProjectReadScratch, takeDashboardBusyFrame, takeDashboardGraphFallbackFrame, projectReadScratchOptions, projectDashboardFactgraphOptions,
   projectDashboardMemoryOptions, projectDashboardViewOptions, validProjectDashboardMemorySelection,
   validProjectDashboardReadArguments } from './runtime/research-runtime.mjs';
 import { GRAPH_FACT_LIMIT, GRAPH_EDGE_LIMIT } from './project-graph.mjs';
@@ -23,11 +23,17 @@ export function acceptDashboardViewRead(access, value) {
 }
 // Unlike successful readbacks, these receipts carry no value. Only this exact
 // durably failed operation can rearm the frame for a later authorized call.
-const settledDashboardBusy = new WeakMap();
+const settledDashboardBusy = new WeakMap(), settledDashboardGraphFallback = new WeakMap();
 export function acceptDashboardViewBusy(access, error) {
   const proof = settledDashboardBusy.get(error);
   if (!proof || proof.access !== access) return false;
   settledDashboardBusy.delete(error);
+  return proof.release() === true;
+}
+export function acceptDashboardViewGraphFallback(access, error) {
+  const proof = settledDashboardGraphFallback.get(error);
+  if (!proof || proof.access !== access) return false;
+  settledDashboardGraphFallback.delete(error);
   return proof.release() === true;
 }
 const reportedIpcRefusals = new WeakMap();
@@ -105,8 +111,34 @@ function dashboardEnvelope(result, projectId, terminal, fields) {
     && (!terminal || typeof result.inventoryRevision === 'string' && result.inventoryRevision.length === 64
       && /^[a-f0-9]{64}$/.test(result.inventoryRevision)), 'PROJECT_CORE_INVALID_RESULT');
 }
-function dashboardResult(value, projectId, terminal) {
-  const result = copyOperation(DASHBOARD_OPERATION, value), graph = result?.graph;
+function dashboardResult(value, projectId, terminal, input = {}) {
+  const result = copyOperation(DASHBOARD_OPERATION, value);
+  if (input?.mode === 'index') {
+    const page = result?.page;
+    dashboardEnvelope(result, projectId, terminal, ['asOf', 'page', 'projectId']);
+    check(typeof result.asOf === 'string' && /^[a-f0-9]{64}$/.test(result.asOf)
+      && object(page) && Object.keys(page).sort().join(',') === 'has_more,max_depth,next_offset,nodes,offset,returned,total_edges,total_nodes'
+      && Array.isArray(page.nodes) && page.nodes.length === page.returned
+      && Number.isSafeInteger(page.total_nodes) && page.total_nodes >= 0 && page.total_nodes <= GRAPH_FACT_LIMIT
+      && Number.isSafeInteger(page.total_edges) && page.total_edges >= 0 && page.total_edges <= GRAPH_EDGE_LIMIT
+      && Number.isSafeInteger(page.offset) && page.offset >= 0
+      && Number.isSafeInteger(page.max_depth) && page.max_depth >= 0
+      && typeof page.has_more === 'boolean'
+      && (page.has_more ? Number.isSafeInteger(page.next_offset) && page.next_offset > page.offset : page.next_offset === null),
+    'PROJECT_CORE_INVALID_RESULT');
+    return result;
+  }
+  if (input?.mode === 'fact') {
+    const detail = result?.fact;
+    dashboardEnvelope(result, projectId, terminal, ['asOf', 'fact', 'projectId']);
+    check(typeof result.asOf === 'string' && /^[a-f0-9]{64}$/.test(result.asOf)
+      && object(detail) && Object.keys(detail).sort().join(',') === 'author,depth,id,intuition,predecessors,problem_id,proof,statement'
+      && typeof detail.id === 'string' && /^[a-f0-9]{16}$/.test(detail.id)
+      && typeof detail.statement === 'string' && typeof detail.proof === 'string'
+      && Array.isArray(detail.predecessors), 'PROJECT_CORE_INVALID_RESULT');
+    return result;
+  }
+  const graph = result?.graph;
   dashboardEnvelope(result, projectId, terminal, ['asOf', 'graph', 'projectId']);
   check(typeof result.asOf === 'string' && /^[a-f0-9]{64}$/.test(result.asOf)
     && object(graph) && Object.keys(graph).sort().join(',') === 'edges,max_depth,nodes'
@@ -370,7 +402,7 @@ export function createProjectCoreAccess(sdk, { projectId, author, createCore, on
           return coreAttempt;
         }).then((value) => {
           let result; try {
-            result = dashboard ? dashboardResult(value, projectId, Object.hasOwn(input, 'terminal'))
+            result = dashboard ? dashboardResult(value, projectId, Object.hasOwn(input, 'terminal'), input)
               : memory ? dashboardMemoryResult(value, projectId, input) : jsonCopy(value);
           } catch (cause) { throw fail('PROJECT_CORE_INVALID_RESULT', cause); }
           if (captureScratch) rawValue = value;
@@ -411,6 +443,10 @@ export function createProjectCoreAccess(sdk, { projectId, author, createCore, on
       && s.meta.taskStatus === 'failed' && s.meta.settlement.expected === 'failed' && s.meta.settlement.confirmed && s.meta.cleanup.confirmed) {
       const release = takeDashboardBusyFrame(s.core, coreAttempt, operation, primary);
       if (release) settledDashboardBusy.set(error, { access, release });
+      else {
+        const graphRelease = takeDashboardGraphFallbackFrame(s.core, coreAttempt, operation, primary);
+        if (graphRelease) settledDashboardGraphFallback.set(error, { access, release: graphRelease });
+      }
     }
     throw error;
   }

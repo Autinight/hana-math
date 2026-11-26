@@ -85,7 +85,9 @@ export function startDashboard(hana, { request, documentPreview = false, livePre
   }
   function startWorkspace(id) {
     let monitor, retryTimer, retry = false, wasHidden = document.hidden;
-    const workspace = mountWorkspaceDashboard((tab, channel) => monitor?.select(tab, channel));
+    const workspace = mountWorkspaceDashboard((tab, channel) => monitor?.select(tab, channel), {
+      fetchFact: factId => monitor?.readFact(factId),
+    });
     workspace.status({ state: 'pending', text: '正在确认研究状态' });
     function cancelRetry() {
       if (retryTimer !== undefined) clearTimeout(retryTimer);

@@ -43,6 +43,8 @@ function matchesSelection(selection, data) {
   switch (selection.view) {
     case 'overview': return ['channel_counts', 'facts_by_author', 'verdicts'].every(key => record(data[key]));
     case 'factgraph': return Array.isArray(data.nodes) && Array.isArray(data.edges);
+    case 'fact': return typeof data.id === 'string' && data.id === selection.factId
+      && typeof data.statement === 'string' && typeof data.proof === 'string' && Array.isArray(data.predecessors);
     case 'channels': return Array.isArray(data.channels);
     case 'channel': return Array.isArray(data.entries);
     default: return false;
@@ -50,6 +52,7 @@ function matchesSelection(selection, data) {
 }
 
 export function registerWorkspaceDashboardRoutes(app, dashboard) {
+  const FACT_PATH = new RegExp(`^${PREFIX}/api/fact/([0-9a-f]{16})$`);
   function register(path, selection) {
     app.get(path, async c => {
       const request = c.req.raw, signal = request.signal;
@@ -61,17 +64,24 @@ export function registerWorkspaceDashboardRoutes(app, dashboard) {
       if (!guard()) return packet(unavailable, 403);
       const url = new URL(request.url);
       if (request.method !== 'GET') return packet(unavailable, 405);
-      if (url.pathname !== path || url.search || request.body !== null) return packet(unavailable, 400);
+      let resolvedSelection = selection;
+      if (path === `${PREFIX}/api/fact/:factId`) {
+        const match = FACT_PATH.exec(url.pathname);
+        if (!match || url.search || request.body !== null) return packet(unavailable, 400);
+        resolvedSelection = Object.freeze({ view: 'fact', factId: match[1] });
+      } else if (url.pathname !== path || url.search || request.body !== null) {
+        return packet(unavailable, 400);
+      }
       const generation = request.headers.get(GENERATION);
-      if (selection ? !generationId(generation) : generation !== null) return packet(unavailable, 400);
+      if (resolvedSelection ? !generationId(generation) : generation !== null) return packet(unavailable, 400);
       if (typeof dashboard?.current !== 'function' || typeof dashboard?.read !== 'function') return packet(unavailable, 503);
       try {
-        const result = selection ? await dashboard.read(selection, generation, guard) : await dashboard.current(guard);
+        const result = resolvedSelection ? await dashboard.read(resolvedSelection, generation, guard) : await dashboard.current(guard);
         if (!guard()) return packet(unavailable, 403);
-        if (!selection) return currentPacket(result);
+        if (!resolvedSelection) return currentPacket(result);
         if (result === workspaceProjectBusy) return packet(busy, 409);
         if (result?.state === 'unavailable') return packet(unavailable, 409);
-        return matchesSelection(selection, result) ? packet(result) : packet(unavailable, 503);
+        return matchesSelection(resolvedSelection, result) ? packet(result) : packet(unavailable, 503);
       } catch {
         // Do not serialize reader exceptions, recover data, or fall back to
         // an unbound Project/creator read after a failed guard.
@@ -81,4 +91,5 @@ export function registerWorkspaceDashboardRoutes(app, dashboard) {
   }
   register(`${PREFIX}/current`, null);
   for (const path of livePaths) register(`${PREFIX}${path}`, dashboardSelection(path));
+  register(`${PREFIX}/api/fact/:factId`, null);
 }

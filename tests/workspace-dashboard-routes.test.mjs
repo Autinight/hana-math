@@ -65,7 +65,7 @@ const header = { [generation]: scope.generation };
 test('one awaited panel registrar adds only discovery and the fixed Danus GET paths', async () => {
   const f = await routes();
   assert.deepEqual([...f.handlers.keys()].filter(x => x.includes(prefix)),
-    ['/current', ...livePaths].map(path => `GET ${prefix}${path}`));
+    ['/current', ...livePaths, '/api/fact/:factId'].map(path => `GET ${prefix}${path}`));
   assert.ok(f.handlers.has(`GET ${LIVE_ACTIVATE}`));
   assert.ok(livePaths.every(path => f.handlers.has(`GET ${LIVE_ROUTE}${path}`)));
   await checked(await f.send(`${prefix}/current`), 200, scope);

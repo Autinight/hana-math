@@ -104,7 +104,7 @@ async function json(root, file, max = LIMIT, owned = false, observeFile, windows
   try { return await read(handle); } finally { await handle.close(); }
 }
 // Private evidence for the original request, independent of ids and disk markers.
-const completedReadScratch = new WeakMap(), completedDashboardBusy = new WeakMap(), projectScratchOptions = new WeakSet();
+const completedReadScratch = new WeakMap(), completedDashboardBusy = new WeakMap(), completedDashboardGraphFallback = new WeakMap(), projectScratchOptions = new WeakSet();
 const dashboardOptions = new WeakSet(), dashboardMemoryOptions = new WeakSet(), dashboardViewOptions = new WeakMap();
 const dashboardKinds = new Set(['conclusion', 'example', 'counterexample', 'proof_attempt', 'plan', 'direction',
   'obstacle', 'dead_end', 'verification', 'elaboration', 'master_guidance']);
@@ -117,13 +117,30 @@ export function validProjectDashboardMemorySelection(args) {
 }
 // Terminal is an internal view argument, never a member of a public selection.
 // Callers here have already validated the argument object as plain JSON.
+const FACT_ID = /^[0-9a-f]{16}$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 export function validProjectDashboardReadArguments(operation, args, allowTerminal) {
   let keys = Reflect.ownKeys(args);
   if (keys.includes('terminal')) {
     if (!allowTerminal || args.terminal !== true) return false;
     keys = keys.filter(key => key !== 'terminal');
   }
-  if (operation === 'dashboard_factgraph') return keys.length === 0;
+  if (operation === 'dashboard_factgraph') {
+    if (keys.length === 0) return true;
+    if (args.mode === 'index') {
+      if (!keys.every(k => ['mode', 'offset', 'limit', 'asOf'].includes(k))) return false;
+      const offset = args.offset ?? 0, limit = args.limit ?? 512;
+      return Number.isSafeInteger(offset) && offset >= 0 && offset < 4096
+        && Number.isSafeInteger(limit) && limit >= 1 && limit <= 1024
+        && (args.asOf === undefined || typeof args.asOf === 'string' && SHA256_HEX.test(args.asOf));
+    }
+    if (args.mode === 'fact') {
+      return keys.every(k => ['mode', 'factId', 'asOf'].includes(k))
+        && typeof args.factId === 'string' && FACT_ID.test(args.factId)
+        && (args.asOf === undefined || typeof args.asOf === 'string' && SHA256_HEX.test(args.asOf));
+    }
+    return false;
+  }
   return operation === 'dashboard_memory' && validDashboardMemoryKeys(args, keys);
 }
 // Only internal ProjectCoreAccess mints this; a model argument or a copy of
@@ -222,6 +239,16 @@ export function takeDashboardBusyFrame(bridge, attempt, operation, error) {
     return rearm?.() ?? false;
   };
 }
+export function takeDashboardGraphFallbackFrame(bridge, attempt, operation, error) {
+  const proof = completedDashboardGraphFallback.get(attempt);
+  if (!proof || proof.bridge !== bridge || proof.operation !== operation || proof.error !== error) return null;
+  completedDashboardGraphFallback.delete(attempt);
+  let accept = proof.accept;
+  return () => {
+    const rearm = accept; accept = null;
+    return rearm?.() ?? false;
+  };
+}
 function exactKeys(value, keys) {
   return object(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 }
@@ -231,6 +258,14 @@ function dashboardBusyEnvelope(envelope) {
   return exactKeys(envelope, ['schemaVersion', 'requestId', 'ok', 'error'])
     && exactKeys(envelope.error, ['code', 'message'])
     && envelope.error.code === 'busy' && envelope.error.message === 'project is busy';
+}
+function dashboardFactgraphFallbackEnvelope(operation, envelope) {
+  // Clean pre-mutation Core refusal for large fact-graph pagination fallback or page drift.
+  return operation === 'dashboard_factgraph'
+    && exactKeys(envelope, ['schemaVersion', 'requestId', 'ok', 'error'])
+    && exactKeys(envelope.error, ['code', 'message'])
+    && (envelope.error.code === 'size_limit' || envelope.error.code === 'fact_page_changed')
+    && typeof envelope.error.message === 'string' && envelope.error.message.length > 0 && envelope.error.message.length <= 256;
 }
 // Only local admission faults can mint this evidence for the exact call promise.
 const ipcRefusals = new WeakMap();
@@ -747,7 +782,7 @@ export function createResearchRuntime(sdk, { packageRoot = ROOT, platform = proc
   async function execute(s, request, signal) {
     const race = (p) => Promise.race([p, s.interrupted]);
     const abort = () => s.cancel(fault('CANCELLED', 'Host cancelled research call'));
-    let timer, scratchValue, busyError;
+    let timer, scratchValue, busyError, graphFallbackError;
     s.preparing = true;
     try {
       if (disposed) throw fault('DISPOSED', 'Bridge disposed');
@@ -838,7 +873,10 @@ export function createResearchRuntime(sdk, { packageRoot = ROOT, platform = proc
         e.indeterminate = envelope.error?.mutationState === 'indeterminate';
         const diagnostic = checkedDiagnostic(member(envelope, 'diagnostic'), member(envelope.error, 'code'), s.operation);
         if (diagnostic && !s.cancelled) checkedRejections.set(e, { requestId: s.requestId, operation: s.operation, value: diagnostic });
-        if (s.viewGuard && s.frame && s.finalGetExited && final.signal == null && dashboardBusyEnvelope(envelope)) busyError = e;
+        if (s.viewGuard && s.frame && s.finalGetExited && final.signal == null) {
+          if (dashboardBusyEnvelope(envelope)) busyError = e;
+          else if (dashboardFactgraphFallbackEnvelope(s.operation, envelope)) graphFallbackError = e;
+        }
         throw e;
       }
       if (!Object.hasOwn(envelope, 'result')) throw fault('INVALID_RESULT', 'Missing result');
@@ -861,6 +899,8 @@ export function createResearchRuntime(sdk, { packageRoot = ROOT, platform = proc
           // Leave the pinned frame waiting for validation; taking evidence
           // alone does not rearm it and never changes the failed outcome.
           completedDashboardBusy.set(s.invocation.promise, { bridge: s.invocation.bridge, operation: s.operation, error: busyError, accept: s.frame.accept });
+        } else if (settled && graphFallbackError && s.error === graphFallbackError) {
+          completedDashboardGraphFallback.set(s.invocation.promise, { bridge: s.invocation.bridge, operation: s.operation, error: graphFallbackError, accept: s.frame.accept });
         } else s.frame.fence();
       }
       if (!s.error && !result.confirmed) {

@@ -240,11 +240,20 @@ test('operator-notes unknown or unconfirmed creation never recreates, and old ci
   });
 });
 
-test('operator-notes writer mode is explicit and valid only on paper-revision', async t => {
+test('operator-notes, gap-fill and compile-fix writer modes are explicit and valid only on paper-revision', async t => {
   const f = await fixture(t);
-  for (const value of [null, '', 'citation', 'style', 'gap-fill']) await assert.rejects(f.writer.start({ ...revision, revisionMode: value }), { code: 'PROJECT_INVALID_INPUT' });
-  for (const kind of [undefined, 'paper-source', 'reference-audit', 'reference-verification']) await assert.rejects(f.writer.start({ ...input, kind, revisionMode: 'operator-notes' }), { code: 'PROJECT_INVALID_INPUT' });
+  for (const value of [null, '', 'citation', 'style', 'unknown']) await assert.rejects(f.writer.start({ ...revision, revisionMode: value }), { code: 'PROJECT_INVALID_INPUT' });
+  for (const mode of ['operator-notes', 'gap-fill', 'compile-fix']) {
+    for (const kind of [undefined, 'paper-source', 'reference-audit', 'reference-verification']) {
+      await assert.rejects(f.writer.start({ ...input, kind, revisionMode: mode }), { code: 'PROJECT_INVALID_INPUT' });
+    }
+  }
   assert.deepEqual(f.calls, []);
+  await f.writer.start({ ...revision, revisionMode: 'gap-fill' });
+  await f.writer.start({ ...revision, revisionMode: 'compile-fix' });
+  assert.equal((await registry(f, 'paper-gap-fill-revision-registry.json')).state, 'created');
+  assert.equal((await registry(f, 'paper-compile-fix-revision-registry.json')).state, 'created');
+  assert.equal(f.starts.every(s => s.toolless === true && s.toolNames.length === 0), true);
 });
 
 test('reference auditor has a distinct private identity, registry and session role', async t => {

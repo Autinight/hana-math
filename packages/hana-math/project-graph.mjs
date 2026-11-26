@@ -1,6 +1,6 @@
 import { validateFactPage } from './fact-page.mjs';
 
-export const GRAPH_FACT_LIMIT = 2048, GRAPH_EDGE_LIMIT = 32768, GRAPH_PAGE_LIMIT = 128;
+export const GRAPH_FACT_LIMIT = 4096, GRAPH_EDGE_LIMIT = 32768, GRAPH_PAGE_LIMIT = 256;
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 
 // Reads through the caller's authorized ProjectService.result, never raw stores.

@@ -418,16 +418,47 @@ def fact_list_page(root, project_id, args, *, _inventory=None):
         rows.pop()
 
 
-def _dashboard_factgraph(root, project_id, shared_files):
+def _dashboard_factgraph(root, project_id, shared_files, args=None):
     # Deferred import: the pure adapter already shares this module's budgets.
-    from .dashboard_factgraph import FactgraphSizeLimit, build_factgraph
+    from .dashboard_factgraph import (
+        FactgraphSizeLimit, build_factgraph, build_factgraph_fact, build_factgraph_index_page,
+    )
 
+    args = args or {}
+    mode = args.get('mode')
     ids = _fact_ids(root, shared_files if _win else None)
-    require(len(ids) <= 2048, 'size_limit', 'dashboard fact index exceeds 2048 facts')
+    if mode is None:
+        require(len(ids) <= 2048, 'size_limit', 'dashboard fact index exceeds 2048 facts')
+    else:
+        require(len(ids) <= MAX_TREE_FILES, 'size_limit', f'dashboard fact index exceeds {MAX_TREE_FILES} facts')
     visible = sorted(p.stem for p in shared_files
                      if p.parent == Path('fact_graph/facts') and p.suffix == '.md')
     require(ids == visible, 'invalid_fact', 'fact index differs from project observation')
     hashes = []
+
+    if mode == 'fact':
+        fid = args['factId']
+        expected_as_of = args.get('asOf')
+        if expected_as_of is not None:
+            for item_id in ids:
+                _, digest = fact(root, item_id, _inventory=shared_files)
+                hashes.append([item_id, digest])
+            current_as_of = fact_index_as_of(project_id, hashes)
+            require(current_as_of == expected_as_of, 'fact_page_changed', 'factgraph observation changed')
+        else:
+            for item_id in ids:
+                _, digest = fact(root, item_id, _inventory=shared_files)
+                hashes.append([item_id, digest])
+            current_as_of = fact_index_as_of(project_id, hashes)
+        require(fid in ids, 'not_found', 'fact not found in current graph observation')
+        value, _ = fact(root, fid, _inventory=shared_files)
+        try:
+            detail = build_factgraph_fact(value)
+        except FactgraphSizeLimit as error:
+            raise Rejected('size_limit', str(error)) from None
+        except ValueError:
+            raise Rejected('invalid_fact', 'canonical dashboard fact input is inconsistent') from None
+        return {'projectId': project_id, 'asOf': current_as_of, 'fact': detail}
 
     def records():
         edges = 0
@@ -437,6 +468,24 @@ def _dashboard_factgraph(root, project_id, shared_files):
             require(edges <= 32768, 'size_limit', 'dashboard fact index exceeds 32768 edges')
             hashes.append([fid, digest])
             yield value
+
+    if mode == 'index':
+        all_records = list(records())
+        current_as_of = fact_index_as_of(project_id, hashes)
+        expected_as_of = args.get('asOf')
+        if expected_as_of is not None:
+            require(current_as_of == expected_as_of, 'fact_page_changed', 'factgraph observation changed')
+        try:
+            page = build_factgraph_index_page(
+                all_records,
+                offset=args.get('offset', 0),
+                limit=args.get('limit', 512),
+            )
+        except FactgraphSizeLimit as error:
+            raise Rejected('size_limit', str(error)) from None
+        except ValueError:
+            raise Rejected('invalid_request', 'invalid factgraph index request') from None
+        return {'projectId': project_id, 'asOf': current_as_of, 'page': page}
 
     try:
         graph = build_factgraph(records())
@@ -477,7 +526,23 @@ def validate_operation(op, args, role):
             require(args['terminal'] is True, message='terminal must be true')
             args = {key: value for key, value in args.items() if key != 'terminal'}
         if op == 'dashboard_factgraph':
-            fields(args, set())
+            if 'mode' not in args:
+                fields(args, set())
+            elif args['mode'] == 'index':
+                fields(args, {'mode', 'offset', 'limit', 'asOf'}, {'mode'})
+                offset = args.get('offset', 0)
+                limit = args.get('limit', 512)
+                require(type(offset) is int and 0 <= offset < MAX_TREE_FILES, message='invalid factgraph offset')
+                require(type(limit) is int and 1 <= limit <= 1024, message='invalid factgraph limit')
+                if 'asOf' in args:
+                    require(matches(SHA, args['asOf']), message='invalid factgraph asOf')
+            elif args['mode'] == 'fact':
+                fields(args, {'mode', 'factId', 'asOf'}, {'mode', 'factId'})
+                require(matches(FID, args['factId']), message='invalid factId')
+                if 'asOf' in args:
+                    require(matches(SHA, args['asOf']), message='invalid factgraph asOf')
+            else:
+                raise Rejected('invalid_request', 'unknown dashboard_factgraph mode')
         else:
             from .dashboard_memory import valid_selection
             require(valid_selection(args), message='invalid shared dashboard selection')
@@ -874,7 +939,9 @@ def dispatch(data_dir, request):
                 atomic_write(journal, encoded({'state': 'ended', 'fingerprint': fingerprint, 'response': response}))
                 return response
         elif op == 'dashboard_factgraph':
-            result = _dashboard_factgraph(root, ctx['projectId'], shared_files)
+            fg_args = ({key: value for key, value in request['arguments'].items() if key != 'terminal'}
+                       if terminal else request['arguments'])
+            result = _dashboard_factgraph(root, ctx['projectId'], shared_files, fg_args)
         elif op == 'dashboard_memory':
             from .dashboard_memory import build_dashboard_memory
             selection = request['arguments']

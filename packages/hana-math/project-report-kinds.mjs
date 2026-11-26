@@ -10,16 +10,35 @@ export const REPORT_ID = /^report-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const paperId = v => /^[a-z0-9][a-z0-9-]{0,63}$/.test(v);
 const sha256 = v => /^[a-f0-9]{64}$/.test(v);
-const auditKeys = ['sourceReportId', 'paperId', 'mainSha256', 'ledgerSha256', 'contractSha256', 'boundContractSha256',
-  'auditorPromptSha256', 'boundAuditorPromptSha256', 'promptSha256', 'boundPromptSha256', 'citationStatus'];
-const verificationKeys = ['auditReportId', 'sourceReportId', 'paperId', 'mainSha256', 'ledgerSha256', 'auditSha256',
-  'contractSha256', 'boundContractSha256', 'verifierPromptSha256', 'boundVerifierPromptSha256', 'promptSha256', 'boundPromptSha256', 'keys', 'citationStatus'];
+const allSelectorKeys = ['sourceReportId', 'revisionReportId', 'verificationReportId', 'chapterTreeReportId', 'planReportId', 'finalSectionReportId'];
+const manuscriptSelectors = [['sourceReportId'], ['revisionReportId'], ['chapterTreeReportId'], ['planReportId', 'finalSectionReportId']];
+const notesSelectors = [['sourceReportId'], ['chapterTreeReportId'], ['planReportId', 'finalSectionReportId']];
+const compileFixSelectors = [['sourceReportId'], ['revisionReportId'], ['chapterTreeReportId'], ['planReportId', 'finalSectionReportId']];
+function matchSelector(value, allowed, ignore = []) {
+  if (!object(value)) return null;
+  const present = allSelectorKeys.filter(key => !ignore.includes(key) && Object.hasOwn(value, key));
+  return allowed.find(fields => present.length === fields.length
+    && fields.every(key => typeof value[key] === 'string' && REPORT_ID.test(value[key]))) ?? null;
+}
+function pickSelector(value, allowed, ignore = []) {
+  const fields = matchSelector(value, allowed, ignore);
+  return fields ? Object.fromEntries(fields.map(key => [key, value[key]])) : {};
+}
+const auditBaseKeys = ['paperId', 'mainSha256', 'ledgerSha256', 'contractSha256', 'boundContractSha256',
+  'auditorPromptSha256', 'boundAuditorPromptSha256', 'promptSha256', 'boundPromptSha256'];
+const verificationBaseKeys = ['auditReportId', 'paperId', 'mainSha256', 'ledgerSha256', 'auditSha256',
+  'contractSha256', 'boundContractSha256', 'verifierPromptSha256', 'boundVerifierPromptSha256', 'promptSha256', 'boundPromptSha256', 'keys'];
 const revisionHashes = ['mainSha256', 'verdictsSha256', 'ledgerSha256', 'originalLedgerSha256', 'provenanceSha256',
   'contractSha256', 'reviserPromptSha256', 'styleSha256', 'promptSha256'];
-const revisionKeys = ['verificationReportId', 'sourceReportId', 'paperId', 'citationStatus', 'sourceStatus', ...revisionHashes];
+const revisionBaseKeys = ['verificationReportId', 'paperId', 'citationStatus', 'sourceStatus', ...revisionHashes];
 const notesHashes = ['mainSha256', 'ledgerSha256', 'provenanceSha256', 'notesSha256', 'contractSha256', 'reviserPromptSha256', 'styleSha256', 'promptSha256'];
-const notesKeys = ['mode', 'sourceReportId', 'paperId', 'sourceStatus', 'notesBytes', ...notesHashes];
-const mathSelectors = [['sourceReportId'], ['planReportId', 'finalSectionReportId']];
+const notesBaseKeys = ['mode', 'paperId', 'sourceStatus', 'notesBytes', ...notesHashes];
+const gapFillHashes = ['mainSha256', 'ledgerSha256', 'originalLedgerSha256', 'provenanceSha256', 'notesSha256', 'factsSha256', 'mathReviewSha256',
+  'contractSha256', 'reviserPromptSha256', 'styleSha256', 'promptSha256'];
+const gapFillBaseKeys = ['mode', 'mathReviewReportId', 'paperId', 'sourceStatus', 'notesBytes', 'factIds', 'missingBacking', ...gapFillHashes];
+const compileFixHashes = ['mainSha256', 'ledgerSha256', 'provenanceSha256', 'compileLogSha256', 'contractSha256', 'reviserPromptSha256', 'styleSha256', 'promptSha256'];
+const compileFixBaseKeys = ['mode', 'paperId', 'sourceStatus', 'compileLogBytes', ...compileFixHashes];
+const mathSelectors = [['sourceReportId'], ['planReportId', 'finalSectionReportId'], ['revisionReportId'], ['verificationReportId'], ['chapterTreeReportId']];
 const mathHashes = ['mainSha256', 'ledgerSha256', 'contractSha256', 'verifierPromptSha256', 'promptSha256'];
 function mathShape(value, bound = false) {
   if (!object(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) return null;
@@ -42,15 +61,50 @@ function copyMathBinding(value) {
   return Object.fromEntries(fields.map(key => [key, value[key]]));
 }
 function validNotesRevision(meta) {
-  const r = meta.revision;
-  return Object.keys(r).length === notesKeys.length && notesKeys.every(key => Object.hasOwn(r, key))
-    && r.mode === 'operator-notes' && typeof r.sourceReportId === 'string' && REPORT_ID.test(r.sourceReportId)
+  const r = meta.revision, sel = matchSelector(r, notesSelectors);
+  const expected = sel ? [...sel, ...notesBaseKeys] : null;
+  return Boolean(expected) && Object.keys(r).length === expected.length && expected.every(key => Object.hasOwn(r, key))
+    && r.mode === 'operator-notes'
     && typeof r.paperId === 'string' && paperId(r.paperId) && ['generated', 'flagged'].includes(r.sourceStatus)
     && notesHashes.every(key => typeof r[key] === 'string' && sha256(r[key]))
     && Number.isSafeInteger(r.notesBytes) && r.notesBytes > 0 && r.notesBytes <= 32 * 1024
     // Partial archive/admission failures must remain loadable for cleanup; run checks bytes before any model.
     && (meta.state !== 'completed' || (Object.hasOwn(meta, 'revisionOutcome') && object(meta.artifacts?.notes) && meta.artifacts.notes.name === 'OPERATOR_NOTES.md'
       && meta.artifacts.notes.bytes === r.notesBytes && meta.artifacts.notes.sha256 === r.notesSha256));
+}
+function validGapFillRevision(meta) {
+  const r = meta.revision, sel = matchSelector(r, mathSelectors);
+  const expected = sel ? [...sel, ...gapFillBaseKeys] : null;
+  return Boolean(expected) && Object.keys(r).length === expected.length && expected.every(key => Object.hasOwn(r, key))
+    && r.mode === 'gap-fill' && typeof r.mathReviewReportId === 'string' && REPORT_ID.test(r.mathReviewReportId)
+    && typeof r.paperId === 'string' && paperId(r.paperId) && ['generated', 'flagged'].includes(r.sourceStatus)
+    && gapFillHashes.every(key => typeof r[key] === 'string' && sha256(r[key]))
+    && Number.isSafeInteger(r.notesBytes) && r.notesBytes > 0 && r.notesBytes <= 32 * 1024
+    && Array.isArray(r.factIds) && r.factIds.length >= 1 && r.factIds.length <= 16
+    && r.factIds.every(id => typeof id === 'string' && /^[0-9a-f]{16}$/.test(id)) && new Set(r.factIds).size === r.factIds.length
+    && Array.isArray(r.missingBacking) && r.missingBacking.length <= 16
+    && r.missingBacking.every(s => typeof s === 'string' && s.isWellFormed() && !s.includes('\0') && s.trim().length > 0 && Buffer.byteLength(s) <= 1024)
+    && (meta.state !== 'completed' || (Object.hasOwn(meta, 'revisionOutcome') && object(meta.artifacts?.notes) && meta.artifacts.notes.name === 'OPERATOR_NOTES.md'
+      && meta.artifacts.notes.bytes === r.notesBytes && meta.artifacts.notes.sha256 === r.notesSha256));
+}
+function validCompileFixRevision(meta) {
+  const r = meta.revision, sel = matchSelector(r, compileFixSelectors);
+  const expected = sel ? [...sel, ...compileFixBaseKeys] : null;
+  return Boolean(expected) && Object.keys(r).length === expected.length && expected.every(key => Object.hasOwn(r, key))
+    && r.mode === 'compile-fix'
+    && typeof r.paperId === 'string' && paperId(r.paperId) && ['generated', 'flagged'].includes(r.sourceStatus)
+    && compileFixHashes.every(key => typeof r[key] === 'string' && sha256(r[key]))
+    && Number.isSafeInteger(r.compileLogBytes) && r.compileLogBytes > 0 && r.compileLogBytes <= 32 * 1024
+    && (meta.state !== 'completed' || (Object.hasOwn(meta, 'revisionOutcome') && object(meta.artifacts?.compileLog) && meta.artifacts.compileLog.name === 'COMPILE_LOG.txt'
+      && meta.artifacts.compileLog.bytes === r.compileLogBytes && meta.artifacts.compileLog.sha256 === r.compileLogSha256));
+}
+function validCitationRevision(meta) {
+  const r = meta.revision, sel = matchSelector(r, manuscriptSelectors, ['verificationReportId']);
+  const expected = sel ? [...sel, ...revisionBaseKeys] : null;
+  return Boolean(expected) && Object.keys(r).length === expected.length && expected.every(key => Object.hasOwn(r, key))
+    && typeof r.verificationReportId === 'string' && REPORT_ID.test(r.verificationReportId)
+    && typeof r.paperId === 'string' && paperId(r.paperId) && revisionHashes.every(key => typeof r[key] === 'string' && sha256(r[key]))
+    && ['unverified', 'partial', 'verified'].includes(r.citationStatus) && ['generated', 'flagged'].includes(r.sourceStatus);
 }
 function validRevisionOutcomeRecord(meta) {
   // Absence is legacy, never synthesized. Explicit null or malformed data is not legacy.
@@ -61,7 +115,8 @@ function validRevisionOutcomeRecord(meta) {
     && object(meta.artifacts) && object(meta.artifacts.source) && object(meta.artifacts.proposal)
     && typeof meta.sha256 === 'string' && sha256(meta.sha256) && Number.isSafeInteger(meta.bytes) && meta.bytes > 0
     && meta.artifacts.source.sha256 === meta.sha256 && meta.artifacts.source.bytes === meta.bytes);
-  const allowed = meta.revision?.mode === 'operator-notes' ? ['response', 'notes'] : ['response'];
+  const allowed = ['operator-notes', 'gap-fill'].includes(meta.revision?.mode) ? ['response', 'notes']
+    : meta.revision?.mode === 'compile-fix' ? ['response', 'compileLog'] : ['response'];
   if (!object(meta.artifacts) || !object(meta.artifacts.response) || Object.keys(meta.artifacts).some(key => !allowed.includes(key))
     || ['artifact', 'publishedArtifact', 'publishedSha256', 'publishedBytes'].some(key => Object.hasOwn(meta, key))) return false;
   // Computed diagnostics may survive interruption/failure; only a clean completed record is a successful no-op.
@@ -103,19 +158,36 @@ const specs = Object.freeze({
     artifactNames: Object.freeze({ response: 'raw-response.txt', blocks: 'PLANNER_BLOCKS.json', plan: 'SECTION_PLAN.json', ledger: 'REFERENCE_LEDGER.md' }),
     deliveredRoles: Object.freeze(['blocks', 'plan', 'ledger']),
   }),
+  'paper-chapter-tree': Object.freeze({
+    label: 'Math paper chapter-tree assembly',
+    startValid: () => false,
+    persistedValid: (meta, projectId) => meta.language === 'English' && meta.projectId === projectId && object(meta.chapterTree)
+      && typeof meta.chapterTree.paperId === 'string' && paperId(meta.chapterTree.paperId)
+      && sha256(meta.chapterTree.mainSha256) && sha256(meta.chapterTree.ledgerSha256)
+      && sha256(meta.chapterTree.manifestSha256) && Array.isArray(meta.chapterTree.chapterOrder)
+      && meta.chapterTree.chapterOrder.length >= 1 && meta.chapterTree.chapterOrder.length <= 32,
+    recordFields: payload => ({ kind: 'paper-chapter-tree', chapterTree: structuredClone(payload) }),
+    taskFields: meta => ({ kind: 'paper-chapter-tree', paperId: meta.chapterTree.paperId,
+      mainSha256: meta.chapterTree.mainSha256, ledgerSha256: meta.chapterTree.ledgerSha256,
+      manifestSha256: meta.chapterTree.manifestSha256 }),
+    artifactNames: Object.freeze({ source: 'main.tex', ledger: 'REFERENCE_LEDGER.md', provenance: 'PROVENANCE.json', manifest: 'CHAPTER_TREE_MANIFEST.json' }),
+    deliveredRoles: Object.freeze(['source', 'manifest', 'ledger']),
+  }),
   'paper-revision': Object.freeze({
     label: 'Math paper revision proposal',
     startValid: args => Boolean(snapshotPaperRevisionStart(args)),
     persistedValid: meta => meta.language === 'English' && object(meta.revision)
-      && (meta.revision.mode === 'operator-notes' ? validNotesRevision(meta) : (Object.keys(meta.revision).every(k => revisionKeys.includes(k))
-      && typeof meta.revision.verificationReportId === 'string' && REPORT_ID.test(meta.revision.verificationReportId)
-      && typeof meta.revision.sourceReportId === 'string' && REPORT_ID.test(meta.revision.sourceReportId)
-      && typeof meta.revision.paperId === 'string' && paperId(meta.revision.paperId) && revisionHashes.every(k => typeof meta.revision[k] === 'string' && sha256(meta.revision[k]))
-      && ['unverified', 'partial', 'verified'].includes(meta.revision.citationStatus) && ['generated', 'flagged'].includes(meta.revision.sourceStatus)))
+      && (meta.revision.mode === 'operator-notes' ? validNotesRevision(meta)
+        : meta.revision.mode === 'gap-fill' ? validGapFillRevision(meta)
+        : meta.revision.mode === 'compile-fix' ? validCompileFixRevision(meta)
+        : validCitationRevision(meta))
       && validRevisionOutcomeRecord(meta),
     recordFields: payload => ({ kind: 'paper-revision', revision: structuredClone(payload) }),
-    taskFields: meta => ({ kind: 'paper-revision', ...meta.revision }),
-    artifactNames: Object.freeze({ notes: 'OPERATOR_NOTES.md', response: 'raw-response.txt', source: 'proposal.tex', ledger: 'INHERITED_REFERENCE_LEDGER.md',
+    taskFields: meta => {
+      const scalars = Object.fromEntries(Object.entries(meta.revision).filter(([, v]) => typeof v === 'string' || typeof v === 'number'));
+      return { kind: 'paper-revision', ...scalars };
+    },
+    artifactNames: Object.freeze({ notes: 'OPERATOR_NOTES.md', compileLog: 'COMPILE_LOG.txt', response: 'raw-response.txt', source: 'proposal.tex', ledger: 'INHERITED_REFERENCE_LEDGER.md',
       provenance: 'INHERITED_PROVENANCE.json', proposal: 'REVISION_PROPOSAL.json', summary: 'REVISION_SUMMARY.md' }),
     deliveredRoles: Object.freeze(['source', 'summary', 'proposal', 'ledger']),
   }),
@@ -144,22 +216,26 @@ const specs = Object.freeze({
     startValid: args => object(args.verification) && Object.keys(args.verification).length === 2
       && typeof args.verification.auditReportId === 'string' && REPORT_ID.test(args.verification.auditReportId)
       && typeof args.verification.paperId === 'string' && paperId(args.verification.paperId),
-    persistedValid: meta => object(meta.verification) && Object.keys(meta.verification).every(k => verificationKeys.includes(k))
-      && typeof meta.verification.auditReportId === 'string' && REPORT_ID.test(meta.verification.auditReportId)
-      && typeof meta.verification.sourceReportId === 'string' && REPORT_ID.test(meta.verification.sourceReportId)
-      && typeof meta.verification.paperId === 'string' && paperId(meta.verification.paperId)
-      && ['mainSha256', 'ledgerSha256', 'auditSha256', 'contractSha256', 'verifierPromptSha256', 'promptSha256']
-        .every(k => typeof meta.verification[k] === 'string' && sha256(meta.verification[k]))
-      && meta.verification.boundContractSha256 === meta.verification.contractSha256
-      && meta.verification.boundVerifierPromptSha256 === meta.verification.verifierPromptSha256
-      && meta.verification.boundPromptSha256 === meta.verification.promptSha256
-      && Array.isArray(meta.verification.keys) && meta.verification.keys.length > 0
-      && meta.verification.keys.every(k => typeof k === 'string' && k.length > 0 && k.isWellFormed() && !/[\x00-\x1f]/.test(k))
-      && new Set(meta.verification.keys).size === meta.verification.keys.length
-      && (meta.verification.citationStatus === undefined || ['unverified', 'partial', 'verified'].includes(meta.verification.citationStatus)),
+    persistedValid: meta => {
+      const v = meta.verification, sel = matchSelector(v, manuscriptSelectors);
+      if (!sel) return false;
+      const required = [...sel, ...verificationBaseKeys], allowed = [...required, 'citationStatus'];
+      return Object.keys(v).every(k => allowed.includes(k)) && required.every(k => Object.hasOwn(v, k))
+        && typeof v.auditReportId === 'string' && REPORT_ID.test(v.auditReportId)
+        && typeof v.paperId === 'string' && paperId(v.paperId)
+        && ['mainSha256', 'ledgerSha256', 'auditSha256', 'contractSha256', 'verifierPromptSha256', 'promptSha256']
+          .every(k => typeof v[k] === 'string' && sha256(v[k]))
+        && v.boundContractSha256 === v.contractSha256
+        && v.boundVerifierPromptSha256 === v.verifierPromptSha256
+        && v.boundPromptSha256 === v.promptSha256
+        && Array.isArray(v.keys) && v.keys.length > 0
+        && v.keys.every(k => typeof k === 'string' && k.length > 0 && k.isWellFormed() && !/[\x00-\x1f]/.test(k))
+        && new Set(v.keys).size === v.keys.length
+        && (v.citationStatus === undefined || ['unverified', 'partial', 'verified'].includes(v.citationStatus));
+    },
     recordFields: payload => ({ kind: 'reference-verification', verification: structuredClone(payload) }),
     taskFields: meta => ({ kind: 'reference-verification', auditReportId: meta.verification.auditReportId,
-      sourceReportId: meta.verification.sourceReportId, paperId: meta.verification.paperId,
+      ...pickSelector(meta.verification, manuscriptSelectors), paperId: meta.verification.paperId,
       mainSha256: meta.verification.mainSha256, ledgerSha256: meta.verification.ledgerSha256,
       auditSha256: meta.verification.auditSha256, promptSha256: meta.verification.promptSha256 }),
     artifactNames: Object.freeze({ response: 'raw-response.txt', verdicts: 'REFERENCE_VERDICTS.json', ledger: 'REFERENCE_LEDGER.md' }),
@@ -167,19 +243,27 @@ const specs = Object.freeze({
   }),
   'reference-audit': Object.freeze({
     label: 'Math reference audit',
-    startValid: args => object(args.audit) && Object.keys(args.audit).length === 2 && typeof args.audit.sourceReportId === 'string'
-      && REPORT_ID.test(args.audit.sourceReportId) && typeof args.audit.paperId === 'string' && paperId(args.audit.paperId),
-    persistedValid: meta => object(meta.audit) && Object.keys(meta.audit).every(k => auditKeys.includes(k))
-      && REPORT_ID.test(meta.audit.sourceReportId) && typeof meta.audit.paperId === 'string' && paperId(meta.audit.paperId)
-      && sha256(meta.audit.mainSha256)
-      && sha256(meta.audit.ledgerSha256) && sha256(meta.audit.contractSha256)
-      && sha256(meta.audit.auditorPromptSha256) && sha256(meta.audit.promptSha256)
-      && meta.audit.boundPromptSha256 === meta.audit.promptSha256
-      && meta.audit.boundContractSha256 === meta.audit.contractSha256
-      && meta.audit.boundAuditorPromptSha256 === meta.audit.auditorPromptSha256
-      && (meta.audit.citationStatus === undefined || meta.audit.citationStatus === 'unverified'),
+    startValid: args => {
+      const a = args.audit, sel = matchSelector(a, manuscriptSelectors);
+      return Boolean(sel) && Object.keys(a).length === sel.length + 1
+        && typeof a.paperId === 'string' && paperId(a.paperId);
+    },
+    persistedValid: meta => {
+      const a = meta.audit, sel = matchSelector(a, manuscriptSelectors);
+      if (!sel) return false;
+      const required = [...sel, ...auditBaseKeys], allowed = [...required, 'citationStatus'];
+      return Object.keys(a).every(k => allowed.includes(k)) && required.every(k => Object.hasOwn(a, k))
+        && typeof a.paperId === 'string' && paperId(a.paperId)
+        && sha256(a.mainSha256)
+        && sha256(a.ledgerSha256) && sha256(a.contractSha256)
+        && sha256(a.auditorPromptSha256) && sha256(a.promptSha256)
+        && a.boundPromptSha256 === a.promptSha256
+        && a.boundContractSha256 === a.contractSha256
+        && a.boundAuditorPromptSha256 === a.auditorPromptSha256
+        && (a.citationStatus === undefined || a.citationStatus === 'unverified');
+    },
     recordFields: payload => ({ kind: 'reference-audit', audit: structuredClone(payload) }),
-    taskFields: meta => ({ kind: 'reference-audit', sourceReportId: meta.audit.sourceReportId, paperId: meta.audit.paperId,
+    taskFields: meta => ({ kind: 'reference-audit', ...pickSelector(meta.audit, manuscriptSelectors), paperId: meta.audit.paperId,
       mainSha256: meta.audit.mainSha256, ledgerSha256: meta.audit.ledgerSha256, promptSha256: meta.audit.promptSha256 }),
     artifactNames: Object.freeze({ response: 'raw-response.txt', audit: 'REFERENCE_AUDIT.md' }),
     deliveredRoles: Object.freeze(['audit']),

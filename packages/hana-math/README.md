@@ -17,7 +17,7 @@ Hana Math 接入 Danus 的数学研究流程：main 派工，worker 写证明，
 - **实时看板。** 在主窗口打开与 Code 同级的 Σ「研究看板」。有获准展示的活动项目时，自动跟踪其总览、事实图和共享记忆；不必打开文件或手动绑定。页面隐藏时暂停刷新，重开时重新选项目。事实图可点开证明和前驱；核验记录有对应事实时也可点到证明。
 - **结束后。** 无活动项目时，Σ 显示最近一次可信的终态快照，标明项目和结束时间；正常重启后可读回。没有活动项目或可用快照时显示空态；无法确认状态或授权时显示不可用，不扫描旧项目补位。
 - **旧项目。** 在原创建会话明确授权或撤回后，用 `math_project dashboard_follow` 或 `dashboard_unfollow` 管理 Σ 的跨重启跟踪，均只传 `projectId`。「当前已保存结果」只在无活动项目、也无优先的可信终态快照时显示，以读取基准时间为准。授权不启动、停止或恢复研究。
-- **文档预览。** `.hanamathboard` 仍须在原创建聊天授权绑定当前 Preview，最多 15 分钟。`dashboard_snapshot` 导出的 `.hanamathgraph` 是不刷新的事实图；`graph` 导出的交互 HTML 只含索引和依赖，超出图上限（2048 条事实、32768 条边）时拒绝，不返回残图。`dashboard_overview` 可在聊天中读一次总览。
+- **文档预览。** `.hanamathboard` 仍须在原创建聊天授权绑定当前 Preview，最多 15 分钟。`dashboard_snapshot` 导出的 `.hanamathgraph` 是不刷新的事实图；`graph` 导出的交互 HTML 只含索引和依赖，超出图上限（4096 条事实、32768 条边）时拒绝，不返回残图；Σ 实时看板面对大型事实图（如 3157 条事实、8616 条边）会自动分页拉取索引并在点击节点时按需读取证明，不提高 IPC 额度。`dashboard_overview` 可在聊天中读一次总览。
 - **查证明。** 用 `fact_search` 查已验证事实，或用 `math_project result` 加 `factId` 读完整证明。无 ID 时返回一页摘要；沿 `nextCursor` 续读，图变化后从头读。
 
 ## 进展报告
@@ -34,9 +34,11 @@ Hana Math 接入 Danus 的数学研究流程：main 派工，worker 写证明，
 | --- | --- |
 | 直接写初稿 | `paper`，提供 `brief`；输出 `main.tex` 和引用账本。显式 `factIds` 最多 64 条，须含全部主结果。目标及其前驱合计达 10 条时必须精选，不能全选 |
 | 规划、逐节写、拼稿 | `paper_plan` 生成线性计划；`paper_section` 每次传 `planReportId`，续写时另传 `previousSectionReportId`。到末节返回 `no_next_section`。用 `paper_stitch` 指定 `planReportId` 与 `finalSectionReportId`，导出同一条链的 `main.tex` |
-| 查引文 | `paper_audit` 从完成的源稿生成离线意见；`paper_verify` 以审计报告为输入在线查来源。未查实仍标为未确认，旧稿不会自动更新 |
-| 改稿 | `paper_revise` 可基于已结算的引用核验报告，或用 `mode: operator-notes` 对已结算的源稿提出定点修改。结果是独立提案，旧稿不覆盖；无改动时返回 `no_edits_applied` |
-| 全文数学审稿 | `paper_verify_math` 传 `projectId`，再选 `reportId`（完成的整篇源稿）或 `planReportId` 加 `finalSectionReportId`（指定拼稿链）。不接受外部文件路径或自带账本。用 `paper_verify_math_result` 和返回的审稿报告 ID 取 `MATH_REVIEW.json` |
+| 查引文 | `paper_audit` 支持已结算的整篇源稿、修订提案（`proposal.tex`）、章节树（`paper-chapter-tree`）或指定拼稿链（`planReportId` + `finalSectionReportId`）；`paper_verify` 以审计报告为输入在线核验未查实条目，未查实仍标为未确认，原稿与旧账本不变 |
+| 改稿 | `paper_revise` 支持四种模式：默认引用修订（承接核验后的账本）、`mode: operator-notes`（按作者意见定点修改源稿/拼稿链/章节树）、`mode: gap-fill`（针对 `wrong` 数学审稿报告仅用已核验 `factIds` 补证明并把新增 `external_refs` 记为未核验；空 `factIds` 配 `missingBacking` 时零模型调用返回 `needs_research`）、`mode: compile-fix`（仅按 `compileLog` 做最小编译修复）。结果均为独立提案，旧稿不覆盖；无改动时返回 `no_edits_applied` |
+| 全文数学审稿 | `paper_verify_math` 传 `projectId`，再选 `reportId`（已结算的整篇源稿、产出 `proposal.tex` 的修订提案、章节树，或已结算的引用核验报告以使用其更新后账本）或 `planReportId` 加 `finalSectionReportId`（指定拼稿链）。不接受外部文件路径或自带账本。用 `paper_verify_math_result` 和返回的审稿报告 ID 取 `MATH_REVIEW.json` |
+| 交付门禁 | `paper_deliver` 校验稿件与已结算 `MATH_REVIEW.json` 的同版哈希绑定。`wrong` 结论默认拦截交付；创建者可显式传 `override: { reason }` 例外放行，并在交付副本的 `\end{document}` 前插入可见 `\note{[math-override] ...}` 披露（不改动归档原稿），`DELIVERY_MANIFEST.json` 如实记录全部 `must-fix` 与 `ignorable` 意见。未提供受管 TeX 编译证据时如实标 `compileStatus: not-run`、`deliverOk: false`（传 `allowUncompiledTex: true` 可导出 TeX、账本、审稿与清单）；永不授权外发投稿 |
+| 章节树组装 | `paper_chapter_tree_stitch` 将主稿 `host` 与按依赖排序的章节 `chapters` 机械组装为不可变 `paper-chapter-tree` 报告：自动剥离章节壳、降级标题、`chapterId:` 命名空间防标签冲突、在 `\usepackage{hyperref}` 前插入新增宏包、拒绝宏冲突与重名标签、替换主稿指针证明、仅保留正文引用的 `\bibitem` 并汇总接缝清单；自定义作者文风规则须传 `confirmedStyleRules: { confirmedByOperator: true, rules }`。返回的 `reportId` 可直接接 `paper_revise`、`paper_audit`、`paper_verify`、`paper_verify_math` 与 `paper_deliver` |
 
 报告类入口有对应的 `_status`、`_result` 和 `_stop`（修订提案用 `paper_revision_*`）。查询与取回报告时用 `projectId` 和该报告自己的 `reportId`。重取附件不重跑模型。`isError:false` 仅代表本次读取完成，还要检查报告状态、错误和附件。`readError` 是本次读取错误，`archiveError` 是归档问题。容量不足时看 `RESEARCH_RUNTIME_CAPACITY`；如有 `managedIpcRefusal`，`current` 表示本次，`recorded` 表示历史原因。
 

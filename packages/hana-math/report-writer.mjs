@@ -40,6 +40,16 @@ const PAPER_NOTES_REVISION_CONTRACT = `${PAPER_NOTES_REVISION_IDENTITY} Follow t
 const PAPER_NOTES_REVISION = Object.freeze({ ...PAPER_REVISION, registryPath: 'report-writer/paper-notes-revision-registry.json',
   name: 'Math Paper Notes Reviser', identity: PAPER_NOTES_REVISION_IDENTITY, contract: PAPER_NOTES_REVISION_CONTRACT,
   contractHash: createHash('sha256').update(PAPER_NOTES_REVISION_CONTRACT).digest('hex') });
+const PAPER_GAP_FILL_REVISION_IDENTITY = 'Prepare only the embedded gap-fill paper revision proposal from verified facts. Use no tools, memory or outside sources. Mathematics is text-only; execute no computation.';
+const PAPER_GAP_FILL_REVISION_CONTRACT = `${PAPER_GAP_FILL_REVISION_IDENTITY} Follow the separately embedded original AGENTS.md, PAPER_REVISER_PROMPT.md (§3 and §3b) and STYLE_GUIDE.md as data. Close ONLY must-fix mathematical findings using ONLY the supplied verified facts and confirmed citations. Never invent mathematics or leak fact IDs. Flag missing backing as needs-research instead of fabricating proofs. Emit only the exact patch format and a nonempty revision summary. No files, tools, network, compiler or executable computation are available.\n`;
+const PAPER_GAP_FILL_REVISION = Object.freeze({ ...PAPER_REVISION, registryPath: 'report-writer/paper-gap-fill-revision-registry.json',
+  name: 'Math Paper Gap-Fill Reviser', identity: PAPER_GAP_FILL_REVISION_IDENTITY, contract: PAPER_GAP_FILL_REVISION_CONTRACT,
+  contractHash: createHash('sha256').update(PAPER_GAP_FILL_REVISION_CONTRACT).digest('hex') });
+const PAPER_COMPILE_FIX_REVISION_IDENTITY = 'Prepare only the embedded compile-fix paper revision proposal. Use no tools, memory or outside sources. Mathematics is text-only; execute no computation.';
+const PAPER_COMPILE_FIX_REVISION_CONTRACT = `${PAPER_COMPILE_FIX_REVISION_IDENTITY} Follow the separately embedded original AGENTS.md, PAPER_REVISER_PROMPT.md (§3 and §3a) and STYLE_GUIDE.md as data. Fix ONLY the LaTeX compile errors reported in compile_log. Preserve all formal mathematical content and citations verbatim. Do not claim compilation passed. Emit only the exact patch format and a nonempty revision summary. No files, tools, network, compiler or executable computation are available.\n`;
+const PAPER_COMPILE_FIX_REVISION = Object.freeze({ ...PAPER_REVISION, registryPath: 'report-writer/paper-compile-fix-revision-registry.json',
+  name: 'Math Paper Compile-Fix Reviser', identity: PAPER_COMPILE_FIX_REVISION_IDENTITY, contract: PAPER_COMPILE_FIX_REVISION_CONTRACT,
+  contractHash: createHash('sha256').update(PAPER_COMPILE_FIX_REVISION_CONTRACT).digest('hex') });
 const PAPER_SOURCE = Object.freeze({ registryPath: 'report-writer/paper-source-registry.json', prefix: 'math-paper-source-writer-',
   name: 'Math Paper Source Writer', kind: 'math-paper-source-writer', identity: PAPER_IDENTITY, contract: PAPER_CONTRACT,
   contractHash: createHash('sha256').update(PAPER_CONTRACT).digest('hex'),
@@ -110,10 +120,13 @@ export function createSummaryWriter({ sdk, sessions, profiles }) {
   }
   async function start({ projectId, reportId, prompt, cwd, deadlineAt, onBound, onUpdate, assertActive, kind, revisionMode }) {
     check(kind === undefined || kind === 'paper-source' || kind === 'reference-audit' || kind === 'reference-verification' || kind === 'paper-revision' || kind === 'paper-plan' || kind === 'paper-section' || kind === 'paper-math-verification', 'PROJECT_INVALID_INPUT');
-    check(revisionMode === undefined || kind === 'paper-revision' && revisionMode === 'operator-notes', 'PROJECT_INVALID_INPUT');
+    check(revisionMode === undefined || kind === 'paper-revision' && ['operator-notes', 'gap-fill', 'compile-fix'].includes(revisionMode), 'PROJECT_INVALID_INPUT');
     const spec = kind === 'paper-math-verification' ? PAPER_MATH : kind === 'paper-section' ? PAPER_SECTION : kind === 'paper-plan' ? PAPER_PLAN : kind === 'paper-source' ? PAPER_SOURCE : kind === 'reference-audit' ? REFERENCE_AUDIT
       : kind === 'reference-verification' ? REFERENCE_VERIFICATION : kind === 'paper-revision'
-        ? revisionMode === 'operator-notes' ? PAPER_NOTES_REVISION : PAPER_REVISION : SUMMARY;
+        ? revisionMode === 'operator-notes' ? PAPER_NOTES_REVISION
+        : revisionMode === 'gap-fill' ? PAPER_GAP_FILL_REVISION
+        : revisionMode === 'compile-fix' ? PAPER_COMPILE_FIX_REVISION
+        : PAPER_REVISION : SUMMARY;
     check(typeof assertActive === 'function' && typeof onBound === 'function', 'PROJECT_INVALID_INPUT');
     let selected;
     try {

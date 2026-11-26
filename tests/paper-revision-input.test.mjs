@@ -61,6 +61,27 @@ test('operator-notes own-data snapshots reject accessors, symbols, nonenumerable
   assert.throws(() => snapshotPaperRevisionStart(value), { code: 'PROJECT_INVALID_INPUT' }); assert.equal(reads, 0);
 });
 
+test('operator-notes request/start snapshots support stitched selectors and reject mixed/citation stitched shapes', () => {
+  const planReportId = 'report-11234567-89ab-cdef-0123-456789abcdef';
+  const finalSectionReportId = 'report-21234567-89ab-cdef-0123-456789abcdef';
+  const stitchedReq = { planReportId, finalSectionReportId, mode: 'operator-notes', notes: request.notes };
+  const stitchedStart = { kind: 'paper-revision', language: 'English',
+    revision: { mode: 'operator-notes', planReportId, finalSectionReportId, paperId: 'main' }, notes: request.notes };
+  assert.deepEqual(snapshotPaperRevisionRequest(stitchedReq), stitchedReq);
+  assert.deepEqual(snapshotPaperRevisionStart(stitchedStart), stitchedStart);
+  for (const bad of [
+    { ...stitchedReq, reportId }, { planReportId, finalSectionReportId },
+    { planReportId, finalSectionReportId, mode: 'citation' },
+    { planReportId, mode: 'operator-notes', notes: 'x' },
+    { finalSectionReportId, mode: 'operator-notes', notes: 'x' },
+  ]) assert.throws(() => snapshotPaperRevisionRequest(bad), { code: 'PROJECT_INVALID_INPUT' });
+  for (const badRev of [
+    { mode: 'operator-notes', sourceReportId: reportId, planReportId, finalSectionReportId, paperId: 'main' },
+    { mode: 'operator-notes', planReportId, paperId: 'main' },
+    { planReportId, finalSectionReportId, paperId: 'main' },
+  ]) assert.throws(() => snapshotPaperRevisionStart({ ...stitchedStart, revision: badRev }), { code: 'PROJECT_INVALID_INPUT' });
+});
+
 test('operator-notes prompt is a distinct targeted-notes data field, not fake citation fixes or a verification claim', () => {
   const input = { mainTex: 'Opaque main\r\n', ledger: 'Opaque ledger\r\n', notes: request.notes,
     resources: { contract: 'contract', reviserPrompt: 'reviser', style: 'style' } };

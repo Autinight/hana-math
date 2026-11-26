@@ -218,16 +218,47 @@ async function loadGraph(binding) {
     renderGraph(binding, d);
   } catch { if (current === binding) connError(true); }
 }
+const LARGE_GRAPH_THRESHOLD = 500;
+function mergeGraphFacts(prevFacts, nodes) {
+  return new Map(nodes.map(n => {
+    const prior = prevFacts?.get(n.id);
+    if (n.detailLoaded === false && prior?.detailLoaded === true && prior.statement && prior.proof) {
+      return [n.id, { ...n, ...prior, depth: n.depth, predecessors: n.predecessors, detailLoaded: true }];
+    }
+    return [n.id, n];
+  }));
+}
 function renderGraph(binding, d) {
-    binding.facts = new Map(d.nodes.map(n => [n.id, n]));
+    binding.facts = mergeGraphFacts(binding.facts, d.nodes);
     const maxD = d.max_depth || 1, palette = graphPalette();
+    const large = d.nodes.length > LARGE_GRAPH_THRESHOLD;
+    // Seed deterministic initial positions for large graphs so ECharts force
+    // layout starts near layered equilibrium without stalling the main thread.
+    const layerCounts = large ? new Map() : null;
+    const layerCursor = large ? new Map() : null;
+    if (large) {
+      for (const n of d.nodes) {
+        const dp = n.depth || 0;
+        layerCounts.set(dp, (layerCounts.get(dp) || 0) + 1);
+      }
+    }
     const nodes = d.nodes.map((n) => {
       const dp = n.depth || 0;
+      let coords = {};
+      if (large) {
+        const idx = layerCursor.get(dp) || 0;
+        layerCursor.set(dp, idx + 1);
+        const count = layerCounts.get(dp) || 1;
+        const radius = 140 + dp * 90;
+        const angle = (2 * Math.PI * idx) / Math.max(1, count) + dp * 0.37;
+        coords = { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+      }
       return {
         id: n.id, name: n.id.slice(0, 7),
         symbolSize: 6 + Math.min(16, dp * 2.5),        // bigger = deeper, but capped small so circles don't overlap when zoomed out
         itemStyle: { color: depthColor(dp, maxD, palette) },
         depth: dp, author: n.author,                   // no per-node label (would clutter)
+        ...coords,
       };
     });
     const links = d.edges.map((e) => ({ source: e.source, target: e.target }));
@@ -242,9 +273,11 @@ function renderGraph(binding, d) {
       },
       series: [{
         type: 'graph', layout: 'force', roam: true, draggable: true,
-        force: { repulsion: 160, edgeLength: 80, gravity: 0.06 },
+        force: large
+          ? { repulsion: 90, edgeLength: 55, gravity: 0.12, layoutAnimation: false, friction: 0.65 }
+          : { repulsion: 160, edgeLength: 80, gravity: 0.06 },
         label: { show: false }, emphasis: { focus: 'adjacency', label: { show: false } },
-        lineStyle: { color: palette.edge, width: 1, opacity: 0.55, curveness: 0.05 },
+        lineStyle: { color: palette.edge, width: 1, opacity: large ? 0.4 : 0.55, curveness: large ? 0 : 0.05 },
         edgeSymbol: ['none', 'arrow'], edgeSymbolSize: 5,
         data: nodes, links: links,
       }],
@@ -259,17 +292,18 @@ function renderGraph(binding, d) {
 function canPickWorkspaceFact(binding) {
   return current === binding && binding.tab === 'graph' && !document.hidden && binding.graphClick && !binding.proofJump;
 }
-function showFact(binding, id) {
-  if (current !== binding) return;
-  const f = binding.facts?.get(id); if (!f) return;
-  if (binding.workspace) binding.selectedFact = id;
+function renderFactDetail(binding, f, { loading = false, error = false } = {}) {
   const d = $('#fact-detail'); d.replaceChildren();
   d.appendChild(el('div', 'fid', f.id));
   if (f.author || f.problem_id) d.appendChild(el('div', 'muted', `${f.author || '?'} · ${f.problem_id || ''}`));
   const addSec = (h, txt) => { if (!txt) return; d.appendChild(el('div', 'sec-h', h)); const m = el('div', 'math'); renderMarkdownMath(m, txt); d.appendChild(m); };
   addSec('Statement', f.statement);
-  addSec('Proof', f.proof);
-  addSec('Intuition', f.intuition);
+  if (loading) d.appendChild(el('div', 'muted', 'Loading full statement and proof…'));
+  else if (error) d.appendChild(el('div', 'muted', 'Unable to load full proof.'));
+  else {
+    addSec('Proof', f.proof);
+    addSec('Intuition', f.intuition);
+  }
   if (f.predecessors.length) {
     d.appendChild(el('div', 'sec-h', `Predecessors (${f.predecessors.length})`));
     const wrap = el('div');
@@ -282,6 +316,23 @@ function showFact(binding, id) {
     });
     d.appendChild(wrap);
   }
+}
+function showFact(binding, id) {
+  if (current !== binding) return;
+  const f = binding.facts?.get(id); if (!f) return;
+  binding.selectedFact = id;
+  if (f.detailLoaded !== false) { renderFactDetail(binding, f); return; }
+  const load = binding.fetchFact ?? (binding.request ? fid => api(binding, `/api/fact/${fid}`) : null);
+  if (!load) { renderFactDetail(binding, f, { error: true }); return; }
+  renderFactDetail(binding, f, { loading: true });
+  Promise.resolve(load(id)).then(detail => {
+    if (current !== binding || binding.facts?.get(id) !== f) return;
+    const merged = { ...f, ...detail, depth: f.depth, detailLoaded: true };
+    binding.facts.set(id, merged);
+    if (binding.selectedFact === id) renderFactDetail(binding, merged);
+  }, () => {
+    if (current === binding && binding.selectedFact === id) renderFactDetail(binding, f, { error: true });
+  });
 }
 
 // ---- global memory ------------------------------------------------------- //
@@ -394,7 +445,7 @@ function workspaceGraph(binding, data) {
   if (layout !== binding.layout) {
     renderGraph(binding, data);
     binding.layout = layout;
-  } else binding.facts = new Map(data.nodes.map(n => [n.id, n]));
+  } else binding.facts = mergeGraphFacts(binding.facts, data.nodes);
   // The existing stylesheet uses this flag to reveal populated graph detail.
   // In this opt-in adapter it says nothing about the origin of the data.
   document.body.dataset.hasSnapshot = '';
@@ -457,7 +508,7 @@ function workspaceMemory(binding, data, channel, entries, changes) {
 
 // Explicitly mounted by the workspace page; the old card and both document
 // Previews continue to use mountDashboard's independent modes.
-export function mountWorkspaceDashboard(onSelect) {
+export function mountWorkspaceDashboard(onSelect, { fetchFact } = {}) {
   if (typeof onSelect !== 'function') throw new TypeError('Workspace dashboard requires a selection sink');
   if (current) unmountDashboard(current);
   const links = [...document.querySelectorAll('.nav-link')];
@@ -466,7 +517,7 @@ export function mountWorkspaceDashboard(onSelect) {
   links.forEach((link, i) => { link.onclick = handlers[i]; });
   let binding;
   const getTab = () => $('.nav-link.active')?.dataset.tab ?? 'overview';
-  const newBinding = () => ({ workspace: onSelect, tab: getTab(), channels: new Map(), entries: [] });
+  const newBinding = () => ({ workspace: onSelect, fetchFact, tab: getTab(), channels: new Map(), entries: [] });
   binding = current = newBinding();
   function clear() {
     if (current !== binding) return;

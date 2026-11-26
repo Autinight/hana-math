@@ -206,6 +206,94 @@ class DashboardFactgraphTests(unittest.TestCase):
         self.assertIn('2048', reply['error']['message']); self.assertNotIn('result', reply)
         canonical.assert_not_called()
 
+    def test_m07_large_graph_3157_facts_8616_edges_within_existing_1mib_ipc_budget(self):
+        # Upstream M-07 benchmark scale: 3157 facts, 8616 edges, plus deep chain (>1050) without RecursionError.
+        n_facts, target_edges = 3157, 8616
+        ids = [f'{i:016x}' for i in range(1, n_facts + 1)]
+        preds_by_idx = [[] for _ in range(n_facts)]
+        edge_count = 0
+        # Build a 1100-deep spine first to verify iterative depth computation never hits RecursionError.
+        for i in range(1, 1101):
+            preds_by_idx[i].append(ids[i - 1])
+            edge_count += 1
+        # Distribute remaining edges cleanly as valid acyclic predecessors (j < i).
+        i = 10
+        while edge_count < target_edges:
+            k = 1
+            while edge_count < target_edges and k <= 5 and i - k >= 0:
+                cand = ids[i - k]
+                if cand not in preds_by_idx[i]:
+                    preds_by_idx[i].append(cand)
+                    edge_count += 1
+                k += 1
+            i = 10 if i + 1 >= n_facts else i + 1
+        self.assertEqual(edge_count, target_edges)
+
+        records = []
+        for idx, fid in enumerate(ids):
+            preds = preds_by_idx[idx]
+            stmt = f'Fact {idx}: synthetic statement for M-07 scale benchmark.'
+            proof = f'Proof {idx}: ' + ('x' * 200)
+            raw = (f'---\nfact_id: {fid}\nproblem_id: m07-scale\nauthor: worker-{(idx % 4) + 1}\n'
+                   f'predecessors: [{", ".join(preds)}]\nexternal_refs: []\n---\n\n'
+                   f'## statement\n{stmt}\n\n## proof\n{proof}\n')
+            (self.facts / f'{fid}.md').write_bytes(raw.encode('utf-8'))
+            records.append({'fact_id': fid, 'predecessors': preds, 'markdown': raw})
+
+        # Unpaginated full mode still refuses cleanly under existing 2048/1MiB caps.
+        full_reply = research.dispatch(self.data, self.request())
+        self.assertFalse(full_reply['ok'])
+        self.assertEqual(full_reply['error']['code'], 'size_limit')
+
+        # Paginated index mode streams all 3157 facts & 8616 edges strictly within MAX_JSON (1 MiB) per call.
+        offset, as_of, collected_nodes, collected_edges, pages = 0, None, [], 0, 0
+        while True:
+            args = {'mode': 'index', 'offset': offset, 'limit': 1024}
+            if as_of is not None:
+                args['asOf'] = as_of
+            reply = research.dispatch(self.data, self.request(args=args))
+            self.assertTrue(reply['ok'], reply)
+            self.assertLessEqual(len(research.encoded(reply)), research.MAX_JSON)
+            res = reply['result']
+            as_of = as_of or res['asOf']
+            self.assertEqual(res['asOf'], as_of)
+            page = res['page']
+            self.assertEqual(page['total_nodes'], n_facts)
+            self.assertEqual(page['total_edges'], target_edges)
+            self.assertGreaterEqual(page['max_depth'], 1100)
+            collected_nodes.extend(page['nodes'])
+            collected_edges += sum(len(n['predecessors']) for n in page['nodes'])
+            pages += 1
+            if not page['has_more']:
+                break
+            offset = page['next_offset']
+        self.assertEqual(len(collected_nodes), n_facts)
+        self.assertEqual(collected_edges, target_edges)
+        self.assertGreaterEqual(pages, 2)
+
+        # Drift on asOf is rejected cleanly.
+        drift = research.dispatch(self.data, self.request(args={'mode': 'index', 'offset': 0, 'asOf': '0' * 64}))
+        self.assertFalse(drift['ok'])
+        self.assertEqual(drift['error']['code'], 'fact_page_changed')
+
+        # On-demand single-fact detail loads complete proof & predecessors within 1 MiB.
+        target_fid = ids[1100]
+        detail_reply = research.dispatch(self.data, self.request(args={'mode': 'fact', 'factId': target_fid, 'asOf': as_of}))
+        self.assertTrue(detail_reply['ok'], detail_reply)
+        self.assertLessEqual(len(research.encoded(detail_reply)), research.MAX_JSON)
+        detail = detail_reply['result']['fact']
+        self.assertEqual(detail['id'], target_fid)
+        self.assertIn('Proof 1100:', detail['proof'])
+        self.assertEqual(detail['predecessors'], preds_by_idx[1100])
+
+        # Overview memory summary also works at 3157 facts (<= MAX_TREE_FILES = 4096).
+        overview_req = self.request()
+        overview_req['operation'] = 'dashboard_memory'
+        overview_req['arguments'] = {'view': 'overview'}
+        ov_reply = research.dispatch(self.data, overview_req)
+        self.assertTrue(ov_reply['ok'], ov_reply)
+        self.assertEqual(ov_reply['result']['data']['facts'], n_facts)
+
     def test_core_rejects_edge_count_before_producing_graph(self):
         parents = [f'{i:016x}' for i in range(128)]
         for id_ in parents:

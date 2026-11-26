@@ -4,7 +4,13 @@ import { livePaths } from './ui/dashboard/live-protocol.mjs';
 const routes = new Map(livePaths.map(route => [route, Object.freeze(route.startsWith('/api/channel/')
   ? { view: 'channel', kind: route.slice('/api/channel/'.length) }
   : { view: route.slice('/api/'.length) })]));
-export const dashboardSelection = route => routes.get(route);
+const FACT_ROUTE = /^\/api\/fact\/([0-9a-f]{16})$/;
+export const dashboardSelection = route => {
+  const fixed = routes.get(route);
+  if (fixed) return fixed;
+  const match = typeof route === 'string' ? FACT_ROUTE.exec(route) : null;
+  return match ? Object.freeze({ view: 'fact', factId: match[1] }) : undefined;
+};
 export const dashboardHeaders = Object.freeze({ 'cache-control': 'no-store' });
 
 export function createDashboardRequest(read) {

@@ -115,12 +115,19 @@ export function createDashboardView(sdk, projects, { now = () => performance.now
     } finally { observation?.close(); }
   }
 
+  const LIVE_FACT_PATH = new RegExp(`^${LIVE_ROUTE}/api/fact/([0-9a-f]{16})$`);
   function route(path, source) {
     return async c => {
       let lease, eligible = false;
       try {
         const req = c.req.raw, url = new URL(req.url);
-        if (req.method !== 'GET' || url.pathname !== path || url.search || url.hash || req.body !== null
+        let resolvedSource = source;
+        if (path === `${LIVE_ROUTE}/api/fact/:factId`) {
+          const match = LIVE_FACT_PATH.exec(url.pathname);
+          if (req.method !== 'GET' || !match || url.search || url.hash || req.body !== null
+            || headers.some(name => req.headers.has(name))) return deny('DASHBOARD_VIEW_INVALID_INPUT', 400);
+          resolvedSource = `/api/fact/${match[1]}`;
+        } else if (req.method !== 'GET' || url.pathname !== path || url.search || url.hash || req.body !== null
           || headers.some(name => req.headers.has(name))) return deny('DASHBOARD_VIEW_INVALID_INPUT', 400);
         const ctx = c.get('appRequestContext'), doc = ctx?.document, stamp = liveStamp(doc?.context);
         const epoch = req.headers.get(EPOCH_HEADER), seq = req.headers.get(SEQUENCE_HEADER);
@@ -152,7 +159,7 @@ export function createDashboardView(sdk, projects, { now = () => performance.now
         if (activation && !await lease.activated) throw fail('DASHBOARD_VIEW_UNBOUND');
         await hostStillBound();
         if (activation) return new Response(null, { status: 204, headers: dashboardHeaders });
-        const result = await lease.read(source, guard);
+        const result = await lease.read(resolvedSource, guard);
         await hostStillBound();
         guard();
         return result;
@@ -166,6 +173,7 @@ export function createDashboardView(sdk, projects, { now = () => performance.now
   return Object.freeze({ supported, registerRoutes(app) {
     app.get(LIVE_ACTIVATE, route(LIVE_ACTIVATE));
     for (const source of livePaths) app.get(`${LIVE_ROUTE}${source}`, route(`${LIVE_ROUTE}${source}`, source));
+    app.get(`${LIVE_ROUTE}/api/fact/:factId`, route(`${LIVE_ROUTE}/api/fact/:factId`, null));
   }, async registerTool() {
     if (!supported) return;
     return sdk.tools.register({ name: 'math_dashboard_view', documentAccess: 'read', view: { providerId: LIVE_PROVIDER },

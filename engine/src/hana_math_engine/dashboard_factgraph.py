@@ -56,22 +56,32 @@ def _parse_fact(text: str) -> Dict[str, Any]:
 
 def _depths(deps: Dict[str, List[str]]) -> Dict[str, int]:
     """depth = longest path from a leaf (no-predecessor) node up to this one —
-    how many dependency layers a fact is built on. Leaves = 0. Cycle-guarded (a
-    content-addressed DAG shouldn't cycle, but the store may be mid-write)."""
+    how many dependency layers a fact is built on. Leaves = 0. Iterative and
+    cycle-guarded so deep DAGs up to MAX_TREE_FILES never hit RecursionError."""
     depth: Dict[str, int] = {}
-
-    def get(fid: str, stack: frozenset) -> int:
-        if fid in depth:
-            return depth[fid]
-        if fid in stack:  # cycle guard
-            return 0
-        ps = deps.get(fid, [])
-        d = 0 if not ps else 1 + max(get(p, stack | {fid}) for p in ps)
-        depth[fid] = d
-        return d
-
-    for fid in deps:
-        get(fid, frozenset())
+    for root in deps:
+        if root in depth:
+            continue
+        # Explicit stack entries: (node_id, expanded, path_set)
+        stack: List[tuple[str, bool]] = [(root, False)]
+        active: set[str] = set()
+        while stack:
+            fid, expanded = stack.pop()
+            if fid in depth:
+                continue
+            if expanded:
+                active.discard(fid)
+                ps = deps.get(fid, [])
+                # A cycle edge (p still in active or missing) contributes 0 just like the recursive guard.
+                depth[fid] = 0 if not ps else 1 + max(depth.get(p, 0) for p in ps)
+                continue
+            if fid in active:
+                continue
+            active.add(fid)
+            stack.append((fid, True))
+            for p in deps.get(fid, []):
+                if p not in depth and p not in active:
+                    stack.append((p, False))
     return depth
 
 
@@ -151,4 +161,93 @@ def build_factgraph(records: Iterable[dict]) -> dict:
     result = {'nodes': nodes, 'edges': edges, 'max_depth': max(depth.values(), default=0)}
     if len(encoded(result)) > MAX_JSON:
         raise FactgraphSizeLimit('factgraph exceeds result byte budget')
+    return result
+
+
+INDEX_PREVIEW_CHARS = 120
+INDEX_PAGE_MAX_BYTES = 512 << 10
+INDEX_PAGE_MAX_LIMIT = 1024
+
+
+def _collect_checked_facts(records: Iterable[dict]) -> tuple[List[dict], Dict[str, List[str]], Dict[str, int], int]:
+    facts, ids, total, total_edges = [], set(), 0, 0
+    for record in records:
+        if len(facts) >= MAX_TREE_FILES:
+            raise FactgraphSizeLimit('factgraph exceeds tree file budget')
+        fact, size = _checked_fact(record)
+        total += size
+        if total > MAX_TREE_BYTES:
+            raise FactgraphSizeLimit('factgraph exceeds tree byte budget')
+        if fact['fact_id'] in ids:
+            raise ValueError('duplicate canonical fact ID')
+        ids.add(fact['fact_id'])
+        total_edges += len(fact['predecessors'])
+        facts.append(fact)
+    if any(p not in ids for f in facts for p in f['predecessors']):
+        raise ValueError('factgraph observation is missing a predecessor')
+    facts.sort(key=lambda f: f['fact_id'])
+    deps = {f['fact_id']: f['predecessors'] for f in facts}
+    depth = _depths(deps)
+    return facts, deps, depth, total_edges
+
+
+def build_factgraph_index_page(
+    records: Iterable[dict],
+    *,
+    offset: int = 0,
+    limit: int = 512,
+    max_bytes: int = INDEX_PAGE_MAX_BYTES,
+) -> dict:
+    """Build one bounded, lightweight topology/hover page for large graphs (up to MAX_TREE_FILES).
+
+    Never raises Core's 1 MiB IPC cap: omits proof/intuition bodies and shrinks the page to fit max_bytes.
+    """
+    if type(offset) is not int or offset < 0 or type(limit) is not int or not (1 <= limit <= INDEX_PAGE_MAX_LIMIT):
+        raise ValueError('invalid factgraph index pagination')
+    facts, deps, depth, total_edges = _collect_checked_facts(records)
+    total_nodes = len(facts)
+    max_depth = max(depth.values(), default=0)
+    if total_nodes == 0:
+        if offset != 0:
+            raise ValueError('invalid factgraph index offset')
+        return {
+            'nodes': [], 'max_depth': 0, 'total_nodes': 0, 'total_edges': 0,
+            'offset': 0, 'returned': 0, 'has_more': False, 'next_offset': None,
+        }
+    if offset >= total_nodes:
+        raise ValueError('factgraph index offset out of range')
+    rows = []
+    for f in facts[offset:offset + limit]:
+        fid = f['fact_id']
+        stmt = f['statement']
+        preview = stmt[:INDEX_PREVIEW_CHARS] if len(stmt) > INDEX_PREVIEW_CHARS else stmt
+        rows.append({
+            'id': fid, 'author': f['author'], 'depth': depth.get(fid, 0),
+            'statement': preview, 'predecessors': deps[fid],
+        })
+    while True:
+        end = offset + len(rows)
+        has_more = end < total_nodes
+        page = {
+            'nodes': rows, 'max_depth': max_depth, 'total_nodes': total_nodes,
+            'total_edges': total_edges, 'offset': offset, 'returned': len(rows),
+            'has_more': has_more, 'next_offset': end if has_more else None,
+        }
+        if len(encoded(page)) <= max_bytes:
+            return page
+        if len(rows) <= 1:
+            raise FactgraphSizeLimit('factgraph index row exceeds response byte budget')
+        rows = rows[:max(1, len(rows) // 2)]
+
+
+def build_factgraph_fact(record: dict, *, depth: int = 0) -> dict:
+    """Build one complete fact DTO for on-demand inspection in a large graph."""
+    fact, _ = _checked_fact(record)
+    result = {
+        'id': fact['fact_id'], 'author': fact['author'], 'problem_id': fact['problem_id'],
+        'statement': fact['statement'], 'proof': fact['proof'], 'intuition': fact['intuition'],
+        'predecessors': fact['predecessors'], 'depth': depth,
+    }
+    if len(encoded(result)) > MAX_JSON:
+        raise FactgraphSizeLimit('factgraph detail exceeds result byte budget')
     return result

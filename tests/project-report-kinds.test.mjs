@@ -283,6 +283,64 @@ test('revision outcomes validate bounded counts, ordered skip reasons and exact 
   }
 });
 
+test('stitched, revision and verification selectors bind cleanly across audit, verify, revise and math contracts', () => {
+  const planReportId = 'report-21234567-89ab-cdef-0123-456789abcdef';
+  const finalSectionReportId = 'report-31234567-89ab-cdef-0123-456789abcdef';
+  const revisionReportId = 'report-41234567-89ab-cdef-0123-456789abcdef';
+  const verificationReportId = 'report-51234567-89ab-cdef-0123-456789abcdef';
+  const stitched = { planReportId, finalSectionReportId };
+  const revSel = { revisionReportId };
+  const verSel = { verificationReportId };
+  // reference-audit
+  for (const sel of [stitched, revSel]) {
+    assert.equal(validReportStart({ kind: 'reference-audit', audit: { ...sel, paperId: 'main' } }, projectId), true);
+    const { sourceReportId: _drop, ...rest } = audit;
+    const bound = { ...sel, ...rest };
+    const meta = { projectId, reportId, kind: 'reference-audit', audit: bound };
+    assert.equal(validReportPayload(meta, projectId), true);
+    const fields = reportTaskFields(meta);
+    assert.equal(matchesReportTaskFields(meta, fields), true);
+    for (const k of Object.keys(sel)) assert.equal(fields[k], sel[k]);
+    assert.equal(Object.hasOwn(fields, 'sourceReportId'), false);
+  }
+  assert.equal(validReportStart({ kind: 'reference-audit', audit: { sourceReportId: reportId, ...stitched, paperId: 'main' } }, projectId), false);
+  assert.equal(validReportStart({ kind: 'reference-audit', audit: { planReportId, paperId: 'main' } }, projectId), false);
+  // reference-verification
+  for (const sel of [stitched, revSel]) {
+    const { sourceReportId: _drop, ...rest } = verification;
+    const meta = { projectId, reportId, kind: 'reference-verification', verification: { ...sel, ...rest } };
+    assert.equal(validReportPayload(meta, projectId), true);
+    const fields = reportTaskFields(meta);
+    assert.equal(matchesReportTaskFields(meta, fields), true);
+    for (const k of Object.keys(sel)) assert.equal(fields[k], sel[k]);
+    assert.equal(Object.hasOwn(fields, 'sourceReportId'), false);
+  }
+  assert.equal(validReportPayload({ projectId, reportId, kind: 'reference-verification', verification: { ...verification, ...stitched } }, projectId), false);
+  // paper-revision (citation mode)
+  for (const sel of [stitched, revSel]) {
+    const { sourceReportId: _drop, ...rest } = revision;
+    const meta = { projectId, reportId, kind: 'paper-revision', language: 'English', revision: { ...sel, ...rest } };
+    assert.equal(validReportPayload(meta, projectId), true);
+    assert.equal(matchesReportTaskFields(meta, reportTaskFields(meta)), true);
+  }
+  assert.equal(validReportPayload({ projectId, reportId, kind: 'paper-revision', language: 'English', revision: { ...revision, ...stitched } }, projectId), false);
+  // paper-revision (operator-notes stitched)
+  const notesSel = { mode: 'operator-notes', ...stitched, paperId: 'main' };
+  assert.equal(validReportStart({ kind: 'paper-revision', language: 'English', revision: notesSel, notes: 'x' }, projectId), true);
+  const notesBound = { ...notesSel, sourceStatus: 'generated', notesBytes: 1,
+    ...Object.fromEntries(['mainSha256', 'ledgerSha256', 'provenanceSha256', 'notesSha256', 'contractSha256', 'reviserPromptSha256', 'styleSha256', 'promptSha256'].map(k => [k, 'a'.repeat(64)])) };
+  assert.equal(validReportPayload({ projectId, reportId, kind: 'paper-revision', language: 'English', revision: notesBound, state: 'queued' }, projectId), true);
+  // paper-math-verification (revision and verification selectors)
+  for (const sel of [revSel, verSel]) {
+    assert.equal(validReportStart({ kind: mathKind, language: 'English', projectId, math: sel }, projectId), true);
+    const binding = { ...sel, ...mathHashes };
+    const meta = { projectId, reportId, language: 'English', state: 'completed', mathVerdict: 'correct', ...reportKindSpec(mathKind).recordFields(binding) };
+    assert.equal(validReportPayload(meta, projectId), true);
+    assert.equal(matchesReportTaskFields(meta, reportTaskFields(meta)), true);
+  }
+  assert.equal(validReportStart({ kind: mathKind, language: 'English', projectId, math: { ...revSel, ...verSel } }, projectId), false);
+});
+
 test('completed no-op metadata has no derived artifacts; absence alone preserves legacy compatibility', () => {
   const meta = { kind: 'paper-revision', language: 'English', revision, state: 'completed',
     revisionOutcome: { schemaVersion: 1, status: 'no_edits_applied', reason: 'EMPTY_PATCH', parsedCount: 0, appliedCount: 0, skipped: [] },

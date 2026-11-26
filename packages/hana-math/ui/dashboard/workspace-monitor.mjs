@@ -236,7 +236,24 @@ export function createWorkspaceMonitor(transport, { clear, render, status, graph
   clear();
   sync();
 
-  return Object.freeze({ select(next, nextChannel) {
+  async function readFact(factId) {
+    const l = life, activeScope = scope;
+    if (!l || !activeScope || !readable(activeScope) || typeof factId !== 'string' || !/^[0-9a-f]{16}$/.test(factId)) throw refusal();
+    const abort = new AbortController();
+    const control = { again: false, busy: false, stage: 'business', first: null,
+      note() {}, fail() { return refusal(); } };
+    const detail = await packet(l, abort.signal, control, `/api/fact/${factId}`, value => {
+      if (!object(value) || value.id !== factId || typeof value.statement !== 'string'
+        || typeof value.proof !== 'string' || !Array.isArray(value.predecessors)) throw refusal();
+      return value;
+    }, activeScope.generation);
+    control.stage = 'verify';
+    const latest = await packet(l, abort.signal, control, '/current', discovery);
+    if (!alive(l) || !same(activeScope, latest) || !same(scope, activeScope)) throw refusal();
+    return detail;
+  }
+
+  return Object.freeze({ readFact, select(next, nextChannel) {
     if (stopped || !Object.hasOwn(TABS, next)) return;
     if (nextChannel !== undefined && (next !== 'memory' || !channelNames.has(nextChannel))) return;
     if (tab === next && (nextChannel === undefined || nextChannel === channel)) return;

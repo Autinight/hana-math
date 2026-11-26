@@ -33,7 +33,7 @@ async function fixture(t) {
   const unexpected = async () => { assert.fail('Unexpected legacy service, result, finalize or staging call'); };
   const service = Object.fromEntries(['run', 'status', 'setupStatus', 'setToolMode', 'result', 'stop', 'invoke', 'recordSubmissionInputRejection'].map(name => [name, unexpected]));
   const projects = Object.fromEntries(['create', 'list', 'status', 'assign', 'start', 'stop', 'result', 'invoke', 'handles', 'goal', 'mainGoal', 'finalize'].map(name => [name, unexpected]));
-  for (const method of [...Object.values(methods), ...Object.values(planMethods), ...Object.values(auditMethods), ...Object.values(verifyMethods), ...Object.values(revisionMethods), ...Object.values(mathMethods), 'summary', 'paperSubgraph']) projects[method] = async (...args) => {
+  for (const method of [...Object.values(methods), ...Object.values(planMethods), ...Object.values(auditMethods), ...Object.values(verifyMethods), ...Object.values(revisionMethods), ...Object.values(mathMethods), 'paperDeliver', 'paperChapterTreeStitch', 'summary', 'paperSubgraph']) projects[method] = async (...args) => {
     assert.equal(args.length, 2);
     calls.push({ method, args: args[0], context: args[1] });
     if (controls.error) throw controls.error;
@@ -169,9 +169,10 @@ test('public stitch still stages only main.tex and never projects internal ledge
 test('operator-notes public schema and runtime keep mutually exclusive citation and direct-notes variants', async t => {
   const f = await fixture(t), schema = f.tool.parameters;
   const base = { action: 'paper_revise', projectId: PROJECT, reportId: REPORT };
-  assert.equal(schema.oneOf.filter(v => v.properties.action.const === 'paper_revise').length, 2);
+  const stitchedNotes = { action: 'paper_revise', projectId: PROJECT, planReportId: PLAN, finalSectionReportId: SECTION, mode: 'operator-notes', notes: 'Stitched edit.' };
+  assert.equal(schema.oneOf.filter(v => v.properties.action.const === 'paper_revise').length, 6);
   for (const input of [base, { ...base, mode: 'citation' }, { ...base, mode: 'operator-notes', notes: '  Opaque 编辑🙂\r\n ' },
-    { ...base, mode: 'operator-notes', notes: '界'.repeat(10922) + 'ab' }]) {
+    { ...base, mode: 'operator-notes', notes: '界'.repeat(10922) + 'ab' }, stitchedNotes]) {
     assert.equal(accepts(schema, input), true); assert.equal((await f.execute(input)).isError, false);
     const { action, ...args } = input; assert.deepEqual(f.calls.at(-1), { method: 'paperRevise', args, context });
   }
@@ -179,7 +180,11 @@ test('operator-notes public schema and runtime keep mutually exclusive citation 
   for (const input of [{ ...base, mode: 'operator-notes' }, { ...base, mode: 'style', notes: 'x' }, { ...base, notes: 'x' },
     { ...base, mode: 'citation', notes: '' }, { ...base, mode: 'citation', notes: null }, { ...base, mode: null },
     { ...base, mode: 'operator-notes', notes: 'x', verificationReportId: REPORT },
-    { ...base, mode: 'operator-notes', notes: 'x', sourceReportId: REPORT }]) {
+    { ...base, mode: 'operator-notes', notes: 'x', sourceReportId: REPORT },
+    { ...stitchedNotes, reportId: REPORT }, { action: 'paper_revise', projectId: PROJECT, planReportId: PLAN, finalSectionReportId: SECTION },
+    { action: 'paper_revise', projectId: PROJECT, planReportId: PLAN, finalSectionReportId: SECTION, mode: 'citation' },
+    { action: 'paper_revise', projectId: PROJECT, planReportId: PLAN, mode: 'operator-notes', notes: 'x' },
+    { action: 'paper_revise', projectId: PROJECT, finalSectionReportId: SECTION, mode: 'operator-notes', notes: 'x' }]) {
     assert.equal(accepts(schema, input), false); assert.equal((await f.execute(input)).isError, true);
   }
   for (const notes of ['', ' \r\n', null, '\0', '\ud800', 'x'.repeat(32769), '界'.repeat(10923)]) {
@@ -192,8 +197,39 @@ test('operator-notes public schema and runtime keep mutually exclusive citation 
     Object.defineProperty(raw, key, { enumerable: true, get() { reads++; return 'x'; } });
     assert.equal((await f.tool.execute(raw)).isError, true);
   }
+  for (const key of ['planReportId', 'finalSectionReportId']) {
+    const raw = { ...stitchedNotes, context };
+    Object.defineProperty(raw, key, { enumerable: true, get() { reads++; return PLAN; } });
+    assert.equal((await f.tool.execute(raw)).isError, true);
+  }
   assert.equal(reads, 0); assert.equal(f.calls.length, count);
   assert.match(f.tool.description, /not mechanically established/); assert.match(f.tool.description, /requests no citation verification/);
+});
+
+test('paper_audit accepts mutually exclusive reportId or stitched plan/section selectors', async t => {
+  const f = await fixture(t), schema = f.tool.parameters;
+  const byReport = { action: 'paper_audit', projectId: PROJECT, reportId: REPORT };
+  const stitched = { action: 'paper_audit', projectId: PROJECT, planReportId: PLAN, finalSectionReportId: SECTION };
+  assert.equal(schema.oneOf.filter(v => v.properties.action.const === 'paper_audit').length, 2);
+  for (const input of [byReport, stitched]) {
+    assert.equal(accepts(schema, input), true);
+    assert.equal((await f.execute(input)).isError, false);
+    const { action, ...args } = input;
+    assert.deepEqual(f.calls.at(-1), { method: 'paperAudit', args, context });
+  }
+  const before = f.calls.length;
+  for (const bad of [{ action: 'paper_audit', projectId: PROJECT }, { ...byReport, planReportId: PLAN },
+    { ...byReport, finalSectionReportId: SECTION }, { ...byReport, ...stitched },
+    { action: 'paper_audit', projectId: PROJECT, planReportId: PLAN },
+    { action: 'paper_audit', projectId: PROJECT, finalSectionReportId: SECTION }]) {
+    assert.equal(accepts(schema, bad), false);
+    assert.equal((await f.execute(bad)).details.error.code, 'RESEARCH_TOOL_INVALID_INPUT');
+  }
+  let reads = 0;
+  const raw = { ...stitched, context };
+  Object.defineProperty(raw, 'planReportId', { enumerable: true, get() { reads++; return PLAN; } });
+  assert.equal((await f.tool.execute(raw)).isError, true);
+  assert.equal(reads, 0); assert.equal(f.calls.length, before);
 });
 
 test('paper extends only math_project with strict action schemas and explicit source limitations', async t => {
@@ -378,5 +414,46 @@ test('paper service errors and failure values are retained with no result fallba
   const before = f.calls.length, reply = await f.execute({ action: 'paper', ...inputs.paper });
   assert.equal(reply.isError, true);
   assert.equal(reply.details.error.code, 'PROJECT_PAPER_UNAVAILABLE');
+  assert.equal(f.calls.length, before);
+});
+test('gap-fill, compile-fix, paper_deliver and paper_chapter_tree_stitch schemas and dispatch reject invalid shapes', async t => {
+  const f = await fixture(t), schema = f.tool.parameters;
+  const factId = 'a'.repeat(16);
+  const validInputs = [
+    ['paperRevise', { action: 'paper_revise', projectId: PROJECT, reportId: REPORT, mode: 'gap-fill', factIds: [factId], notes: 'Close gap.' }],
+    ['paperRevise', { action: 'paper_revise', projectId: PROJECT, reportId: REPORT, mode: 'gap-fill', factIds: [], notes: 'Need lemma.', missingBacking: ['Need lemma'] }],
+    ['paperRevise', { action: 'paper_revise', projectId: PROJECT, reportId: REPORT, mode: 'compile-fix', compileLog: '! Undefined control sequence.' }],
+    ['paperRevise', { action: 'paper_revise', projectId: PROJECT, planReportId: PLAN, finalSectionReportId: SECTION, mode: 'compile-fix', compileLog: '! Undefined control sequence.' }],
+    ['paperDeliver', { action: 'paper_deliver', projectId: PROJECT, reportId: REPORT, mathReviewReportId: CHILD, allowUncompiledTex: true }],
+    ['paperDeliver', { action: 'paper_deliver', projectId: PROJECT, planReportId: PLAN, finalSectionReportId: SECTION, mathReviewReportId: CHILD, override: { reason: 'Operator review draft.' } }],
+    ['paperChapterTreeStitch', {
+      action: 'paper_chapter_tree_stitch', projectId: PROJECT,
+      host: { reportId: REPORT },
+      chapters: [{ chapterId: 'ch-1', title: 'Chapter 1', reportId: CHILD }],
+      confirmedStyleRules: { confirmedByOperator: true, rules: 'Keep amsart numbering.' },
+    }],
+  ];
+  for (const [method, input] of validInputs) {
+    assert.equal(accepts(schema, input), true, `schema rejected ${input.action}`);
+    const res = await f.execute(input);
+    assert.equal(res.isError, false);
+    const { action, ...args } = input;
+    assert.deepEqual(f.calls.at(-1), { method, args, context });
+  }
+  const before = f.calls.length;
+  for (const bad of [
+    { action: 'paper_revise', projectId: PROJECT, reportId: REPORT, mode: 'gap-fill', notes: 'Missing factIds.' },
+    { action: 'paper_revise', projectId: PROJECT, planReportId: PLAN, finalSectionReportId: SECTION, mode: 'gap-fill', factIds: [factId], notes: 'No stitched gap-fill.' },
+    { action: 'paper_revise', projectId: PROJECT, reportId: REPORT, mode: 'compile-fix', notes: 'Wrong field.' },
+    { action: 'paper_deliver', projectId: PROJECT, reportId: REPORT },
+    { action: 'paper_deliver', projectId: PROJECT, reportId: REPORT, planReportId: PLAN, finalSectionReportId: SECTION, mathReviewReportId: CHILD },
+    { action: 'paper_deliver', projectId: PROJECT, reportId: REPORT, mathReviewReportId: CHILD, override: { reason: '   ' } },
+    { action: 'paper_chapter_tree_stitch', projectId: PROJECT, host: { reportId: REPORT }, chapters: [] },
+    { action: 'paper_chapter_tree_stitch', projectId: PROJECT, host: { reportId: REPORT },
+      chapters: [{ chapterId: 'ch-1', title: 'Ch 1', reportId: CHILD }],
+      confirmedStyleRules: { confirmedByOperator: false, rules: 'Unconfirmed.' } },
+  ]) {
+    assert.equal((await f.execute(bad)).isError, true);
+  }
   assert.equal(f.calls.length, before);
 });

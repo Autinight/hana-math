@@ -3,7 +3,7 @@
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { types } from 'node:util';
 import { createContextStore, contextId } from './context-service.mjs';
-import { createProjectCoreAccess, normalizeProjectCoreArguments, projectCoreManagedIpcRefusal, releaseValidatedProjectRead, acceptDashboardViewRead, acceptDashboardViewBusy } from './project-core-access.mjs';
+import { createProjectCoreAccess, normalizeProjectCoreArguments, projectCoreManagedIpcRefusal, releaseValidatedProjectRead, acceptDashboardViewRead, acceptDashboardViewBusy, acceptDashboardViewGraphFallback } from './project-core-access.mjs';
 import { createProjectMainSession } from './project-main-session.mjs';
 import * as projectMainSession from './project-main-session.mjs';
 import { createMainControlService } from './main-control-service.mjs';
@@ -18,6 +18,8 @@ import { readManagedIpcUsage, runtimeRejectionInfo, supportsManagedDashboardRead
 import { DEFAULT_LANGUAGE, LANGUAGE } from './human-summary.mjs';
 import { createProjectReportService } from './project-report-service.mjs';
 import { snapshotPaperRevisionRequest } from './paper-revision-input.mjs';
+import { snapshotPaperDeliveryRequest } from './paper-delivery.mjs';
+import { snapshotChapterTreeRequest } from './paper-chapter-tree.mjs';
 import { collectProjectGraph, GRAPH_FACT_LIMIT, GRAPH_EDGE_LIMIT } from './project-graph.mjs';
 import { normalizeWorkerDispatch, workerDisplayTitle, WORKER_DISPLAY_TITLE_GUIDANCE } from './worker-selection.mjs';
 import { projectWorkerModels, workerModelPage } from './worker-model-options.mjs';
@@ -1000,6 +1002,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
               if (!p.coreBlocked && !p.persistenceFailed && acceptDashboardViewBusy(p.core, error) && view.workspace) {
                 await view.recheck(); view.guard(); throw workspaceProjectBusy;
               }
+              if (!p.coreBlocked && !p.persistenceFailed) acceptDashboardViewGraphFallback(p.core, error);
               view.guard();
             }
             throw error;
@@ -1492,6 +1495,28 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       return publish(currentSnapshot);
     }
   }
+  async function gatherGapFillFacts(projectId, authority, factIds) {
+    const present = new Set(), facts = [];
+    let options = {}, asOf = null;
+    try {
+      for (;;) {
+        const page = await reportResult(projectId, options, authority);
+        asOf ??= page.page.asOf;
+        check(page.page.asOf === asOf, 'PROJECT_SUMMARY_GRAPH_CHANGED');
+        for (const row of page.facts) present.add(row.fact_id);
+        if (!page.page.hasMore) break;
+        options = { cursor: page.page.nextCursor };
+      }
+      for (const factId of factIds) {
+        check(present.has(factId), 'PROJECT_PAPER_GAP_FILL_FACT_NOT_FOUND');
+        const { fact } = await reportResult(projectId, { factId }, authority);
+        check(fact && fact.fact_id === factId && Array.isArray(fact.predecessors) && typeof fact.markdown === 'string', 'PROJECT_PAPER_GAP_FILL_FACT_NOT_FOUND');
+        facts.push({ fact_id: fact.fact_id, predecessors: [...fact.predecessors], markdown: fact.markdown });
+      }
+      await requireSnapshot(projectId, authority, asOf);
+    } catch (error) { if (factPageChanged(error)) throw failure('PROJECT_SUMMARY_GRAPH_CHANGED'); throw error; }
+    return { facts, asOf };
+  }
   async function gatherSummaryFacts(projectId, authority) {
     const rows = [], facts = []; let options = {}, asOf = null;
     try {
@@ -1695,7 +1720,8 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
       };
       const input = snapshotPlanData(selection, 'PROJECT_INVALID_INPUT');
       const graph = input?.view === 'factgraph' && Reflect.ownKeys(input).length === 1;
-      check(graph || object(input) && validProjectDashboardMemorySelection(input), 'PROJECT_INVALID_INPUT');
+      const factDetail = input?.view === 'fact' && Reflect.ownKeys(input).length === 2 && typeof input.factId === 'string' && FACT_ID.test(input.factId);
+      check(graph || factDetail || object(input) && validProjectDashboardMemorySelection(input), 'PROJECT_INVALID_INPUT');
       const recheck = async (active = guard) => {
         active();
         if (followStamp !== null) {
@@ -1707,18 +1733,65 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
         check(!own.some(row => row.path === creatorPath || row.sessionId === creatorId), 'PROJECT_OWNER_DENIED');
       };
       await recheck(); guard();
-      const operation = graph ? 'dashboard_factgraph' : 'dashboard_memory';
+      const operation = graph || factDetail ? 'dashboard_factgraph' : 'dashboard_memory';
       const admission = Object.freeze({});
       dashboardViewAdmissions.set(admission, Object.freeze({ project: p, operation, guard, recheck, assertProjectOwned, publication, workspace: mode !== 'document' }));
-      const args = graph ? {} : input;
-      const result = await queueCore(p, operation, terminal ? {...args, terminal:true} : args, null, false, null, admission);
+      const args = graph ? {} : factDetail ? { mode: 'fact', factId: input.factId } : input;
+      const isGraphSizeLimit = err => err?.coreError?.code === 'size_limit'
+        || err?.runtime?.coreError?.code === 'size_limit'
+        || err?.cause?.coreError?.code === 'size_limit'
+        || err?.state?.current?.outcome?.failure?.runtime?.coreError?.code === 'size_limit';
+      const isPageDrift = err => err?.coreError?.code === 'fact_page_changed'
+        || err?.runtime?.coreError?.code === 'fact_page_changed'
+        || err?.cause?.coreError?.code === 'fact_page_changed'
+        || err?.state?.current?.outcome?.failure?.runtime?.coreError?.code === 'fact_page_changed';
+      let result;
+      try {
+        result = await queueCore(p, operation, terminal ? { ...args, terminal: true } : args, null, false, null, admission);
+      } catch (error) {
+        if (!graph || !isGraphSizeLimit(error)) throw error;
+        // Large fact graph (M-07): stream lightweight index pages within existing 1 MiB Core IPC cap.
+        let assembled = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            let offset = 0, asOf, maxDepth = 0, totalNodes = null, lastRevision;
+            const nodes = [], edges = [];
+            for (let pageNo = 0; pageNo < 64; pageNo++) {
+              guard();
+              const pageArgs = { mode: 'index', offset, limit: 512, ...(asOf ? { asOf } : {}), ...(terminal ? { terminal: true } : {}) };
+              const res = await queueCore(p, 'dashboard_factgraph', pageArgs, null, false, null, admission);
+              guard();
+              const page = res.page;
+              asOf ??= res.asOf;
+              totalNodes ??= page.total_nodes;
+              check(res.asOf === asOf && page.total_nodes === totalNodes && page.offset === nodes.length, 'PROJECT_DASHBOARD_VIEW_CHANGED');
+              maxDepth = page.max_depth;
+              if (terminal) lastRevision = res.inventoryRevision;
+              for (const n of page.nodes) {
+                nodes.push({ id: n.id, author: n.author, depth: n.depth, statement: n.statement,
+                  predecessors: [...n.predecessors], detailLoaded: false });
+                for (const pred of n.predecessors) edges.push({ source: pred, target: n.id });
+              }
+              if (!page.has_more) break;
+              offset = page.next_offset;
+            }
+            check(nodes.length === totalNodes && nodes.length <= GRAPH_FACT_LIMIT && edges.length <= GRAPH_EDGE_LIMIT, 'PROJECT_DASHBOARD_VIEW_CHANGED');
+            assembled = { graph: { nodes, edges, max_depth: maxDepth, detailOnDemand: true }, asOf, ...(terminal ? { inventoryRevision: lastRevision } : {}) };
+            break;
+          } catch (pageErr) {
+            if (isPageDrift(pageErr) && attempt === 0) continue;
+            throw pageErr;
+          }
+        }
+        result = assembled;
+      }
       guard();
       if (terminal) {
         const data = fence.project(terminal, input, result);
         recordRevision?.(endedAt, result.inventoryRevision);
         return data;
       }
-      return graph ? result.graph : result.data;
+      return graph ? result.graph : factDetail ? result.fact : result.data;
     });
   }
   async function paperStitch(args, ctx) {
@@ -1740,12 +1813,14 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
   async function paperResult(args, ctx) { fields(args, ['projectId', 'reportId'], ['projectId', 'reportId']); return reports.result(get(contextId(args.projectId)), args, ctx, { kind: 'paper-source' }); }
   async function paperStop(args, ctx) { fields(args, ['projectId', 'reportId'], ['projectId', 'reportId']); return reports.stop(get(contextId(args.projectId)), args, ctx, { kind: 'paper-source' }); }
   async function paperAudit(args, ctx) {
-    fields(args, ['projectId', 'reportId'], ['projectId', 'reportId']);
-    const projectId = contextId(args.projectId), p = get(projectId);
+    args = snapshotPlanData(args);
+    const source = args && Object.hasOwn(args, 'reportId');
+    args = source ? snapshotPaperSectionRequest(args, { read: true }) : snapshotPaperStitchRequest(args);
+    const p = get(contextId(args.projectId));
     check(await authorize(p, ctx) === 'creator', 'PROJECT_SUMMARY_DENIED'); live(p);
-    const sourceReport = await reports.status(p, { reportId: args.reportId }, ctx, { kind: 'paper-source' });
-    check(sourceReport.state === 'completed', 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
-    return reports.start(p, { kind: 'reference-audit', language: 'English', audit: { sourceReportId: args.reportId, paperId: sourceReport.paperId } }, ctx);
+    const selector = source ? { reportId: args.reportId }
+      : { planReportId: args.planReportId, finalSectionReportId: args.finalSectionReportId };
+    return reports.audit(p, selector, ctx);
   }
   async function paperAuditStatus(args, ctx) { fields(args, ['projectId', 'reportId'], ['projectId', 'reportId']); return reports.status(get(contextId(args.projectId)), args, ctx, { kind: 'reference-audit' }); }
   async function paperAuditResult(args, ctx) { fields(args, ['projectId', 'reportId'], ['projectId', 'reportId']); return reports.result(get(contextId(args.projectId)), args, ctx, { kind: 'reference-audit' }); }
@@ -1812,6 +1887,18 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
   async function paperVerifyMathStop(args, ctx) {
     args = snapshotPaperSectionRequest(args, { read: true });
     return reports.stop(get(contextId(args.projectId)), args, ctx, paperMathKind);
+  }
+  async function paperDeliver(args, ctx, options) {
+    args = snapshotPaperDeliveryRequest(args);
+    const p = get(contextId(args.projectId));
+    check(await authorize(p, ctx) === 'creator', 'PROJECT_SUMMARY_DENIED'); live(p);
+    return reports.deliver(p, args, ctx, options);
+  }
+  async function paperChapterTreeStitch(args, ctx) {
+    args = snapshotChapterTreeRequest(args);
+    const p = get(contextId(args.projectId));
+    check(await authorize(p, ctx) === 'creator', 'PROJECT_SUMMARY_DENIED'); live(p);
+    return reports.chapterTreeStitch(p, args, ctx);
   }
   async function invoke(name, args, ctx) {
     check(MAIN_TOOLS.has(name), 'PROJECT_TOOL_DENIED');
@@ -1896,7 +1983,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
     isFreshProject: p => freshProjects.has(p),
     authorizeCreator: async (p, ctx) => { check(await authorize(p, ctx) === 'creator', 'PROJECT_SUMMARY_DENIED'); },
     projects: () => projects.values(), getProject: get, assertLive: live, gatherFacts: gatherSummaryFacts, withReportPublication,
-    gatherPaperFacts, withPaperPublication, paperRunnerIpcScope, assertPaperTarget, withPaperTarget,
+    gatherPaperFacts, gatherGapFillFacts, withPaperPublication, paperRunnerIpcScope, assertPaperTarget, withPaperTarget,
     readInput: p => store.readJson(location(p, 'input.json')), track, projectLocation: p => `${BASE}/${p.meta.projectId}`, literature });
   const registration = await bounded(sdk.tasks.registerHandler(HANDLER, { run: async event => {
     const p = projects.get(event?.input?.projectId);
@@ -2523,6 +2610,7 @@ export async function createProjectService(sdk, { contexts, profiles, research, 
   return Object.freeze({ create, operatorRead, operatorSave, list, status, ipcUsage, assign, start, stop, result: (args, ctx) => result(args, ctx, null, true), graph, dashboardSnapshot, workerModels, finalize, summary, summaryStatus, summaryResult, summaryStop, paperSubgraph, paper, paperStatus, paperResult, paperStop,
     paperAudit, paperAuditStatus, paperAuditResult, paperAuditStop, paperVerify, paperVerifyStatus, paperVerifyResult, paperVerifyStop,
     paperVerifyMath, paperVerifyMathStatus, paperVerifyMathResult, paperVerifyMathStop,
+    paperDeliver, paperChapterTreeStitch,
     paperPlan, paperPlanStatus, paperPlanResult, paperPlanStop, paperSection, paperSectionStatus, paperSectionResult, paperSectionStop, paperStitch, paperStartIpcRefusal,
     paperRevise, paperRevisionStatus, paperRevisionResult, paperRevisionStop, dashboardOverview, readDashboard, authorizeDashboardView, dashboardFollow, dashboardUnfollow,
     verificationReads, recheck, doctor, invoke, handles, goal, mainGoal, workspaceMonitor, workspaceDashboard,

@@ -142,7 +142,8 @@ def build_dashboard_memory(project_id, inventory, args, *, updated_at):
         return {'channels': [{'kind': kind, 'role': role, 'count': counts[kind]} for kind, role in CHANNELS]}
 
     paths = sorted(p for p in inventory if p.parent == Path('fact_graph/facts') and p.suffix == '.md')
-    require(len(paths) <= 2048, 'size_limit', 'dashboard fact index exceeds 2048 facts')
+    from .research import MAX_TREE_FILES
+    require(len(paths) <= MAX_TREE_FILES, 'size_limit', f'dashboard fact index exceeds {MAX_TREE_FILES} facts')
     by_author = Counter()
     with_predecessors = 0
     for p in paths:

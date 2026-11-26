@@ -29,7 +29,7 @@ export function createLivePage(hana, show, { epoch = createEpoch(), now = () => 
       headers: { [EPOCH_HEADER]: epoch, [SEQUENCE_HEADER]: String(entry.seq) }, signal: entry.abort.signal });
   }
   async function request(entry, path) {
-    if (!livePaths.includes(path)) throw refused();
+    if (!livePaths.includes(path) && !/^\/api\/fact\/[0-9a-f]{16}$/.test(path)) throw refused();
     try {
       await current(entry);
       const response = await fetchPath(`${LIVE_ROUTE}${path}`, entry);

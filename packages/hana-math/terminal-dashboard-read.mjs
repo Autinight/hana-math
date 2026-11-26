@@ -35,6 +35,7 @@ export function createTerminalReadFence(writeState) {
       if (token.revision !== null && token.revision !== revision) { token.changed = true; changed(); }
       token.revision = revision;
       if (selection.view === 'factgraph') return result.graph;
+      if (selection.view === 'fact') return result.fact;
       // Live overview carries its read time; a terminal overview must not look
       // as if the research finished again on every background refresh.
       return selection.view === 'overview' ? {...result.data, updated_at:token.endedAt / 1000} : result.data;

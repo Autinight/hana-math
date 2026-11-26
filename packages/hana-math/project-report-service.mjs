@@ -16,6 +16,8 @@ import { readSectionResources, buildSectionPrompt } from './paper-section.mjs';
 import { validSectionBinding, sectionDocuments } from './paper-section-binding.mjs';
 import { snapshotPaperMathSelector, validPaperMathBinding } from './paper-math-service-binding.mjs';
 import { PAPER_MATH_PINS, readPaperMathResources, buildPaperMathPrompt, parsePaperMathReport } from './paper-math-verification.mjs';
+import { evaluatePaperDelivery, snapshotPaperDeliveryRequest } from './paper-delivery.mjs';
+import { assembleChapterTree, snapshotChapterTreeRequest } from './paper-chapter-tree.mjs';
 
 const APP = 'hana-math', HANDLER = 'math-project-report';
 const TERMINAL = new Set(['completed', 'leak', 'failed', 'stopped', 'interrupted']);
@@ -62,6 +64,12 @@ const planWriterEvidence = snapshot => {
 const code = error => typeof error?.code === 'string' && /^[A-Z0-9_]{1,96}$/.test(error.code) ? error.code : 'PROJECT_REPORT_FAILED';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const manuscriptSelectorOf = value => value?.planReportId && value?.finalSectionReportId
+  ? { planReportId: value.planReportId, finalSectionReportId: value.finalSectionReportId }
+  : value?.revisionReportId ? { revisionReportId: value.revisionReportId }
+  : value?.chapterTreeReportId ? { chapterTreeReportId: value.chapterTreeReportId }
+  : value?.sourceReportId ? { sourceReportId: value.sourceReportId } : {};
+const mathSelectorOf = value => value?.verificationReportId ? { verificationReportId: value.verificationReportId } : manuscriptSelectorOf(value);
 function paperValid(paper, projectId) {
   if (!object(paper) || Object.keys(paper).some(k => !['paperId', 'target', 'brief', 'instructions', 'factIds', 'material'].includes(k))
     || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(paper.paperId) || typeof paper.brief !== 'string' || !paper.brief.trim()
@@ -84,7 +92,7 @@ async function bounded(promise) {
 }
 
 export async function createProjectReportService({ sdk, store, summaryWriter, authorizeCreator, projects, getProject,
-  assertLive, gatherFacts, withReportPublication, gatherPaperFacts, withPaperPublication, paperRunnerIpcScope, assertPaperTarget, readInput, track, projectLocation, literature,
+  assertLive, gatherFacts, withReportPublication, gatherPaperFacts, gatherGapFillFacts, withPaperPublication, paperRunnerIpcScope, assertPaperTarget, readInput, track, projectLocation, literature,
   deferHistoricalWork = false, isFreshProject = () => false }) {
   const records = new Map(), active = new Map(), damaged = new Set(), admitting = new Set();
   const deferredByProject = new Map(), historyPreparation = new WeakMap(), mathReviewChecks = new WeakMap();
@@ -279,15 +287,19 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       sessionStop: m.recoveryStop || m.recoveryError ? { outcome: m.recoveryStop ?? null,
         confirmed: CONFIRMED_RECOVERY_STOPS.has(m.recoveryStop), error: m.recoveryError ?? null } : null,
       ...(m.kind === 'paper-plan' ? planView(r) : m.kind === 'paper-section' ? sectionView(r) : {}),
+      ...(m.kind === 'paper-chapter-tree' ? { kind: m.kind, ...copy(m.chapterTree),
+        sourceStatus: m.sourceStatus ?? 'generated', mathematicsStatus: 'unreviewed',
+        reviewStatus: 'unreviewed', compileStatus: 'not-run' } : {}),
       ...(m.kind === 'paper-revision' ? { kind: m.kind, ...copy(m.revision),
         ...(Object.hasOwn(m, 'revisionOutcome') ? { revisionOutcome: copy(m.revisionOutcome) } : {}),
         ...(completedRevisionNoOp(r) ? { proposalProduced: false } : {}),
         proposalOnly: true, publicationStatus: completedRevisionNoOp(r) ? 'no_edits_applied' : 'reviewable-proposal', sourceStatus: m.sourceStatus ?? 'pending',
-        ...(m.revision.mode === 'operator-notes' ? { citationStatus: 'not-requested' }
+        ...(m.revision.mode === 'operator-notes' || m.revision.mode === 'compile-fix' ? { citationStatus: 'not-requested' }
+          : m.revision.mode === 'gap-fill' ? { citationStatus: 'unverified' }
           : { citationStatus: 'inherited-verification-source-judgment', inheritedCitationStatus: m.revision.citationStatus }),
-        provenance: { sourceReportId: m.revision.sourceReportId, sha256: m.revision.provenanceSha256, status: 'inherited-not-revalidated' },
+        provenance: { ...manuscriptSelectorOf(m.revision), sha256: m.revision.provenanceSha256, status: 'inherited-not-revalidated' },
         mathematicsStatus: 'unreviewed', reviewStatus: 'unreviewed', compileStatus: 'not-run' } : {}),
-      ...(m.kind === 'reference-audit' ? { kind: m.kind, sourceReportId: m.audit.sourceReportId, paperId: m.audit.paperId,
+      ...(m.kind === 'reference-audit' ? { kind: m.kind, ...manuscriptSelectorOf(m.audit), paperId: m.audit.paperId,
         sourceMainSha256: m.audit.mainSha256, sourceLedgerSha256: m.audit.ledgerSha256,
         contractSha256: m.audit.contractSha256, auditorPromptSha256: m.audit.auditorPromptSha256,
         promptSha256: m.audit.promptSha256, auditMode: 'offline', citationStatus: 'unverified' } : {}),
@@ -298,7 +310,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         paperMathGate: mathVerdict === 'correct' ? 'passed' : mathVerdict === 'wrong' ? 'failed' : 'not-assessed',
         publicationStatus: 'not-assessed', compileStatus: 'not-run' } : {}),
       ...(m.kind === 'reference-verification' ? { kind: m.kind, auditReportId: m.verification.auditReportId,
-        sourceReportId: m.verification.sourceReportId, paperId: m.verification.paperId,
+        ...manuscriptSelectorOf(m.verification), paperId: m.verification.paperId,
         sourceMainSha256: m.verification.mainSha256, sourceLedgerSha256: m.verification.ledgerSha256,
         auditSha256: m.verification.auditSha256, contractSha256: m.verification.contractSha256,
         verifierPromptSha256: m.verification.verifierPromptSha256, promptSha256: m.verification.promptSha256,
@@ -473,48 +485,225 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       });
     }, r.meta.paper.factIds ?? []);
   }
-  async function paperMathSource(p, selector, guard, authorize) {
-    const identity = r => {
-      const m = r.meta;
-      check(m.projectId === p.meta.projectId && m.reportId === r.meta.reportId && m.creator?.sessionId === p.meta.creator?.sessionId
-        && m.creator?.sessionPath === p.meta.creator?.sessionPath && m.state === 'completed' && !m.cleanupPending
-        && !m.stopRequested && !m.taskCreating && !m.scheduleCreating && !m.writerStarting
-        && m.taskSettlement === 'confirmed' && !m.error && !r.failedSave, 'PROJECT_PAPER_MATH_SOURCE_INVALID');
-      return JSON.stringify([m.kind, m.projectId, m.reportId, m.state, m.cleanupPending, m.stopRequested, m.taskCreating,
-        m.scheduleCreating, m.writerStarting, m.taskSettlement, m.error, m.sourceStatus, m.leakFindings,
-        m.math, m.section, m.artifacts]);
-    };
-    let mainTexBytes, ledgerBytes, sourceReports = [], singleSource = null, stitchedSource = null;
-    if (selector.sourceReportId) {
-      const source = get(p, selector.sourceReportId), m = source.meta, before = identity(source);
-      check(m.kind === 'paper-source' && ['generated', 'flagged'].includes(m.sourceStatus) && !m.leakFindings?.length
-        && !m.artifacts?.quarantinedSource && !m.artifacts?.invalidSource && !m.findings?.leaks?.length,
-      'PROJECT_PAPER_MATH_SOURCE_INVALID');
-      const artifact = (role, name) => {
-        const value = m.artifacts?.[role];
-        check(value?.name === name && value.artifact === `${directory(p, m.reportId)}/${name}`
-          && Number.isSafeInteger(value.bytes) && value.bytes > 0 && value.bytes <= PAPER_ARTIFACT_MAX_BYTES
-          && /^[a-f0-9]{64}$/.test(value.sha256), 'PROJECT_PAPER_MATH_SOURCE_INVALID');
-        return copy(value);
+  const strictTextWith = (bytes, errorCode = 'PROJECT_REFERENCE_VERIFY_SOURCE_INVALID') => {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    check(Buffer.from(text, 'utf8').equals(bytes), errorCode);
+    return text;
+  };
+  const strictText = bytes => strictTextWith(bytes, 'PROJECT_REFERENCE_VERIFY_SOURCE_INVALID');
+  function cleanParentRecord(p, r) {
+    const m = r.meta;
+    return m.projectId === p.meta.projectId && m.reportId === r.meta.reportId
+      && m.creator?.sessionId === p.meta.creator?.sessionId && m.creator?.sessionPath === p.meta.creator?.sessionPath
+      && m.state === 'completed' && !m.cleanupPending && !m.stopRequested && !m.taskCreating
+      && !m.scheduleCreating && !m.writerStarting && !m.scheduleId
+      && m.taskSettlement === 'confirmed' && !m.error && !r.failedSave;
+  }
+  async function readBoundArtifact(p, record, role, name, descriptorCode, bytesCode = descriptorCode, minBytes = 0) {
+    const a = copy(record.meta.artifacts?.[role]);
+    check(a?.name === name && a.artifact === `${directory(p, record.meta.reportId)}/${name}`
+      && Number.isSafeInteger(a.bytes) && a.bytes >= minBytes && a.bytes <= PAPER_ARTIFACT_MAX_BYTES
+      && typeof a.sha256 === 'string' && /^[a-f0-9]{64}$/.test(a.sha256), descriptorCode);
+    let bytes;
+    try { bytes = await store.read(a.artifact); } catch { throw failure(bytesCode); }
+    check(bytes.length === a.bytes && hash(bytes) === a.sha256, bytesCode);
+    return { artifact: a, bytes };
+  }
+  async function readManuscript(p, selector, { authorize, guard, errorCode, changeCode = errorCode, needProvenance = false } = {}) {
+    const checkLive = () => { guard?.(); };
+    if (selector.planReportId && selector.finalSectionReportId) {
+      const stitched = await stitchInternal(p, { planReportId: selector.planReportId, finalSectionReportId: selector.finalSectionReportId },
+        authorize ?? (async () => {}), guard ?? (() => { assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); }));
+      if (selector.paperId !== undefined) check(stitched.summary.paperId === selector.paperId, errorCode);
+      const mainBytes = stitched.bytes, ledgerBytes = Buffer.from(stitched.ledger, 'utf8');
+      const mainSha256 = hash(mainBytes), ledgerSha256 = hash(ledgerBytes);
+      strictTextWith(mainBytes, errorCode); strictTextWith(ledgerBytes, errorCode);
+      if (selector.mainSha256) check(mainSha256 === selector.mainSha256, changeCode);
+      if (selector.ledgerSha256) check(ledgerSha256 === selector.ledgerSha256, changeCode);
+      const assertUnchanged = async () => {
+        await stitched.checkDelivery();
+        check(hash(stitched.bytes) === mainSha256 && hash(Buffer.from(stitched.ledger, 'utf8')) === ledgerSha256, changeCode);
       };
-      const mainArtifact = artifact('source', 'main.tex'), savedLedger = artifact('ledger', 'REFERENCE_LEDGER.md');
-      [mainTexBytes, ledgerBytes] = await Promise.all([store.read(mainArtifact.artifact), store.read(savedLedger.artifact)]);
-      guard();
-      check(identity(source) === before && JSON.stringify(m.artifacts.source) === JSON.stringify(mainArtifact)
-        && JSON.stringify(m.artifacts.ledger) === JSON.stringify(savedLedger)
-        && mainTexBytes.length === mainArtifact.bytes && hash(mainTexBytes) === mainArtifact.sha256
-        && ledgerBytes.length === savedLedger.bytes && hash(ledgerBytes) === savedLedger.sha256,
-      'PROJECT_PAPER_MATH_SOURCE_CHANGED');
-      sourceReports = [{ report: source, identity: hash(JSON.stringify(source.meta)) }];
-      singleSource = { report: source, identity: hash(JSON.stringify(source.meta)), mainArtifact, ledgerArtifact: savedLedger };
+      return { selector: { planReportId: selector.planReportId, finalSectionReportId: selector.finalSectionReportId },
+        paperId: stitched.summary.paperId, sourceStatus: stitched.sourceStatus, mainBytes, ledgerBytes,
+        provenanceBytes: stitched.provenanceBytes, mainSha256, ledgerSha256, stitchedSource: stitched, assertUnchanged };
+    }
+    if (selector.revisionReportId) {
+      const source = get(p, selector.revisionReportId), m = source.meta;
+      check(cleanParentRecord(p, source) && m.kind === 'paper-revision'
+        && (selector.paperId === undefined || m.revision?.paperId === selector.paperId)
+        && ['generated', 'flagged'].includes(m.sourceStatus)
+        && (!Object.hasOwn(m, 'revisionOutcome') || m.revisionOutcome?.status === 'proposal')
+        && m.sha256 === m.artifacts?.source?.sha256 && m.bytes === m.artifacts?.source?.bytes, errorCode);
+      const before = JSON.stringify(m);
+      const [main, ledger, proposal, prov] = await Promise.all([
+        readBoundArtifact(p, source, 'source', 'proposal.tex', errorCode, changeCode, 1),
+        readBoundArtifact(p, source, 'ledger', 'INHERITED_REFERENCE_LEDGER.md', errorCode, changeCode, 1),
+        readBoundArtifact(p, source, 'proposal', 'REVISION_PROPOSAL.json', errorCode, changeCode, 1),
+        readBoundArtifact(p, source, 'provenance', 'INHERITED_PROVENANCE.json', errorCode, changeCode, 0),
+      ]);
+      if (['operator-notes', 'gap-fill'].includes(m.revision.mode)) {
+        try { await readOperatorNotes(p, source); } catch { throw failure(changeCode); }
+      }
+      if (m.revision.mode === 'compile-fix') {
+        try { await readCompileLog(p, source); } catch { throw failure(changeCode); }
+      }
+      let parsedProposal;
+      try { parsedProposal = JSON.parse(strictTextWith(proposal.bytes, changeCode)); } catch { throw failure(changeCode); }
+      check(object(parsedProposal) && parsedProposal.schemaVersion === 1 && parsedProposal.kind === 'paper-revision'
+        && parsedProposal.proposalOnly === true && parsedProposal.publicationStatus === 'reviewable-proposal'
+        && JSON.stringify(parsedProposal.binding) === JSON.stringify(m.revision), changeCode);
+      checkLive();
+      check(source.meta === m && JSON.stringify(m) === before && cleanParentRecord(p, source), changeCode);
+      strictTextWith(main.bytes, errorCode); strictTextWith(ledger.bytes, errorCode);
+      if (selector.mainSha256) check(main.artifact.sha256 === selector.mainSha256, changeCode);
+      if (selector.ledgerSha256) check(ledger.artifact.sha256 === selector.ledgerSha256, changeCode);
+      const assertUnchanged = async () => {
+        if (authorize) await authorize();
+        checkLive();
+        check(source.meta === m && JSON.stringify(m) === before && cleanParentRecord(p, source), changeCode);
+        await Promise.all([
+          readBoundArtifact(p, source, 'source', 'proposal.tex', changeCode, changeCode, 1),
+          readBoundArtifact(p, source, 'ledger', 'INHERITED_REFERENCE_LEDGER.md', changeCode, changeCode, 1),
+          readBoundArtifact(p, source, 'proposal', 'REVISION_PROPOSAL.json', changeCode, changeCode, 1),
+          readBoundArtifact(p, source, 'provenance', 'INHERITED_PROVENANCE.json', changeCode, changeCode, 0),
+        ]);
+        if (['operator-notes', 'gap-fill'].includes(m.revision.mode)) {
+          try { await readOperatorNotes(p, source); } catch { throw failure(changeCode); }
+        }
+        if (m.revision.mode === 'compile-fix') {
+          try { await readCompileLog(p, source); } catch { throw failure(changeCode); }
+        }
+        checkLive();
+        check(source.meta === m && JSON.stringify(m) === before && cleanParentRecord(p, source), changeCode);
+      };
+      return { selector: { revisionReportId: m.reportId }, paperId: m.revision.paperId, sourceStatus: m.sourceStatus,
+        mainBytes: main.bytes, ledgerBytes: ledger.bytes, provenanceBytes: prov.bytes,
+        mainSha256: main.artifact.sha256, ledgerSha256: ledger.artifact.sha256, sourceReport: source, assertUnchanged };
+    }
+    if (selector.chapterTreeReportId) {
+      const source = get(p, selector.chapterTreeReportId), m = source.meta;
+      check(cleanParentRecord(p, source) && m.kind === 'paper-chapter-tree'
+        && (selector.paperId === undefined || m.chapterTree?.paperId === selector.paperId)
+        && ['generated', 'flagged'].includes(m.sourceStatus ?? 'generated')
+        && m.sha256 === m.artifacts?.source?.sha256 && m.bytes === m.artifacts?.source?.bytes, errorCode);
+      const before = JSON.stringify(m);
+      const [main, ledger, manifest, prov] = await Promise.all([
+        readBoundArtifact(p, source, 'source', 'main.tex', errorCode, changeCode, 1),
+        readBoundArtifact(p, source, 'ledger', 'REFERENCE_LEDGER.md', errorCode, changeCode, 1),
+        readBoundArtifact(p, source, 'manifest', 'CHAPTER_TREE_MANIFEST.json', errorCode, changeCode, 1),
+        readBoundArtifact(p, source, 'provenance', 'PROVENANCE.json', errorCode, changeCode, 0),
+      ]);
+      check(main.artifact.sha256 === m.chapterTree.mainSha256 && ledger.artifact.sha256 === m.chapterTree.ledgerSha256
+        && manifest.artifact.sha256 === m.chapterTree.manifestSha256, changeCode);
+      checkLive();
+      check(source.meta === m && JSON.stringify(m) === before && cleanParentRecord(p, source), changeCode);
+      strictTextWith(main.bytes, errorCode); strictTextWith(ledger.bytes, errorCode);
+      if (selector.mainSha256) check(main.artifact.sha256 === selector.mainSha256, changeCode);
+      if (selector.ledgerSha256) check(ledger.artifact.sha256 === selector.ledgerSha256, changeCode);
+      const assertUnchanged = async () => {
+        if (authorize) await authorize();
+        checkLive();
+        check(source.meta === m && JSON.stringify(m) === before && cleanParentRecord(p, source), changeCode);
+        await Promise.all([
+          readBoundArtifact(p, source, 'source', 'main.tex', changeCode, changeCode, 1),
+          readBoundArtifact(p, source, 'ledger', 'REFERENCE_LEDGER.md', changeCode, changeCode, 1),
+          readBoundArtifact(p, source, 'manifest', 'CHAPTER_TREE_MANIFEST.json', changeCode, changeCode, 1),
+          readBoundArtifact(p, source, 'provenance', 'PROVENANCE.json', changeCode, changeCode, 0),
+        ]);
+        checkLive();
+        check(source.meta === m && JSON.stringify(m) === before && cleanParentRecord(p, source), changeCode);
+      };
+      return { selector: { chapterTreeReportId: m.reportId }, paperId: m.chapterTree.paperId,
+        sourceStatus: m.sourceStatus ?? 'generated', mainBytes: main.bytes, ledgerBytes: ledger.bytes,
+        provenanceBytes: prov.bytes, mainSha256: main.artifact.sha256, ledgerSha256: ledger.artifact.sha256,
+        sourceReport: source, assertUnchanged };
+    }
+    const source = get(p, selector.sourceReportId), m = source.meta;
+    check(cleanParentRecord(p, source) && m.kind === 'paper-source'
+      && (selector.paperId === undefined || m.paper?.paperId === selector.paperId)
+      && ['generated', 'flagged'].includes(m.sourceStatus) && !m.leakFindings?.length
+      && !m.artifacts?.quarantinedSource && !m.artifacts?.invalidSource && !m.findings?.leaks?.length, errorCode);
+    const before = JSON.stringify(m);
+    const reads = [
+      readBoundArtifact(p, source, 'source', 'main.tex', errorCode, changeCode, 1),
+      readBoundArtifact(p, source, 'ledger', 'REFERENCE_LEDGER.md', errorCode, changeCode, 1),
+    ];
+    if (needProvenance) reads.push(readBoundArtifact(p, source, 'provenance', 'provenance.json', errorCode, changeCode, 0));
+    const [main, ledger, prov] = await Promise.all(reads);
+    checkLive();
+    check(source.meta === m && JSON.stringify(m) === before && cleanParentRecord(p, source), changeCode);
+    strictTextWith(main.bytes, errorCode); strictTextWith(ledger.bytes, errorCode);
+    if (selector.mainSha256) check(main.artifact.sha256 === selector.mainSha256, changeCode);
+    if (selector.ledgerSha256) check(ledger.artifact.sha256 === selector.ledgerSha256, changeCode);
+    const assertUnchanged = async () => {
+      if (authorize) await authorize();
+      checkLive();
+      check(source.meta === m && JSON.stringify(m) === before && cleanParentRecord(p, source), changeCode);
+      const recheckReads = [
+        readBoundArtifact(p, source, 'source', 'main.tex', changeCode, changeCode, 1),
+        readBoundArtifact(p, source, 'ledger', 'REFERENCE_LEDGER.md', changeCode, changeCode, 1),
+      ];
+      if (needProvenance) recheckReads.push(readBoundArtifact(p, source, 'provenance', 'provenance.json', changeCode, changeCode, 0));
+      await Promise.all(recheckReads);
+      checkLive();
+      check(source.meta === m && JSON.stringify(m) === before && cleanParentRecord(p, source), changeCode);
+    };
+    return { selector: { sourceReportId: m.reportId }, paperId: m.paper.paperId, sourceStatus: m.sourceStatus,
+      mainBytes: main.bytes, ledgerBytes: ledger.bytes, provenanceBytes: prov?.bytes ?? null,
+      mainSha256: main.artifact.sha256, ledgerSha256: ledger.artifact.sha256, sourceReport: source, assertUnchanged };
+  }
+  async function readVerifiedParent(p, verificationReportId, { expectedPaperId, authorize, guard, errorCode, changeCode = errorCode, needProvenance = false } = {}) {
+    const parent = get(p, verificationReportId), v = parent.meta;
+    check(v.kind === 'reference-verification'
+      && (expectedPaperId === undefined || v.verification?.paperId === expectedPaperId)
+      && cleanParentRecord(p, parent), errorCode);
+    const parentSnapshot = JSON.stringify(v), binding = copy(v.verification);
+    const original = await verificationSource(p, binding, { authorize, guard, errorCode, changeCode, needProvenance });
+    const [rawVerdicts, verifiedLedger, module] = await Promise.all([
+      readBoundArtifact(p, parent, 'verdicts', 'REFERENCE_VERDICTS.json', errorCode, changeCode, 0),
+      readBoundArtifact(p, parent, 'ledger', 'REFERENCE_LEDGER.md', errorCode, changeCode, 0),
+      import('./reference-verification.mjs'),
+    ]);
+    // Never trust normalized child JSON: validate again against the original, pre-verification ledger.
+    const verdicts = module.parseReferenceVerdicts(strictTextWith(rawVerdicts.bytes, errorCode), original.ledger);
+    check(module.applyReferenceVerdicts(original.ledger, verdicts) === strictTextWith(verifiedLedger.bytes, changeCode), changeCode);
+    const promotions = verdicts.filter(row => ['verified', 'corrected'].includes(row.verdict)).length;
+    const citationStatus = promotions === verdicts.length ? 'verified' : promotions ? 'partial' : 'unverified';
+    check(binding.citationStatus === citationStatus, errorCode);
+    check(parent.meta === v && JSON.stringify(v) === parentSnapshot && cleanParentRecord(p, parent), changeCode);
+    await original.assertUnchanged();
+    return { parent, binding, original, rawVerdicts: rawVerdicts.bytes, verdicts,
+      ledgerBytes: verifiedLedger.bytes, ledgerSha256: verifiedLedger.artifact.sha256, citationStatus };
+  }
+  async function paperMathSource(p, selector, guard, authorize, { resolveReportId = false } = {}) {
+    let resolvedSelector = { ...selector };
+    if (resolveReportId && selector.sourceReportId) {
+      const target = get(p, selector.sourceReportId), targetKind = target.meta.kind ?? 'summary';
+      if (targetKind === 'paper-revision') resolvedSelector = { revisionReportId: selector.sourceReportId };
+      else if (targetKind === 'reference-verification') resolvedSelector = { verificationReportId: selector.sourceReportId };
+      else if (targetKind === 'paper-chapter-tree') resolvedSelector = { chapterTreeReportId: selector.sourceReportId };
+    }
+    let mainTexBytes, ledgerBytes, checkInput;
+    if (resolvedSelector.verificationReportId) {
+      const verified = await readVerifiedParent(p, resolvedSelector.verificationReportId,
+        { authorize, guard, errorCode: 'PROJECT_PAPER_MATH_SOURCE_INVALID', changeCode: 'PROJECT_PAPER_MATH_SOURCE_CHANGED' });
+      mainTexBytes = verified.original.mainBytes; ledgerBytes = verified.ledgerBytes;
+      checkInput = async binding => {
+        const latest = await readVerifiedParent(p, resolvedSelector.verificationReportId,
+          { authorize, guard, errorCode: 'PROJECT_PAPER_MATH_SOURCE_CHANGED', changeCode: 'PROJECT_PAPER_MATH_SOURCE_CHANGED' });
+        check(latest.original.mainSha256 === binding.mainSha256 && latest.ledgerSha256 === binding.ledgerSha256, 'PROJECT_PAPER_MATH_SOURCE_CHANGED');
+      };
     } else {
-      stitchedSource = await stitchInternal(p, selector, authorize, guard);
-      mainTexBytes = stitchedSource.bytes; ledgerBytes = Buffer.from(stitchedSource.ledger, 'utf8');
+      const manuscript = await readManuscript(p, resolvedSelector,
+        { authorize, guard, errorCode: 'PROJECT_PAPER_MATH_SOURCE_INVALID', changeCode: 'PROJECT_PAPER_MATH_SOURCE_CHANGED' });
+      mainTexBytes = manuscript.mainBytes; ledgerBytes = manuscript.ledgerBytes;
+      checkInput = async () => { await manuscript.assertUnchanged(); };
     }
     const mainTex = strictText(mainTexBytes), ledger = strictText(ledgerBytes);
     const resources = await readPaperMathResources();
     const prompt = buildPaperMathPrompt({ mainTex, ledger, ...resources });
-    const binding = { ...selector,
+    const binding = { ...resolvedSelector,
       mainSha256: hash(mainTexBytes), ledgerSha256: hash(ledgerBytes),
       contractSha256: hash(Buffer.from(resources.contract)), verifierPromptSha256: hash(Buffer.from(resources.verifierPrompt)),
       promptSha256: hash(Buffer.from(prompt)) };
@@ -522,22 +711,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       && binding.verifierPromptSha256 === PAPER_MATH_PINS.verifierPromptSha256, 'PROJECT_PAPER_MATH_RESOURCE_INVALID');
     const assertSource = async () => {
       await authorize(); guard();
-      for (const entry of sourceReports) check(hash(JSON.stringify(entry.report.meta)) === entry.identity, 'PROJECT_PAPER_MATH_SOURCE_CHANGED');
-      if (stitchedSource) {
-        await stitchedSource.checkDelivery();
-        check(hash(stitchedSource.bytes) === binding.mainSha256
-          && hash(Buffer.from(stitchedSource.ledger, 'utf8')) === binding.ledgerSha256, 'PROJECT_PAPER_MATH_SOURCE_CHANGED');
-      } else {
-        check(singleSource && hash(JSON.stringify(singleSource.report.meta)) === singleSource.identity
-          && JSON.stringify(singleSource.report.meta.artifacts?.source) === JSON.stringify(singleSource.mainArtifact)
-          && JSON.stringify(singleSource.report.meta.artifacts?.ledger) === JSON.stringify(singleSource.ledgerArtifact),
-        'PROJECT_PAPER_MATH_SOURCE_CHANGED');
-        const [latestMain, latestLedger] = await Promise.all([store.read(singleSource.mainArtifact.artifact), store.read(singleSource.ledgerArtifact.artifact)]);
-        guard();
-        check(latestMain.length === singleSource.mainArtifact.bytes && hash(latestMain) === binding.mainSha256
-          && latestLedger.length === singleSource.ledgerArtifact.bytes && hash(latestLedger) === binding.ledgerSha256,
-        'PROJECT_PAPER_MATH_SOURCE_CHANGED');
-      }
+      await checkInput(binding);
       const latest = await readPaperMathResources();
       check(hash(Buffer.from(latest.contract)) === binding.contractSha256
         && hash(Buffer.from(latest.verifierPrompt)) === binding.verifierPromptSha256
@@ -547,67 +721,52 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     };
     return { binding, prompt, assertSource };
   }
-  async function auditSource(p, audit) {
-    const source = get(p, audit.sourceReportId), meta = source.meta;
-    check(meta.kind === 'paper-source' && meta.projectId === p.meta.projectId && meta.paper.paperId === audit.paperId
-      && meta.state === 'completed' && meta.sourceStatus !== 'invalid' && !meta.leakFindings?.length
-      && !meta.artifacts?.quarantinedSource && !meta.artifacts?.invalidSource, 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
-    const outputs = {};
-    for (const [role, name] of [['source', 'main.tex'], ['ledger', 'REFERENCE_LEDGER.md']]) {
-      const artifact = meta.artifacts?.[role];
-      check(artifact?.name === name && artifact.artifact === `${directory(p, meta.reportId)}/${name}`
-        && Number.isSafeInteger(artifact.bytes) && artifact.bytes <= PAPER_ARTIFACT_MAX_BYTES
-        && /^[a-f0-9]{64}$/.test(artifact.sha256), 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
-      const bytes = await store.read(artifact.artifact);
-      check(bytes.length === artifact.bytes && hash(bytes) === artifact.sha256, 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
-      outputs[role] = bytes;
-    }
-    check(!meta.cleanupPending && !source.failedSave, 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
-    if (audit.mainSha256) check(meta.artifacts.source.sha256 === audit.mainSha256
-      && meta.artifacts.ledger.sha256 === audit.ledgerSha256, 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
-    return { source, outputs };
+  async function auditSource(p, audit, { authorize, guard, errorCode = 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID', changeCode = errorCode, needProvenance = false } = {}) {
+    const manuscript = await readManuscript(p, audit, { authorize, guard, errorCode, changeCode, needProvenance });
+    return { ...manuscript, source: manuscript.sourceReport, outputs: { source: manuscript.mainBytes, ledger: manuscript.ledgerBytes } };
   }
-  const strictText = bytes => {
-    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    check(Buffer.from(text, 'utf8').equals(bytes), 'PROJECT_REFERENCE_VERIFY_SOURCE_INVALID');
-    return text;
-  };
-  async function verificationSource(p, verification) {
+  async function verificationSource(p, verification, { authorize, guard, errorCode = 'PROJECT_REFERENCE_VERIFY_SOURCE_INVALID', changeCode = errorCode, needProvenance = false } = {}) {
     // Capture all source identities/descriptors before the first asynchronous read.
     const expected = copy(verification), audit = get(p, expected.auditReportId), a = audit.meta;
     const auditState = () => JSON.stringify([a.kind, a.projectId, a.reportId, a.state, a.cleanupPending, a.stopRequested,
       a.taskCreating, a.scheduleCreating, a.writerStarting, a.taskSettlement, a.error, a.audit, a.artifacts?.audit]);
     check(a.kind === 'reference-audit' && a.state === 'completed' && a.audit?.paperId === expected.paperId
       && !a.cleanupPending && !a.stopRequested && !a.taskCreating && !a.scheduleCreating && !a.writerStarting
-      && a.taskSettlement === 'confirmed' && !a.error && !audit.failedSave, 'PROJECT_REFERENCE_VERIFY_SOURCE_INVALID');
+      && a.taskSettlement === 'confirmed' && !a.error && !audit.failedSave, errorCode);
     const auditBinding = auditState(), auditPayload = copy(a.audit), artifact = copy(a.artifacts?.audit);
-    const source = get(p, auditPayload.sourceReportId), s = source.meta;
-    const sourceState = () => JSON.stringify([s.kind, s.projectId, s.reportId, s.state, s.cleanupPending, s.stopRequested,
-      s.paper?.paperId, s.sourceStatus, s.leakFindings, s.artifacts?.source, s.artifacts?.ledger, s.artifacts?.quarantinedSource, s.artifacts?.invalidSource]);
-    const sourceBinding = sourceState();
-    check((expected.sourceReportId === undefined || expected.sourceReportId === auditPayload.sourceReportId)
+    const auditSelector = manuscriptSelectorOf(auditPayload), expectedSelector = manuscriptSelectorOf(expected);
+    check((Object.keys(expectedSelector).length === 0 || JSON.stringify(expectedSelector) === JSON.stringify(auditSelector))
       && auditPayload.boundContractSha256 === auditPayload.contractSha256
       && auditPayload.boundAuditorPromptSha256 === auditPayload.auditorPromptSha256
-      && auditPayload.boundPromptSha256 === auditPayload.promptSha256,
-    'PROJECT_REFERENCE_VERIFY_SOURCE_INVALID');
+      && auditPayload.boundPromptSha256 === auditPayload.promptSha256, errorCode);
     check(artifact?.name === 'REFERENCE_AUDIT.md' && artifact.artifact === `${directory(p, a.reportId)}/REFERENCE_AUDIT.md`
       && Number.isSafeInteger(artifact.bytes) && artifact.bytes >= 0 && artifact.bytes <= PAPER_ARTIFACT_MAX_BYTES
-      && typeof artifact.sha256 === 'string' && /^[a-f0-9]{64}$/.test(artifact.sha256), 'PROJECT_REFERENCE_VERIFY_SOURCE_INVALID');
-    const checked = await auditSource(p, auditPayload);
-    const findings = await store.read(artifact.artifact);
-    check(audit.meta === a && source.meta === s && checked.source === source && auditState() === auditBinding
-      && sourceState() === sourceBinding && !audit.failedSave && !source.failedSave
-      && findings.length === artifact.bytes && hash(findings) === artifact.sha256,
-    'PROJECT_REFERENCE_VERIFY_SOURCE_INVALID');
-    check(auditPayload.mainSha256 === s.artifacts.source.sha256 && auditPayload.ledgerSha256 === s.artifacts.ledger.sha256
+      && typeof artifact.sha256 === 'string' && /^[a-f0-9]{64}$/.test(artifact.sha256), errorCode);
+    const checked = await auditSource(p, auditPayload, { authorize, guard, errorCode, changeCode, needProvenance });
+    let findings;
+    try { findings = await store.read(artifact.artifact); } catch { throw failure(changeCode); }
+    check(audit.meta === a && auditState() === auditBinding && !audit.failedSave
+      && findings.length === artifact.bytes && hash(findings) === artifact.sha256, changeCode);
+    check(auditPayload.mainSha256 === checked.mainSha256 && auditPayload.ledgerSha256 === checked.ledgerSha256
       && (!expected.mainSha256 || expected.mainSha256 === auditPayload.mainSha256)
       && (!expected.ledgerSha256 || expected.ledgerSha256 === auditPayload.ledgerSha256)
-      && (!expected.auditSha256 || expected.auditSha256 === artifact.sha256), 'PROJECT_REFERENCE_VERIFY_SOURCE_INVALID');
-    return { sourceReportId: s.reportId, mainSha256: auditPayload.mainSha256, ledgerSha256: auditPayload.ledgerSha256,
-      auditSha256: artifact.sha256, mainTex: strictText(checked.outputs.source), ledger: strictText(checked.outputs.ledger), findings: strictText(findings) };
+      && (!expected.auditSha256 || expected.auditSha256 === artifact.sha256), changeCode);
+    const assertUnchanged = async () => {
+      await checked.assertUnchanged();
+      check(audit.meta === a && auditState() === auditBinding && !audit.failedSave, changeCode);
+      let latestFindings;
+      try { latestFindings = await store.read(artifact.artifact); } catch { throw failure(changeCode); }
+      check(latestFindings.length === artifact.bytes && hash(latestFindings) === artifact.sha256, changeCode);
+    };
+    return { selector: checked.selector, paperId: checked.paperId, sourceStatus: checked.sourceStatus,
+      ...(checked.selector.sourceReportId ? { sourceReportId: checked.selector.sourceReportId } : {}),
+      mainSha256: auditPayload.mainSha256, ledgerSha256: auditPayload.ledgerSha256,
+      auditSha256: artifact.sha256, mainBytes: checked.mainBytes, mainTex: strictTextWith(checked.mainBytes, errorCode),
+      ledger: strictTextWith(checked.ledgerBytes, errorCode), provenanceBytes: checked.provenanceBytes,
+      findings: strictTextWith(findings, errorCode), assertUnchanged };
   }
-  async function verificationMaterial(p, verification) {
-    const [source, module] = await Promise.all([verificationSource(p, verification), import('./reference-verification.mjs')]);
+  async function verificationMaterial(p, verification, authority = {}) {
+    const [source, module] = await Promise.all([verificationSource(p, verification, authority), import('./reference-verification.mjs')]);
     const resources = await module.readReferenceVerificationResources();
     check(['contract', 'verifierPrompt'].every(k => typeof resources[k] === 'string' && resources[k].isWellFormed()), 'PROJECT_REFERENCE_VERIFY_RESOURCE_INVALID');
     const keys = module.referenceVerificationKeys(source.ledger);
@@ -624,7 +783,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   }
   async function readOperatorNotes(p, r) {
     const binding = copy(r.meta.revision), a = copy(r.meta.artifacts?.notes);
-    check(binding.mode === 'operator-notes' && a && Object.keys(a).length === 5
+    check(['operator-notes', 'gap-fill'].includes(binding.mode) && a && Object.keys(a).length === 5
       && a.name === 'OPERATOR_NOTES.md' && a.mime === 'text/markdown'
       && a.artifact === `${directory(p, r.meta.reportId)}/OPERATOR_NOTES.md`
       && a.bytes === binding.notesBytes && a.sha256 === binding.notesSha256, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
@@ -636,94 +795,204 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     check(Buffer.from(text, 'utf8').equals(bytes) && validOperatorNotes(text), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
     return text;
   }
-  async function notesRevisionMaterial(p, selector, report, admissionNotes) {
-    const expected = copy(selector), source = get(p, expected.sourceReportId), s = source.meta;
-    const cleanParent = () => s.kind === 'paper-source' && s.projectId === p.meta.projectId && s.reportId === expected.sourceReportId
-      && s.paper?.paperId === expected.paperId && s.state === 'completed' && ['generated', 'flagged'].includes(s.sourceStatus)
-      && !s.cleanupPending && !s.stopRequested && !s.taskCreating && !s.scheduleCreating && !s.writerStarting && !s.scheduleId
-      && s.taskSettlement === 'confirmed' && !s.error && !source.failedSave && !s.leakFindings?.length
-      && !s.artifacts?.quarantinedSource && !s.artifacts?.invalidSource
-      && s.creator?.sessionId === p.meta.creator.sessionId && s.creator?.sessionPath === p.meta.creator.sessionPath;
-    check(cleanParent(), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
-    const captured = JSON.stringify(s);
-    const read = async (role, name) => {
-      const a = copy(s.artifacts?.[role]);
-      check(a?.name === name && a.artifact === `${directory(p, s.reportId)}/${name}`
-        && Number.isSafeInteger(a.bytes) && a.bytes >= 0 && a.bytes <= PAPER_ARTIFACT_MAX_BYTES
-        && typeof a.sha256 === 'string' && /^[a-f0-9]{64}$/.test(a.sha256), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
-      const bytes = await store.read(a.artifact);
-      check(bytes.length === a.bytes && hash(bytes) === a.sha256, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
-      strictText(bytes); return bytes;
+  async function readCompileLog(p, r) {
+    const binding = copy(r.meta.revision), a = copy(r.meta.artifacts?.compileLog);
+    check(binding.mode === 'compile-fix' && a && Object.keys(a).length === 5
+      && a.name === 'COMPILE_LOG.txt' && a.mime === 'text/plain'
+      && a.artifact === `${directory(p, r.meta.reportId)}/COMPILE_LOG.txt`
+      && a.bytes === binding.compileLogBytes && a.sha256 === binding.compileLogSha256, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    const bytes = await store.read(a.artifact);
+    check(bytes.length === a.bytes && hash(bytes) === a.sha256 && JSON.stringify(r.meta.artifacts?.compileLog) === JSON.stringify(a)
+      && JSON.stringify(r.meta.revision) === JSON.stringify(binding), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+    check(Buffer.from(text, 'utf8').equals(bytes) && validOperatorNotes(text), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    return text;
+  }
+  async function resolveMathBoundManuscript(p, mathBinding, authority, errorCode) {
+    const sel = mathSelectorOf(mathBinding);
+    if (sel.verificationReportId) {
+      const verified = await readVerifiedParent(p, sel.verificationReportId, { ...authority, errorCode, needProvenance: true });
+      return {
+        selector: { verificationReportId: sel.verificationReportId }, paperId: verified.binding.paperId,
+        sourceStatus: verified.original.sourceStatus, mainBytes: verified.original.mainBytes,
+        ledgerBytes: verified.ledgerBytes, provenanceBytes: verified.original.provenanceBytes,
+        mainSha256: verified.original.mainSha256, ledgerSha256: verified.ledgerSha256,
+        assertUnchanged: verified.original.assertUnchanged,
+      };
+    }
+    return readManuscript(p, sel, { ...authority, errorCode, needProvenance: true });
+  }
+  async function resolveAnyManuscript(p, selector, authority, errorCode) {
+    if (selector.reportId) {
+      const target = get(p, selector.reportId), kind = target.meta.kind ?? 'summary';
+      if (kind === 'reference-verification') {
+        const verified = await readVerifiedParent(p, selector.reportId, { ...authority, errorCode, needProvenance: true });
+        return {
+          selector: { verificationReportId: selector.reportId }, paperId: verified.binding.paperId,
+          sourceStatus: verified.original.sourceStatus, mainBytes: verified.original.mainBytes,
+          ledgerBytes: verified.ledgerBytes, provenanceBytes: verified.original.provenanceBytes,
+          mainSha256: verified.original.mainSha256, ledgerSha256: verified.ledgerSha256,
+          assertUnchanged: verified.original.assertUnchanged,
+        };
+      }
+      const mapped = kind === 'paper-revision' ? { revisionReportId: selector.reportId }
+        : kind === 'paper-chapter-tree' ? { chapterTreeReportId: selector.reportId }
+        : kind === 'paper-source' ? { sourceReportId: selector.reportId }
+        : null;
+      check(mapped !== null, 'PROJECT_REPORT_KIND_MISMATCH');
+      return readManuscript(p, mapped, { ...authority, errorCode, needProvenance: true });
+    }
+    return readManuscript(p, { planReportId: selector.planReportId, finalSectionReportId: selector.finalSectionReportId },
+      { ...authority, errorCode, needProvenance: true });
+  }
+  async function gapFillRevisionMaterial(p, selector, report, admissionNotes, authority = {}) {
+    const expected = copy(selector);
+    const mathReport = getKind(p, expected.mathReviewReportId, { kind: 'paper-math-verification' });
+    check(cleanMathCompletion(mathReport), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    const checkedReview = await readPaperMathReview(p, mathReport);
+    check(checkedReview.review.verdict === 'wrong', 'PROJECT_PAPER_GAP_FILL_NO_MUST_FIX');
+    const mustFixFindings = checkedReview.review.findings.filter(f => f.class === 'must-fix');
+    const ignorableCount = checkedReview.review.findings.filter(f => f.class === 'ignorable').length;
+    check(mustFixFindings.length > 0, 'PROJECT_PAPER_GAP_FILL_NO_MUST_FIX');
+    const [manuscript, revisionModule] = await Promise.all([
+      resolveMathBoundManuscript(p, mathReport.meta.math, authority, 'PROJECT_PAPER_REVISION_SOURCE_INVALID'),
+      import('./paper-revision.mjs'),
+    ]);
+    check(manuscript.mainSha256 === mathReport.meta.math.mainSha256
+      && manuscript.ledgerSha256 === mathReport.meta.math.ledgerSha256, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    const notes = report ? await readOperatorNotes(p, report) : admissionNotes;
+    check(validOperatorNotes(notes), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    const factAuthority = { guard: authority.authorize ?? (async () => {}), assertActive: authority.guard ?? (() => {}) };
+    let verifiedFacts;
+    if (typeof gatherGapFillFacts === 'function') {
+      try {
+        const gathered = await gatherGapFillFacts(p.meta.projectId, factAuthority, expected.factIds);
+        verifiedFacts = gathered.facts;
+      } catch (error) {
+        if (report && error?.code === 'PROJECT_PAPER_GAP_FILL_FACT_NOT_FOUND') throw failure('PROJECT_SUMMARY_FACT_REVOKED');
+        throw error;
+      }
+    } else {
+      const gathered = await gatherFacts(p.meta.projectId, factAuthority);
+      const byId = new Map(gathered.facts.map(f => [f.fact_id, f]));
+      verifiedFacts = expected.factIds.map(id => {
+        const found = byId.get(id);
+        check(found, report ? 'PROJECT_SUMMARY_FACT_REVOKED' : 'PROJECT_PAPER_GAP_FILL_FACT_NOT_FOUND');
+        return found;
+      });
+    }
+    const baseLedgerText = strictText(manuscript.ledgerBytes);
+    const { ledger: mergedLedgerText } = revisionModule.mergeLedgerWithFacts(baseLedgerText, verifiedFacts);
+    const mergedLedgerBytes = Buffer.from(mergedLedgerText, 'utf8');
+    const missingBacking = expected.missingBacking ? [...expected.missingBacking] : [];
+    const resources = await revisionModule.readPaperRevisionResources();
+    const prompt = revisionModule.buildPaperGapFillRevisionPrompt({
+      mainTex: strictText(manuscript.mainBytes), ledger: mergedLedgerText,
+      mustFixFindings, ignorableCount, verifiedFacts, notes, missingBacking, resources,
+    });
+    check(Buffer.byteLength(prompt) <= 512 * 1024, 'PROJECT_SUMMARY_INPUT_TOO_LARGE');
+    const factsSha256 = hash(Buffer.from(JSON.stringify(verifiedFacts), 'utf8'));
+    if (expected.factsSha256 !== undefined) check(expected.factsSha256 === factsSha256, 'PROJECT_SUMMARY_FACT_REVOKED');
+    const hashes = {
+      mode: 'gap-fill', ...manuscript.selector, mathReviewReportId: expected.mathReviewReportId,
+      paperId: manuscript.paperId, sourceStatus: manuscript.sourceStatus,
+      factIds: [...expected.factIds], missingBacking,
+      mainSha256: manuscript.mainSha256, ledgerSha256: hash(mergedLedgerBytes),
+      originalLedgerSha256: manuscript.ledgerSha256, provenanceSha256: hash(manuscript.provenanceBytes),
+      notesSha256: hash(Buffer.from(notes)), notesBytes: Buffer.byteLength(notes),
+      factsSha256, mathReviewSha256: checkedReview.descriptor.sha256,
+      contractSha256: hash(Buffer.from(resources.contract)), reviserPromptSha256: hash(Buffer.from(resources.reviserPrompt)),
+      styleSha256: hash(Buffer.from(resources.style)), promptSha256: hash(Buffer.from(prompt)),
     };
-    const [main, ledger, provenance, revisionModule] = await Promise.all([
-      read('source', 'main.tex'), read('ledger', 'REFERENCE_LEDGER.md'), read('provenance', 'provenance.json'), import('./paper-revision.mjs')]);
+    if (report) check(await readOperatorNotes(p, report) === notes, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    await manuscript.assertUnchanged();
+    for (const [k, v] of Object.entries(hashes)) {
+      if (expected[k] !== undefined) check(JSON.stringify(expected[k]) === JSON.stringify(v), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    }
+    return { hashes, prompt, mainTex: strictText(manuscript.mainBytes), ledger: mergedLedgerBytes,
+      provenance: manuscript.provenanceBytes, module: revisionModule };
+  }
+  async function compileFixRevisionMaterial(p, selector, report, admissionCompileLog, authority = {}) {
+    const expected = copy(selector);
+    const [manuscript, revisionModule] = await Promise.all([
+      readManuscript(p, expected, { ...authority, errorCode: 'PROJECT_PAPER_REVISION_SOURCE_INVALID', needProvenance: true }),
+      import('./paper-revision.mjs'),
+    ]);
+    const main = manuscript.mainBytes, ledger = manuscript.ledgerBytes, provenance = manuscript.provenanceBytes;
+    const compileLog = report ? await readCompileLog(p, report) : admissionCompileLog;
+    check(validOperatorNotes(compileLog), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    const resources = await revisionModule.readPaperRevisionResources();
+    const prompt = revisionModule.buildPaperCompileFixRevisionPrompt({
+      mainTex: strictText(main), ledger: strictText(ledger), compileLog, resources,
+    });
+    check(Buffer.byteLength(prompt) <= 512 * 1024, 'PROJECT_SUMMARY_INPUT_TOO_LARGE');
+    const hashes = {
+      mode: 'compile-fix', ...manuscript.selector, paperId: manuscript.paperId, sourceStatus: manuscript.sourceStatus,
+      mainSha256: hash(main), ledgerSha256: hash(ledger), provenanceSha256: hash(provenance),
+      compileLogSha256: hash(Buffer.from(compileLog)), compileLogBytes: Buffer.byteLength(compileLog),
+      contractSha256: hash(Buffer.from(resources.contract)), reviserPromptSha256: hash(Buffer.from(resources.reviserPrompt)),
+      styleSha256: hash(Buffer.from(resources.style)), promptSha256: hash(Buffer.from(prompt)),
+    };
+    if (report) check(await readCompileLog(p, report) === compileLog, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    await manuscript.assertUnchanged();
+    for (const [k, v] of Object.entries(hashes)) check(expected[k] === undefined || expected[k] === v, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    return { hashes, prompt, mainTex: strictText(main), ledger, provenance, module: revisionModule };
+  }
+  async function notesRevisionMaterial(p, selector, report, admissionNotes, authority = {}) {
+    const expected = copy(selector);
+    const [manuscript, revisionModule] = await Promise.all([
+      readManuscript(p, expected, { ...authority, errorCode: 'PROJECT_PAPER_REVISION_SOURCE_INVALID', needProvenance: true }),
+      import('./paper-revision.mjs'),
+    ]);
+    const main = manuscript.mainBytes, ledger = manuscript.ledgerBytes, provenance = manuscript.provenanceBytes;
     const notes = report ? await readOperatorNotes(p, report) : admissionNotes;
     check(validOperatorNotes(notes), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
     const resources = await revisionModule.readPaperRevisionResources();
     const prompt = revisionModule.buildPaperNotesRevisionPrompt({ mainTex: strictText(main), ledger: strictText(ledger), notes, resources });
     check(Buffer.byteLength(prompt) <= 512 * 1024, 'PROJECT_SUMMARY_INPUT_TOO_LARGE');
-    const hashes = { mode: 'operator-notes', sourceReportId: s.reportId, paperId: s.paper.paperId, sourceStatus: s.sourceStatus,
+    const hashes = { mode: 'operator-notes', ...manuscript.selector, paperId: manuscript.paperId, sourceStatus: manuscript.sourceStatus,
       mainSha256: hash(main), ledgerSha256: hash(ledger), provenanceSha256: hash(provenance), notesSha256: hash(Buffer.from(notes)), notesBytes: Buffer.byteLength(notes),
       contractSha256: hash(Buffer.from(resources.contract)), reviserPromptSha256: hash(Buffer.from(resources.reviserPrompt)),
       styleSha256: hash(Buffer.from(resources.style)), promptSha256: hash(Buffer.from(prompt)) };
     if (report) check(await readOperatorNotes(p, report) === notes, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
-    check(source.meta === s && JSON.stringify(s) === captured && cleanParent(), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+    await manuscript.assertUnchanged();
     for (const [key, value] of Object.entries(hashes)) check(expected[key] === undefined || expected[key] === value, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
     return { hashes, prompt, mainTex: strictText(main), ledger, provenance, module: revisionModule };
   }
-  async function revisionMaterial(p, selector, report = null, admissionNotes) {
-    if (selector.mode === 'operator-notes') return notesRevisionMaterial(p, selector, report, admissionNotes);
-    const expected = copy(selector), parent = get(p, expected.verificationReportId), v = parent.meta;
-    const cleanParent = r => r.meta.state === 'completed' && !r.meta.cleanupPending && !r.meta.stopRequested
-      && !r.meta.taskCreating && !r.meta.scheduleCreating && !r.meta.writerStarting
-      && r.meta.taskSettlement === 'confirmed' && !r.meta.error && !r.failedSave
-      && r.meta.creator?.sessionId === p.meta.creator.sessionId && r.meta.creator?.sessionPath === p.meta.creator.sessionPath;
-    check(v.kind === 'reference-verification' && v.verification?.paperId === expected.paperId && cleanParent(parent), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
-    const parentSnapshot = JSON.stringify(v), binding = copy(v.verification);
-    const source = get(p, binding.sourceReportId), s = source.meta;
-    check(s.kind === 'paper-source' && ['generated', 'flagged'].includes(s.sourceStatus) && cleanParent(source), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
-    const sourceSnapshot = JSON.stringify(s);
-    const original = await verificationSource(p, binding);
-    const readArtifact = async (record, role, name) => {
-      const a = copy(record.meta.artifacts?.[role]);
-      check(a?.name === name && a.artifact === `${directory(p, record.meta.reportId)}/${name}`
-        && Number.isSafeInteger(a.bytes) && a.bytes >= 0 && a.bytes <= PAPER_ARTIFACT_MAX_BYTES
-        && typeof a.sha256 === 'string' && /^[a-f0-9]{64}$/.test(a.sha256), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
-      const bytes = await store.read(a.artifact);
-      check(bytes.length === a.bytes && hash(bytes) === a.sha256, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
-      return bytes;
-    };
-    const [rawVerdicts, ledger, provenance, module, revisionModule] = await Promise.all([
-      readArtifact(parent, 'verdicts', 'REFERENCE_VERDICTS.json'), readArtifact(parent, 'ledger', 'REFERENCE_LEDGER.md'),
-      readArtifact(source, 'provenance', 'provenance.json'), import('./reference-verification.mjs'), import('./paper-revision.mjs')]);
-    // Never trust normalized child JSON: validate again against the original, pre-verification ledger.
-    const verdicts = module.parseReferenceVerdicts(strictText(rawVerdicts), original.ledger);
-    check(module.applyReferenceVerdicts(original.ledger, verdicts) === strictText(ledger), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
-    const promotions = verdicts.filter(row => ['verified', 'corrected'].includes(row.verdict)).length;
-    const citationStatus = promotions === verdicts.length ? 'verified' : promotions ? 'partial' : 'unverified';
-    check(binding.citationStatus === citationStatus, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+  async function revisionMaterial(p, selector, report = null, admissionInput, authority = {}) {
+    if (selector.mode === 'operator-notes') return notesRevisionMaterial(p, selector, report, admissionInput, authority);
+    if (selector.mode === 'gap-fill') return gapFillRevisionMaterial(p, selector, report, admissionInput, authority);
+    if (selector.mode === 'compile-fix') return compileFixRevisionMaterial(p, selector, report, admissionInput, authority);
+    const expected = copy(selector);
+    const [verified, revisionModule] = await Promise.all([
+      readVerifiedParent(p, expected.verificationReportId, { ...authority, expectedPaperId: expected.paperId,
+        errorCode: 'PROJECT_PAPER_REVISION_SOURCE_INVALID', needProvenance: true }),
+      import('./paper-revision.mjs'),
+    ]);
+    const { binding, original, rawVerdicts, verdicts, ledgerBytes: ledger, citationStatus } = verified;
+    const provenance = original.provenanceBytes;
     const resources = await revisionModule.readPaperRevisionResources();
     const prompt = revisionModule.buildPaperRevisionPrompt({ mainTex: original.mainTex, verdicts, resources });
     check(Buffer.byteLength(prompt) <= 512 * 1024, 'PROJECT_SUMMARY_INPUT_TOO_LARGE');
-    const hashes = { sourceReportId: binding.sourceReportId, paperId: binding.paperId, mainSha256: original.mainSha256,
+    const hashes = { ...original.selector, paperId: binding.paperId, mainSha256: original.mainSha256,
       verdictsSha256: hash(rawVerdicts), ledgerSha256: hash(ledger), originalLedgerSha256: original.ledgerSha256,
-      provenanceSha256: hash(provenance), citationStatus, sourceStatus: s.sourceStatus, contractSha256: hash(Buffer.from(resources.contract)),
+      provenanceSha256: hash(provenance), citationStatus, sourceStatus: original.sourceStatus, contractSha256: hash(Buffer.from(resources.contract)),
       reviserPromptSha256: hash(Buffer.from(resources.reviserPrompt)), styleSha256: hash(Buffer.from(resources.style)), promptSha256: hash(Buffer.from(prompt)) };
-    check(parent.meta === v && source.meta === s && JSON.stringify(v) === parentSnapshot && JSON.stringify(s) === sourceSnapshot
-      && cleanParent(parent) && cleanParent(source), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
     for (const [key, value] of Object.entries(hashes)) check(expected[key] === undefined || expected[key] === value, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
     return { hashes, prompt, mainTex: original.mainTex, ledger, provenance, module: revisionModule };
   }
   async function runRevision(p, r, guard, assertActive) {
     const binding = copy(r.meta.revision), encoded = JSON.stringify(binding);
+    const privateInputMode = ['operator-notes', 'gap-fill', 'compile-fix'].includes(binding.mode);
+    const authority = { authorize: async () => { await guard(); }, guard: assertActive };
     const recheck = async () => {
       assertActive(); check(JSON.stringify(r.meta.revision) === encoded, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
-      const material = await revisionMaterial(p, binding, r);
+      const material = await revisionMaterial(p, binding, r, undefined, authority);
       assertActive(); check(JSON.stringify(r.meta.revision) === encoded, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
       await guard();
-      if (binding.mode === 'operator-notes') {
+      if (privateInputMode) {
         // Authority reads await the Host: collect archived inputs again afterwards, not from the call text.
-        const latest = await revisionMaterial(p, binding, r);
+        const latest = await revisionMaterial(p, binding, r, undefined, authority);
         assertActive(); check(JSON.stringify(r.meta.revision) === encoded, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
         return latest;
       }
@@ -732,7 +1001,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     const input = await recheck(), cwd = await store.mkdir(directory(p, r.meta.reportId));
     await recheck(); r.meta.writerStarting = true; r.meta.cleanupPending = true; await save(p, r); assertActive();
     const handle = await summaryWriter.start({ projectId: r.meta.projectId, reportId: r.meta.reportId, kind: 'paper-revision',
-      ...(binding.mode === 'operator-notes' ? { revisionMode: 'operator-notes' } : {}), prompt: input.prompt, cwd, deadlineAt: Date.now() + 30 * 60 * 1000, assertActive,
+      ...(privateInputMode ? { revisionMode: binding.mode } : {}), prompt: input.prompt, cwd, deadlineAt: Date.now() + 30 * 60 * 1000, assertActive,
       onBound: async writer => {
         r.meta.writer = { ...copy(writer), state: 'preparing', cleanupPending: true }; await save(p, r);
         await recheck(); return { ok: true };
@@ -741,7 +1010,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     r.handle = handle; r.meta.writerStarting = false; await save(p, r);
     const terminal = await handle.done;
     r.meta.writer = copy(terminal); r.meta.cleanupPending = terminal?.cleanupPending !== false; await save(p, r);
-    if (binding.mode === 'operator-notes') await recheck();
+    if (privateInputMode) await recheck();
     if (typeof terminal?.finalText === 'string') {
       check(terminal.finalText.isWellFormed(), 'PROJECT_PAPER_REVISION_PATCH_INVALID');
       await paperArtifact(p, r, 'response', Buffer.from(terminal.finalText), 'text/plain');
@@ -749,7 +1018,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     }
     assertActive(); check(terminal?.state === 'completed' && terminal.modelStopReason === 'stop' && terminal.cleanupPending === false
       && typeof terminal.finalText === 'string' && terminal.finalText.trim(), 'PROJECT_SUMMARY_WRITER_FAILED');
-    if (binding.mode === 'operator-notes') await recheck();
+    if (privateInputMode) await recheck();
     const applied = input.module.applyPaperRevision(input.mainTex, terminal.finalText);
     r.meta.revisionOutcome = copy(applied.outcome);
     // Even a no-op must reject malformed inherited provenance, never bypass its gate.
@@ -764,6 +1033,10 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       });
       return;
     }
+    if (binding.mode === 'gap-fill') {
+      const leakedFactId = binding.factIds.some(id => applied.tex.includes(id));
+      check(!leakedFactId && leakFindings(applied.tex).length === 0, 'PROJECT_PAPER_OUTPUT_LEAK');
+    }
     const citationKeyCheck = input.module.checkPaperRevisionCitationKeys(applied.tex, strictText(input.ledger));
     const provenanceWarning = 'All provenance for edited TeX is unresolved; the inherited mapping is a historical-only archive, not reusable validation.';
     if (!applied.findings.warnings.includes(provenanceWarning)) applied.findings.warnings.push(provenanceWarning);
@@ -774,12 +1047,17 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       binding, revisionOutcome: copy(applied.outcome),
       sourceStatus: binding.sourceStatus === 'flagged' || applied.findings.blockers.length ? 'flagged' : 'generated', findings: applied.findings,
       provenanceReconciliation, citationKeyCheck,
-      ...(binding.mode === 'operator-notes' ? { citationStatus: 'not-requested' }
+      ...(binding.mode === 'operator-notes' || binding.mode === 'compile-fix' ? { citationStatus: 'not-requested' }
+        : binding.mode === 'gap-fill' ? { citationStatus: 'unverified' }
         : { citationStatus: 'inherited-verification-source-judgment', inheritedCitationStatus: binding.citationStatus }),
-      provenance: { sourceReportId: binding.sourceReportId, sha256: binding.provenanceSha256, status: 'inherited-not-revalidated' },
+      provenance: { ...manuscriptSelectorOf(binding), sha256: binding.provenanceSha256, status: 'inherited-not-revalidated' },
       mathematicsStatus: 'unreviewed', reviewStatus: 'unreviewed', compileStatus: 'not-run',
       scope: binding.mode === 'operator-notes'
         ? 'Operator-notes proposal; notes authenticate neither identities nor mathematics. Mechanical editorial-only scope and preservation of mathematics have not been established.'
+        : binding.mode === 'gap-fill'
+        ? 'Gap-fill proposal backed by supplied verified facts; re-run whole-paper paper_verify_math and verify any newly added unverified citations.'
+        : binding.mode === 'compile-fix'
+        ? 'Compile-fix proposal from supplied compile_log; compilation has not been re-run and mathematical preservation has not been mechanically certified.'
         : 'Citation-targeted proposal; mechanical citation-only scope and preservation of mathematics have not been established.' };
     for (const [role, bytes, mime] of [
       ['source', Buffer.from(applied.tex), 'application/x-tex'], ['summary', Buffer.from(applied.summary), 'text/markdown'],
@@ -789,7 +1067,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     }
     await recheck();
     await exclusive(r, async () => {
-      if (binding.mode === 'operator-notes') await recheck();
+      if (privateInputMode) await recheck();
       current(p, r); r.meta.findings = copy(applied.findings); r.meta.sourceStatus = proposal.sourceStatus;
       r.meta.sha256 = r.meta.artifacts.source.sha256; r.meta.bytes = r.meta.artifacts.source.bytes;
       r.meta.state = 'completed'; r.meta.completedAt = Date.now(); r.meta.cleanupPending = false; await save(p, r);
@@ -836,8 +1114,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     return linearKind(r.meta.kind) ? planWriterEvidence(snapshot) : copy(snapshot);
   }
   async function runPaperMathVerification(p, r, guard, assertActive) {
-    const binding = copy(r.meta.math), selector = Object.fromEntries(Object.entries(binding)
-      .filter(([key]) => key === 'sourceReportId' || key === 'planReportId' || key === 'finalSectionReportId'));
+    const binding = copy(r.meta.math), selector = mathSelectorOf(binding);
     const recheck = async () => {
       assertActive(); check(JSON.stringify(r.meta.math) === JSON.stringify(binding), 'PROJECT_PAPER_MATH_SOURCE_CHANGED');
       const material = await paperMathSource(p, selector, assertActive, async () => { await guard(); });
@@ -895,9 +1172,10 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   }
   async function runVerification(p, r, guard, assertActive) {
     const binding = copy(r.meta.verification), encodedBinding = JSON.stringify(binding);
+    const authority = { authorize: async () => { await guard(); }, guard: assertActive };
     const recheck = async () => {
       assertActive(); check(JSON.stringify(r.meta.verification) === encodedBinding, 'PROJECT_REFERENCE_VERIFY_SOURCE_INVALID');
-      const value = await verificationMaterial(p, binding);
+      const value = await verificationMaterial(p, binding, authority);
       assertActive(); check(JSON.stringify(r.meta.verification) === encodedBinding, 'PROJECT_REFERENCE_VERIFY_SOURCE_INVALID');
       await guard(); return value;
     };
@@ -938,7 +1216,8 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   }
   async function runAudit(p, r, guard, assertActive) {
     const { buildReferenceAuditPrompt, readReferenceAuditResources } = await import('./paper-source.mjs');
-    let checked = await auditSource(p, r.meta.audit);
+    const authority = { authorize: async () => { await guard(); }, guard: assertActive };
+    let checked = await auditSource(p, r.meta.audit, authority);
     const resources = await readReferenceAuditResources();
     const decode = bytes => {
       const value = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
@@ -950,7 +1229,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     check(hash(Buffer.from(resources.contract)) === r.meta.audit.boundContractSha256
       && hash(Buffer.from(resources.auditorPrompt)) === r.meta.audit.boundAuditorPromptSha256,
     'PROJECT_REFERENCE_AUDIT_RESOURCE_INVALID');
-    checked = await auditSource(p, r.meta.audit); assertActive(); await guard();
+    checked = await auditSource(p, r.meta.audit, authority); assertActive(); await guard();
     check(hash(Buffer.from(prompt)) === r.meta.audit.boundPromptSha256, 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
     await save(p, r);
     const cwd = await store.mkdir(directory(p, r.meta.reportId));
@@ -958,9 +1237,9 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     const handle = await summaryWriter.start({ projectId: r.meta.projectId, reportId: r.meta.reportId, prompt, cwd,
       kind: 'reference-audit', deadlineAt: Date.now() + 30 * 60 * 1000, assertActive,
       onBound: async binding => {
-        const latest = await auditSource(p, r.meta.audit);
-        check(latest.source.meta.artifacts.source.sha256 === r.meta.audit.mainSha256
-          && latest.source.meta.artifacts.ledger.sha256 === r.meta.audit.ledgerSha256, 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
+        const latest = await auditSource(p, r.meta.audit, authority);
+        check(latest.mainSha256 === r.meta.audit.mainSha256
+          && latest.ledgerSha256 === r.meta.audit.ledgerSha256, 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
         const latestResources = await readReferenceAuditResources();
         check(hash(Buffer.from(latestResources.contract)) === r.meta.audit.boundContractSha256
           && hash(Buffer.from(latestResources.auditorPrompt)) === r.meta.audit.boundAuditorPromptSha256,
@@ -976,6 +1255,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     }
     assertActive(); check(terminal?.state === 'completed' && terminal.modelStopReason === 'stop'
       && terminal.cleanupPending === false && typeof terminal.finalText === 'string' && terminal.finalText.trim(), 'PROJECT_SUMMARY_WRITER_FAILED');
+    await auditSource(p, r.meta.audit, authority);
     const report = Buffer.from(terminal.finalText, 'utf8');
     await paperArtifact(p, r, 'audit', report, 'text/markdown');
     r.meta.sha256 = r.meta.artifacts.audit.sha256; r.meta.bytes = report.length;
@@ -1027,7 +1307,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         && r.meta.provenanceStatus === expected.document.provenanceStatus && r.meta.findingsTruncated === expected.document.findingsTruncated
         && JSON.stringify(r.meta.findings) === JSON.stringify(expected.document.findings)
         && JSON.stringify(r.meta.section) === encoded && JSON.stringify(r.meta.artifacts) === JSON.stringify(artifacts), 'PROJECT_REPORT_ARTIFACT_INVALID');
-      return freezeData({ binding, tex: expected.tex, document: expected.document, ledger: decode(bytes.ledger), artifacts: Object.fromEntries(Object.entries(artifacts).map(([role, a]) => [role, { sha256: a.sha256, bytes: a.bytes }])) });
+      return freezeData({ binding, tex: expected.tex, provenance: expected.provenance, document: expected.document, ledger: decode(bytes.ledger), artifacts: Object.fromEntries(Object.entries(artifacts).map(([role, a]) => [role, { sha256: a.sha256, bytes: a.bytes }])) });
     } catch { throw failure('PROJECT_REPORT_ARTIFACT_INVALID'); }
   }
   async function inspectSavedSection(p, r, statusRead = false) {
@@ -1053,7 +1333,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   // which may quarantine a record or write an interrupted state on corruption.
   async function stitchInternal(p, { planReportId, finalSectionReportId }, authorize, guard) {
     const unavailable = 'PROJECT_PAPER_STITCH_NOT_READY', invalid = 'PROJECT_PAPER_STITCH_CHAIN_INVALID';
-    const corrupted = 'PROJECT_REPORT_ARTIFACT_INVALID', witnessed = new Map(), selected = [], warnings = [];
+    const corrupted = 'PROJECT_REPORT_ARTIFACT_INVALID', witnessed = new Map(), selected = [], warnings = [], provenanceParts = [];
     const sessionId = p.meta.creator.sessionId, projectId = p.meta.projectId;
     const alive = () => { guard(); check(!disposed && getProject(projectId) === p, 'PROJECT_DISPOSED'); };
     const clean = r => (r.meta.kind === 'paper-plan' ? planView(r).publicationStatus === 'reviewable-plan'
@@ -1112,10 +1392,27 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       warningBytes += Buffer.byteLength(JSON.stringify(details)) + 1;
       check(warningBytes <= PAPER_ARTIFACT_MAX_BYTES, 'PROJECT_PAPER_STITCH_TOO_LARGE');
       warnings.push(details);
+      provenanceParts.push(own.provenance);
       id = l.previousSectionReportId; nextLineage = l;
     }
     check(count > 0 && id === null, invalid); assertSelected();
     const { bytes, bibliographyStatus } = assembly.finish();
+    const orderedProvenance = provenanceParts.reverse();
+    let provenanceBytes;
+    if (orderedProvenance.every(part => part === null)) {
+      provenanceBytes = Buffer.from('null\n');
+    } else {
+      const merged = {};
+      for (const part of orderedProvenance) {
+        if (!part) continue;
+        for (const [label, fid] of Object.entries(part)) {
+          if (!Object.hasOwn(merged, label)) merged[label] = fid;
+        }
+      }
+      provenanceBytes = Buffer.from(JSON.stringify(merged, null, 2) + '\n');
+    }
+    const orderedSections = warnings.reverse();
+    const sourceStatus = orderedSections.some(s => s.sourceStatus === 'flagged' || s.blockers.length > 0) ? 'flagged' : 'generated';
     const checkDelivery = async () => {
       assertSelected();
       // Revisit identities after export I/O, using the already verified bytes;
@@ -1126,15 +1423,15 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       }
       await authorize(); assertSelected();
     };
-    return { bytes, ledger: saved.ledger, sessionId, checkDelivery, selectedReports: selected.map(({ r, signature }) => ({ report: r, identity: signature })),
+    return { bytes, ledger: saved.ledger, provenanceBytes, sourceStatus, sessionId, checkDelivery, selectedReports: selected.map(({ r, signature }) => ({ report: r, identity: signature })),
       summary: { projectId, paperId: source.paperId, planReportId, finalSectionReportId,
-      chainRootReportId: rootId, sectionCount: count, sections: warnings.reverse(), bibliographyStatus, mathematicsStatus: 'unreviewed',
+      chainRootReportId: rootId, sectionCount: count, sections: orderedSections, bibliographyStatus, mathematicsStatus: 'unreviewed',
       citationStatus: 'not-checked', compileStatus: 'not-run', limitations: ['Frozen plan and selected archived chain only; current facts were not checked.',
         'Reviewable TeX text only: no TeX execution, macro safety, mathematical, citation, or compilation validation.'] } };
   }
   async function stitch(p, selector, authorize, guard) {
     const result = await stitchInternal(p, selector, authorize, guard);
-    const { ledger, selectedReports, ...publicResult } = result;
+    const { ledger, provenanceBytes, sourceStatus, selectedReports, ...publicResult } = result;
     return publicResult;
   }
   async function sectionContext(p, selector, expectedSource = null) {
@@ -1412,7 +1709,8 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       check(sectionView(r).publicationStatus === 'reviewable-section', 'PROJECT_REPORT_NOT_READY');
       await (r.historical ? readSavedSection(p, r) : inspectSavedSection(p, r));
     }
-    if (m.kind === 'paper-revision' && m.revision.mode === 'operator-notes') await readOperatorNotes(p, r);
+    if (m.kind === 'paper-revision' && ['operator-notes', 'gap-fill'].includes(m.revision.mode)) await readOperatorNotes(p, r);
+    if (m.kind === 'paper-revision' && m.revision.mode === 'compile-fix') await readCompileLog(p, r);
     let checkedMathReview = null;
     if (m.kind === 'paper-math-verification') checkedMathReview = await readPaperMathReview(p, r);
     if (completedRevisionNoOp(r)) return { ...view(r), saved: true, status: 'no_edits_applied', files: [],
@@ -1688,51 +1986,48 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       const input = await admissionPlanCheck(); planRecord = { ...planBase, ...input.hashes };
       await admissionPlanCheck();
     }
+    const startAuthority = { authorize: () => authorizeCreator(p, ctx), guard: () => { assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); } };
     const auditRecord = audit ? { ...copy(args.audit), mainSha256: '', ledgerSha256: '', contractSha256: '', boundContractSha256: '',
       auditorPromptSha256: '', boundAuditorPromptSha256: '', promptSha256: '', boundPromptSha256: '' } : null;
     if (audit) {
-      const checked = await auditSource(p, auditRecord);
+      const checked = await auditSource(p, auditRecord, startAuthority);
       const resources = await (await import('./paper-source.mjs')).readReferenceAuditResources();
-      auditRecord.mainSha256 = checked.source.meta.artifacts.source.sha256; auditRecord.ledgerSha256 = checked.source.meta.artifacts.ledger.sha256;
+      auditRecord.mainSha256 = checked.mainSha256; auditRecord.ledgerSha256 = checked.ledgerSha256;
       auditRecord.contractSha256 = hash(Buffer.from(resources.contract)); auditRecord.boundContractSha256 = auditRecord.contractSha256;
       auditRecord.auditorPromptSha256 = hash(Buffer.from(resources.auditorPrompt));
       auditRecord.boundAuditorPromptSha256 = auditRecord.auditorPromptSha256;
-      const decode = bytes => {
-        const value = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-        check(Buffer.from(value, 'utf8').equals(bytes), 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
-        return value;
-      };
       const prompt = (await import('./paper-source.mjs')).buildReferenceAuditPrompt({
-        mainTex: decode(checked.outputs.source), ledger: decode(checked.outputs.ledger), ...resources });
+        mainTex: strictTextWith(checked.outputs.source, 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID'),
+        ledger: strictTextWith(checked.outputs.ledger, 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID'), ...resources });
       check(Buffer.byteLength(prompt) <= 512 * 1024, 'PROJECT_SUMMARY_INPUT_TOO_LARGE');
       auditRecord.promptSha256 = hash(Buffer.from(prompt)); auditRecord.boundPromptSha256 = auditRecord.promptSha256;
+      await checked.assertUnchanged();
     }
     let revisionRecord = null;
     if (args.kind === 'paper-revision') {
-      const material = await revisionMaterial(p, revisionSelector, null, args.notes);
+      const admissionInput = revisionSelector.mode === 'compile-fix' ? args.compileLog : args.notes;
+      const material = await revisionMaterial(p, revisionSelector, null, admissionInput, startAuthority);
       revisionRecord = { ...revisionSelector, ...material.hashes };
-      await revisionMaterial(p, revisionRecord, null, args.notes);
+      await revisionMaterial(p, revisionRecord, null, admissionInput, startAuthority);
       await authorizeCreator(p, ctx); assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
     }
     let mathBinding = null, mathMaterial = null;
     if (args.kind === 'paper-math-verification') {
       const sourceSelector = { ...mathSelector };
-      const authorize = () => authorizeCreator(p, ctx);
-      mathMaterial = await paperMathSource(p, sourceSelector,
-        () => { assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); }, authorize);
+      mathMaterial = await paperMathSource(p, sourceSelector, startAuthority.guard, startAuthority.authorize, { resolveReportId: true });
       mathBinding = mathMaterial.binding;
       check(validPaperMathBinding(mathBinding), 'PROJECT_INVALID_INPUT');
       await mathMaterial.assertSource();
     }
     let verificationRecord = null;
     if (args.kind === 'reference-verification') {
-      const material = await verificationMaterial(p, verificationSelector);
-      verificationRecord = { ...verificationSelector, sourceReportId: material.sourceReportId,
+      const material = await verificationMaterial(p, verificationSelector, startAuthority);
+      verificationRecord = { ...verificationSelector, ...material.selector,
         mainSha256: material.mainSha256, ledgerSha256: material.ledgerSha256, auditSha256: material.auditSha256,
         contractSha256: material.contractSha256, boundContractSha256: material.contractSha256,
         verifierPromptSha256: material.verifierPromptSha256, boundVerifierPromptSha256: material.verifierPromptSha256,
         promptSha256: material.promptSha256, boundPromptSha256: material.promptSha256, keys: [...material.keys] };
-      await verificationMaterial(p, verificationRecord);
+      await verificationMaterial(p, verificationRecord, startAuthority);
       await authorizeCreator(p, ctx); assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
     }
     if (paper) {
@@ -1758,11 +2053,17 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     try {
       await store.mkdir(directory(p, reportId), true); await save(p, r);
       if (mathMaterial) await mathMaterial.assertSource();
-      if (revisionRecord?.mode === 'operator-notes') {
-        await revisionMaterial(p, revisionRecord, null, args.notes);
+      if (['operator-notes', 'gap-fill'].includes(revisionRecord?.mode)) {
+        await revisionMaterial(p, revisionRecord, null, args.notes, startAuthority);
         await paperArtifact(p, r, 'notes', Buffer.from(args.notes), 'text/markdown');
         // Once archived, only the report input is authoritative; never fall back to the call text.
-        await revisionMaterial(p, revisionRecord, r);
+        await revisionMaterial(p, revisionRecord, r, undefined, startAuthority);
+        await authorizeCreator(p, ctx); assertLive(p); check(!disposed && !r.meta.stopRequested, 'PROJECT_SUMMARY_STOPPED');
+      }
+      if (revisionRecord?.mode === 'compile-fix') {
+        await revisionMaterial(p, revisionRecord, null, args.compileLog, startAuthority);
+        await paperArtifact(p, r, 'compileLog', Buffer.from(args.compileLog), 'text/plain');
+        await revisionMaterial(p, revisionRecord, r, undefined, startAuthority);
         await authorizeCreator(p, ctx); assertLive(p); check(!disposed && !r.meta.stopRequested, 'PROJECT_SUMMARY_STOPPED');
       }
       if (linear) await admissionLinearCheck();
@@ -1775,12 +2076,12 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       r.meta.taskId = task.taskId; r.meta.taskCreating = false; await save(p, r);
       if (mathMaterial) await mathMaterial.assertSource();
       if (linear) { const receipt = await taskReceipt(p, r); check(['pending', 'running'].includes(receipt.status), 'PROJECT_REPORT_TASK_INACTIVE'); await admissionLinearCheck(); }
-      if (revisionRecord?.mode === 'operator-notes') {
-        await revisionMaterial(p, revisionRecord, r);
+      if (['operator-notes', 'gap-fill', 'compile-fix'].includes(revisionRecord?.mode)) {
+        await revisionMaterial(p, revisionRecord, r, undefined, startAuthority);
         await authorizeCreator(p, ctx);
         const checkedTask = await taskReceipt(p, r);
         check(['pending', 'running'].includes(checkedTask.status), 'PROJECT_REPORT_TASK_INACTIVE');
-        await revisionMaterial(p, revisionRecord, r);
+        await revisionMaterial(p, revisionRecord, r, undefined, startAuthority);
       }
       check(!disposed, 'PROJECT_DISPOSED'); check(!r.meta.stopRequested, 'PROJECT_SUMMARY_STOPPED');
       if (mathMaterial) await mathMaterial.assertSource();
@@ -1835,7 +2136,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   }
   function getKind(p, id, options) {
     const expected = options?.kind ?? 'summary';
-    check(['summary', 'paper-source', 'reference-audit', 'reference-verification', 'paper-revision', 'paper-plan', 'paper-section', 'paper-math-verification'].includes(expected), 'PROJECT_INVALID_INPUT');
+    check(['summary', 'paper-source', 'reference-audit', 'reference-verification', 'paper-revision', 'paper-plan', 'paper-section', 'paper-math-verification', 'paper-chapter-tree'].includes(expected), 'PROJECT_INVALID_INPUT');
     const r = get(p, id);
     check((r.meta.kind ?? 'summary') === expected, 'PROJECT_REPORT_KIND_MISMATCH');
     return r;
@@ -1917,8 +2218,11 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     if (r.meta.kind === 'paper-plan' && r.meta.state === 'completed') await readSavedPlan(p, r);
     const inspection = r.meta.kind === 'paper-section' && r.meta.state === 'completed'
       ? await (r.historical ? readSavedSection(p, r) : inspectSavedSection(p, r, true)) : null;
-    if (r.historical && r.meta.kind === 'paper-revision' && r.meta.revision.mode === 'operator-notes' && r.meta.state === 'completed') {
+    if (r.historical && r.meta.kind === 'paper-revision' && ['operator-notes', 'gap-fill'].includes(r.meta.revision.mode) && r.meta.state === 'completed') {
       await readOperatorNotes(p, r);
+    }
+    if (r.historical && r.meta.kind === 'paper-revision' && r.meta.revision.mode === 'compile-fix' && r.meta.state === 'completed') {
+      await readCompileLog(p, r);
     }
     let mathReviewError = null;
     if (r.meta.kind === 'paper-math-verification') {
@@ -2016,7 +2320,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     if (deferHistoricalWork === true) await prepareHistory(p, () => authorizeCreator(p, ctx));
     const r = getKind(p, args.reportId, options), m = r.meta;
     if (m.kind === 'paper-source' || m.kind === 'reference-audit' || m.kind === 'reference-verification' || m.kind === 'paper-revision'
-      || m.kind === 'paper-plan' || m.kind === 'paper-section' || m.kind === 'paper-math-verification') return paperResult(p, r);
+      || m.kind === 'paper-plan' || m.kind === 'paper-section' || m.kind === 'paper-math-verification' || m.kind === 'paper-chapter-tree') return paperResult(p, r);
     check(['completed', 'leak'].includes(m.state) && !m.cleanupPending && !r.failedSave, 'PROJECT_REPORT_NOT_READY');
     if (m.state === 'leak') return { ...view(r), saved: true, status: 'leak' };
     const { sessionId, sessionPath } = p.meta.creator ?? {};
@@ -2080,7 +2384,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
           r.meta.cleanupPending = !CONFIRMED_RECOVERY_STOPS.has(stopped.abortOutcome);
         } catch (error) { r.meta.recoveryError = code(error); r.meta.cleanupPending = true; }
       } else if (r.meta.writerStarting) r.meta.cleanupPending = true;
-      else if (r.meta.kind === 'paper-revision' && r.meta.revision.mode === 'operator-notes' && !r.failedSave
+      else if (r.meta.kind === 'paper-revision' && ['operator-notes', 'gap-fill', 'compile-fix'].includes(r.meta.revision.mode) && !r.failedSave
         && !r.meta.taskId && !r.meta.taskCreating && !r.meta.scheduleId && !r.meta.scheduleCreating) {
         // A recovered pre-task archive failure has no Host resources. Never clear uncertain creation markers.
         r.meta.cleanupPending = false; r.meta.taskSettlement = 'confirmed';
@@ -2153,20 +2457,218 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     const r = getKind(p, args.reportId, options);
     return r.historical ? stopHistorical(p, r) : stopInternal(p, r);
   }
+  async function audit(p, selector, ctx) {
+    await authorizeCreator(p, ctx);
+    if (deferHistoricalWork === true) await prepareHistory(p, () => authorizeCreator(p, ctx));
+    if (selector.reportId) {
+      const parent = get(p, selector.reportId), kind = parent.meta.kind ?? 'summary';
+      if (kind === 'paper-source') {
+        check(parent.meta.state === 'completed', 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
+        return start(p, { kind: 'reference-audit', language: 'English', audit: {
+          sourceReportId: parent.meta.reportId, paperId: parent.meta.paper.paperId } }, ctx);
+      }
+      if (kind === 'paper-revision') {
+        check(parent.meta.state === 'completed', 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
+        return start(p, { kind: 'reference-audit', language: 'English', audit: {
+          revisionReportId: parent.meta.reportId, paperId: parent.meta.revision.paperId } }, ctx);
+      }
+      if (kind === 'paper-chapter-tree') {
+        check(parent.meta.state === 'completed', 'PROJECT_REFERENCE_AUDIT_SOURCE_INVALID');
+        return start(p, { kind: 'reference-audit', language: 'English', audit: {
+          chapterTreeReportId: parent.meta.reportId, paperId: parent.meta.chapterTree.paperId } }, ctx);
+      }
+      throw failure('PROJECT_REPORT_KIND_MISMATCH');
+    }
+    const stitched = await stitchInternal(p, { planReportId: selector.planReportId, finalSectionReportId: selector.finalSectionReportId },
+      () => authorizeCreator(p, ctx), () => { assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); });
+    return start(p, { kind: 'reference-audit', language: 'English', audit: {
+      planReportId: selector.planReportId, finalSectionReportId: selector.finalSectionReportId, paperId: stitched.summary.paperId } }, ctx);
+  }
   async function revise(p, args, ctx) {
     args = snapshotPaperRevisionRequest(args);
     await authorizeCreator(p, ctx);
     if (deferHistoricalWork === true) await prepareHistory(p, () => authorizeCreator(p, ctx));
     // Select the lane before reading a parent; never fall back from citation failure.
-    if (args.mode === 'operator-notes') {
-      const parent = getKind(p, args.reportId, { kind: 'paper-source' });
+    if (args.mode === 'gap-fill') {
+      const mathReport = getKind(p, args.reportId, { kind: 'paper-math-verification' });
+      check(cleanMathCompletion(mathReport), 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+      const checkedReview = await readPaperMathReview(p, mathReport);
+      check(checkedReview.review.verdict === 'wrong', 'PROJECT_PAPER_GAP_FILL_NO_MUST_FIX');
+      const mustFixCount = checkedReview.review.findings.filter(f => f.class === 'must-fix').length;
+      check(mustFixCount > 0, 'PROJECT_PAPER_GAP_FILL_NO_MUST_FIX');
+      if (args.factIds.length === 0) {
+        if (args.missingBacking?.length) {
+          return {
+            projectId: p.meta.projectId, mathReviewReportId: mathReport.meta.reportId,
+            status: 'needs_research', mustFixCount, missingBacking: [...args.missingBacking],
+            message: 'No verified facts were supplied for gap-fill; return to research to prove and verify the missing backing first.',
+          };
+        }
+        throw failure('PROJECT_PAPER_GAP_FILL_FACTS_REQUIRED');
+      }
+      const authority = { authorize: () => authorizeCreator(p, ctx), guard: () => { assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); } };
+      const manuscript = await resolveMathBoundManuscript(p, mathReport.meta.math, authority, 'PROJECT_PAPER_REVISION_SOURCE_INVALID');
+      return start(p, {
+        kind: 'paper-revision', language: 'English',
+        revision: {
+          mode: 'gap-fill', mathReviewReportId: mathReport.meta.reportId, paperId: manuscript.paperId,
+          factIds: [...args.factIds], ...(args.missingBacking ? { missingBacking: [...args.missingBacking] } : {}),
+        },
+        notes: args.notes,
+      }, ctx);
+    }
+    if (args.mode === 'compile-fix') {
+      if (args.reportId) {
+        const parent = get(p, args.reportId), kind = parent.meta.kind ?? 'summary';
+        if (kind === 'paper-source') {
+          return start(p, { kind: 'paper-revision', language: 'English', revision: {
+            mode: 'compile-fix', sourceReportId: parent.meta.reportId, paperId: parent.meta.paper.paperId }, compileLog: args.compileLog }, ctx);
+        }
+        if (kind === 'paper-revision') {
+          return start(p, { kind: 'paper-revision', language: 'English', revision: {
+            mode: 'compile-fix', revisionReportId: parent.meta.reportId, paperId: parent.meta.revision.paperId }, compileLog: args.compileLog }, ctx);
+        }
+        if (kind === 'paper-chapter-tree') {
+          return start(p, { kind: 'paper-revision', language: 'English', revision: {
+            mode: 'compile-fix', chapterTreeReportId: parent.meta.reportId, paperId: parent.meta.chapterTree.paperId }, compileLog: args.compileLog }, ctx);
+        }
+        throw failure('PROJECT_REPORT_KIND_MISMATCH');
+      }
+      const stitched = await stitchInternal(p, { planReportId: args.planReportId, finalSectionReportId: args.finalSectionReportId },
+        () => authorizeCreator(p, ctx), () => { assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); });
       return start(p, { kind: 'paper-revision', language: 'English', revision: {
-        mode: 'operator-notes', sourceReportId: parent.meta.reportId, paperId: parent.meta.paper.paperId }, notes: args.notes }, ctx);
+        mode: 'compile-fix', planReportId: args.planReportId, finalSectionReportId: args.finalSectionReportId, paperId: stitched.summary.paperId }, compileLog: args.compileLog }, ctx);
+    }
+    if (args.mode === 'operator-notes') {
+      if (args.reportId) {
+        const parent = get(p, args.reportId), kind = parent.meta.kind ?? 'summary';
+        if (kind === 'paper-chapter-tree') {
+          return start(p, { kind: 'paper-revision', language: 'English', revision: {
+            mode: 'operator-notes', chapterTreeReportId: parent.meta.reportId, paperId: parent.meta.chapterTree.paperId }, notes: args.notes }, ctx);
+        }
+        const sourceParent = getKind(p, args.reportId, { kind: 'paper-source' });
+        return start(p, { kind: 'paper-revision', language: 'English', revision: {
+          mode: 'operator-notes', sourceReportId: sourceParent.meta.reportId, paperId: sourceParent.meta.paper.paperId }, notes: args.notes }, ctx);
+      }
+      const stitched = await stitchInternal(p, { planReportId: args.planReportId, finalSectionReportId: args.finalSectionReportId },
+        () => authorizeCreator(p, ctx), () => { assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); });
+      return start(p, { kind: 'paper-revision', language: 'English', revision: {
+        mode: 'operator-notes', planReportId: args.planReportId, finalSectionReportId: args.finalSectionReportId, paperId: stitched.summary.paperId }, notes: args.notes }, ctx);
     }
     // Read only the selector, not status(): verifier status may persist live tool diagnostics.
     const parent = getKind(p, args.reportId, { kind: 'reference-verification' });
     return start(p, { kind: 'paper-revision', language: 'English', revision: {
       verificationReportId: parent.meta.reportId, paperId: parent.meta.verification.paperId } }, ctx);
+  }
+  async function deliver(p, args, ctx, { compileEvidence = null } = {}) {
+    args = snapshotPaperDeliveryRequest(args);
+    await authorizeCreator(p, ctx);
+    assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
+    if (deferHistoricalWork === true) await prepareHistory(p, () => authorizeCreator(p, ctx));
+    const authority = { authorize: () => authorizeCreator(p, ctx), guard: () => { assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); } };
+    const manuscript = await resolveAnyManuscript(p, args, authority, 'PROJECT_PAPER_DELIVERY_SOURCE_INVALID');
+    const mathReport = getKind(p, args.mathReviewReportId, { kind: 'paper-math-verification' });
+    check(cleanMathCompletion(mathReport), 'PROJECT_PAPER_DELIVERY_REVIEW_INVALID');
+    const checkedReview = await readPaperMathReview(p, mathReport);
+    const evaluated = evaluatePaperDelivery({
+      projectId: p.meta.projectId, manuscript, mathReview: checkedReview.review,
+      compileEvidence, override: args.override ?? null, allowUncompiledTex: args.allowUncompiledTex === true,
+    });
+    if (!evaluated.texDeliverable) return { ...evaluated.manifest, files: [] };
+    const deliveryId = `delivery-${randomUUID()}`;
+    const dir = `${projectLocation(p)}/deliveries/${deliveryId}`;
+    await store.mkdir(dir, true);
+    const manifestBytes = Buffer.from(JSON.stringify(evaluated.manifest, null, 2) + '\n', 'utf8');
+    const deliverables = [
+      ['source', 'main.tex', evaluated.deliveredTexBytes, 'application/x-tex'],
+      ['ledger', 'REFERENCE_LEDGER.md', manuscript.ledgerBytes, 'text/markdown'],
+      ['review', 'MATH_REVIEW.json', checkedReview.bytes, 'application/json'],
+      ['manifest', 'DELIVERY_MANIFEST.json', manifestBytes, 'application/json'],
+    ];
+    if (evaluated.deliverOk && compileEvidence?.pdfBytes) {
+      deliverables.push(['pdf', 'main.pdf', Buffer.from(compileEvidence.pdfBytes), 'application/pdf']);
+    }
+    const written = [];
+    for (const [role, name, bytes, mime] of deliverables) {
+      const artifact = `${dir}/${name}`;
+      await store.write(artifact, bytes);
+      written.push({ role, name, artifact, mime, bytes: bytes.length, sha256: hash(bytes) });
+    }
+    await manuscript.assertUnchanged();
+    await authorizeCreator(p, ctx);
+    assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
+    const files = [];
+    for (const item of written) {
+      const receipt = await sdk.resources.stage({ path: store.absolute(item.artifact), name: item.name, mime: item.mime, deliverAs: 'attachment' });
+      const resource = receipt?.resource;
+      check(receipt?.ok !== false && !receipt?.error && resource?.kind === 'session-file'
+        && typeof resource.fileId === 'string' && resource.fileId && typeof p.meta.creator?.sessionId === 'string'
+        && resource.sessionId === p.meta.creator.sessionId, 'PROJECT_REPORT_STAGE_INVALID');
+      files.push({ role: item.role, name: item.name, bytes: item.bytes, sha256: item.sha256,
+        resource: { kind: 'session-file', fileId: resource.fileId, sessionId: resource.sessionId } });
+    }
+    return { ...evaluated.manifest, deliveryId, files };
+  }
+  async function chapterTreeStitch(p, args, ctx) {
+    args = snapshotChapterTreeRequest(args);
+    await authorizeCreator(p, ctx);
+    assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
+    if (deferHistoricalWork === true) await prepareHistory(p, () => authorizeCreator(p, ctx));
+    const authority = { authorize: () => authorizeCreator(p, ctx), guard: () => { assertLive(p); check(!disposed, 'PROJECT_DISPOSED'); } };
+    const hostMs = await resolveAnyManuscript(p, args.host, authority, 'PROJECT_PAPER_TREE_SOURCE_INVALID');
+    const resolvedChapters = [];
+    for (const ch of args.chapters) {
+      const ms = await resolveAnyManuscript(p, ch, authority, 'PROJECT_PAPER_TREE_SOURCE_INVALID');
+      resolvedChapters.push({ ch, ms });
+    }
+    const assembled = assembleChapterTree({
+      host: { tex: strictTextWith(hostMs.mainBytes, 'PROJECT_PAPER_TREE_SOURCE_INVALID'),
+        ledger: strictTextWith(hostMs.ledgerBytes, 'PROJECT_PAPER_TREE_SOURCE_INVALID'),
+        ...(args.host.assemblyAnchor ? { assemblyAnchor: args.host.assemblyAnchor } : {}) },
+      chapters: resolvedChapters.map(({ ch, ms }) => ({
+        chapterId: ch.chapterId, title: ch.title, dependsOn: ch.dependsOn,
+        ...(ch.hostPointerLabel ? { hostPointerLabel: ch.hostPointerLabel } : {}),
+        tex: strictTextWith(ms.mainBytes, 'PROJECT_PAPER_TREE_SOURCE_INVALID'),
+        ledger: strictTextWith(ms.ledgerBytes, 'PROJECT_PAPER_TREE_SOURCE_INVALID'),
+      })),
+      confirmedStyleRules: args.confirmedStyleRules ?? null,
+    });
+    await hostMs.assertUnchanged();
+    for (const { ms } of resolvedChapters) await ms.assertUnchanged();
+    await authorizeCreator(p, ctx);
+    assertLive(p); check(!disposed, 'PROJECT_DISPOSED');
+    const reportId = `report-${randomUUID()}`;
+    const fullManifest = { ...assembled.manifest, projectId: p.meta.projectId, reportId, paperId: hostMs.paperId };
+    const manifestBytes = Buffer.from(JSON.stringify(fullManifest, null, 2) + '\n', 'utf8');
+    const chapterTreeRecord = {
+      paperId: hostMs.paperId, chapterOrder: [...assembled.manifest.chapterOrder],
+      mainSha256: assembled.manifest.mainSha256, ledgerSha256: assembled.manifest.ledgerSha256,
+      manifestSha256: hash(manifestBytes),
+    };
+    const sourceStatus = assembled.manifest.seamChecklist.length || assembled.manifest.pointerWarnings.length
+      || assembled.manifest.bibliographyWarnings.length || assembled.manifest.cyclicDependencies.length
+      || assembled.manifest.forwardEdges.length ? 'flagged' : 'generated';
+    const r = wrap({
+      schemaVersion: 1, projectId: p.meta.projectId, reportId, kind: 'paper-chapter-tree',
+      chapterTree: chapterTreeRecord, sourceStatus, state: 'completed', language: 'English',
+      creator: copy(p.meta.creator), createdAt: Date.now(), completedAt: Date.now(),
+      taskId: null, taskCreating: false, scheduleId: null, scheduleCreating: false, scheduleCleaned: true,
+      nonce: randomBytes(24).toString('hex'), writerStarting: false, writer: null,
+      cleanupPending: false, stopRequested: false, taskSettlement: 'confirmed', delivery: null,
+      sha256: null, bytes: null,
+    });
+    await store.mkdir(directory(p, reportId), true);
+    await save(p, r);
+    await paperArtifact(p, r, 'source', assembled.mainTexBytes, 'application/x-tex');
+    await paperArtifact(p, r, 'ledger', assembled.ledgerBytes, 'text/markdown');
+    await paperArtifact(p, r, 'provenance', assembled.provenanceBytes, 'application/json');
+    await paperArtifact(p, r, 'manifest', manifestBytes, 'application/json');
+    r.meta.sha256 = r.meta.artifacts.source.sha256;
+    r.meta.bytes = r.meta.artifacts.source.bytes;
+    await save(p, r);
+    records.set(key(p, reportId), r);
+    const staged = await paperResult(p, r);
+    return { ...staged, manifest: fullManifest };
   }
   const verifierIdentityKeys = ['role', 'agentId', 'sessionId', 'sessionPath', 'cwd', 'kind'];
   const verifierRecords = () => [...records.values()].filter(r => r.meta.kind === 'reference-verification' && r.meta.writer);
@@ -2257,7 +2759,8 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
           // A live schedule/writer is independent evidence even without the report bit.
           meta.cleanupPending ||= cleanupPending;
         }
-        if (meta.kind === 'paper-revision' && meta.revision.mode === 'operator-notes' && meta.state === 'completed') await readOperatorNotes(p, r);
+        if (meta.kind === 'paper-revision' && ['operator-notes', 'gap-fill'].includes(meta.revision.mode) && meta.state === 'completed') await readOperatorNotes(p, r);
+        if (meta.kind === 'paper-revision' && meta.revision.mode === 'compile-fix' && meta.state === 'completed') await readCompileLog(p, r);
         records.set(key(p, id), r);
         if (['completed', 'leak'].includes(meta.state) && !meta.cleanupPending
           && !meta.taskCreating && !meta.scheduleCreating && !meta.writerStarting) {
@@ -2322,5 +2825,5 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
   function dashboardShutdownIdle() {
     return !disposed && active.size === 0 && deferredByProject.size === 0 && damaged.size === 0 && !hasUnopenedHistory();
   }
-  return Object.freeze({ start, status, result, stop, revise, stitch, handlesLiterature, invokeLiterature, dispose, dashboardShutdownIdle });
+  return Object.freeze({ start, status, result, stop, audit, revise, stitch, deliver, chapterTreeStitch, handlesLiterature, invokeLiterature, dispose, dashboardShutdownIdle });
 }
