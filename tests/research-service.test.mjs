@@ -11,6 +11,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { syncBuiltinESMExports } from 'node:module';
 import { createAppSdk } from '../packages/hana-math/sdk/app-contract/server-client.js';
 import { createResearchService, submissionProjection } from '../packages/hana-math/research-service.mjs';
+import { createProjectService } from '../packages/hana-math/project-service.mjs';
 import { createResearchBindings } from '../packages/hana-math/research-bindings.mjs';
 import { runSettlementState } from '../packages/hana-math/worker-stop-reconciliation.mjs';
 import { registerMathResearch } from '../packages/hana-math/research-tools.mjs';
@@ -4069,6 +4070,229 @@ test('deferred natural completion witnesses authorize historical reads only', as
     assert.deepEqual(hostCalls, []);
     assert.deepEqual(f.calls.core.map(call => call.operation), readable ? ['fact_get'] : []);
   });
+});
+
+test('deferred historical stopped runs settle via creator recheck and unblock Project admission without rewriting journals or replaying', async t => {
+  const behavior = {
+    createService: (sdk, options) => createResearchService(sdk, { ...options, deferHistoricalWork: true }),
+    realContexts: true,
+  };
+  const f = await fixture(t, behavior);
+  const { store, service, sdk } = f;
+  const projectId = 'project-mayer';
+  const owner = { sessionId: 'owner-stable-id', sessionPath: origin.sessionPath };
+  const mainSession = { sessionId: 'mayer-main-id', sessionPath: '/host/mayer-main.jsonl', agentId: 'saved-main' };
+  const host = new Map([
+    [origin.sessionPath, { sessionId: owner.sessionId, path: origin.sessionPath, ownerPluginId: null, namespace: 'home', visibility: 'public', lifecycle: 'active' }],
+    [mainSession.sessionPath, { sessionId: mainSession.sessionId, path: mainSession.sessionPath, ownerPluginId: 'hana-math', namespace: 'app', visibility: 'plugin_private', lifecycle: 'active', agentId: mainSession.agentId, cwd: store.absolute(`context/projects/${projectId}/main`), kind: `math-project:${projectId}:main` }],
+  ]);
+  const natural = { state: 'completed', phase: 'completed', abortOutcome: 'not-requested', sendState: 'accepted',
+    active: false, sendPending: false, cleanupPending: false, setupPending: false, finalizing: false,
+    modelStopReason: 'stop', error: null, failurePhase: null, sdkError: null };
+  const runSpecs = [
+    { workerId: 'worker-1', runId: 'run-stop-1', taskId: 'task-stop-1', coreTaskId: 'task-core-1',
+      sessions: [{ ...natural, role: 'worker', agentId: 'saved-worker', kind: 'math-research:run-stop-1:1', sessionId: 'sess-w1-1', sessionPath: '/host/w1-1.jsonl', cwd: store.absolute(`context/projects/${projectId}/workers/worker-1`), modelTurn: 1, turnEnded: true }],
+      expectedBefore: true },
+    { workerId: 'worker-1', runId: 'run-stop-2', taskId: 'task-stop-2', coreTaskId: 'task-core-2',
+      sessions: [
+        { ...natural, role: 'worker', agentId: 'saved-worker', kind: 'math-research:run-stop-2:1', state: 'stopped', phase: 'stopped', abortOutcome: 'aborted', error: 'EXPLICIT_STOP', failurePhase: 'awaiting-agent-end', turnEnded: false, modelStopReason: null, sessionId: 'sess-w1-2', sessionPath: '/host/w1-2.jsonl', cwd: store.absolute(`context/projects/${projectId}/workers/worker-1`), modelTurn: 1 },
+        { ...natural, role: 'verifier', agentId: 'saved-verifier', kind: 'math-research:run-stop-2:2', sessionId: 'sess-v1-2', sessionPath: '/host/v1-2.jsonl', submissionId: 'sub-1', cwd: store.absolute(`context/projects/${projectId}/research/run-stop-2/verifiers/sub-1`) },
+      ],
+      straySchedule: 'sched-stop-2', pendingCoreTask: true, expectedBefore: true },
+    { workerId: 'worker-2', runId: 'run-stop-3', taskId: 'task-stop-3', coreTaskId: 'task-core-3',
+      sessions: [{ ...natural, role: 'worker', agentId: 'saved-worker', kind: 'math-research:run-stop-3:1', state: 'stopped', phase: 'stopped', abortOutcome: 'aborted', sessionId: 'sess-w2-3', sessionPath: '/host/w2-3.jsonl', cwd: store.absolute(`context/projects/${projectId}/workers/worker-2`), modelTurn: 1, turnEnded: true }],
+      expectedBefore: false },
+    { workerId: 'worker-2', runId: 'run-stop-4', taskId: 'task-stop-4', coreTaskId: 'task-core-4',
+      sessions: [{ ...natural, role: 'worker', agentId: 'saved-worker', kind: 'math-research:run-stop-4:1', sessionId: 'sess-w2-4', sessionPath: '/host/w2-4.jsonl', cwd: store.absolute(`context/projects/${projectId}/workers/worker-2`), modelTurn: 2, turnEnded: true }],
+      expectedBefore: true },
+  ];
+  await f.prepareWorker(projectId, 'worker-1');
+  await f.prepareWorker(projectId, 'worker-2');
+  const journalBytes = new Map();
+  for (const spec of runSpecs) {
+    const loc = `research/runs/${spec.runId}/run.json`;
+    await store.mkdir(`research/runs/${spec.runId}`, true);
+    const meta = {
+      schemaVersion: 1, mode: 'project-worker', projectId, workerId: spec.workerId, runId: spec.runId,
+      taskId: spec.taskId, owner, state: 'stopped', phase: 'stopped', endedAt: 100, finalizing: false,
+      cleanupPending: false, abortOutcome: 'confirmed', indeterminate: false, cleanupErrors: [],
+      submissions: [], verifiedFactIds: [], pendingMutations: [], scheduleIds: [],
+      taskCreatePending: false, schedulePending: false, taskSettlementPending: false, taskTerminalExpected: 'failed',
+      coreTaskId: spec.coreTaskId, coreTaskCreatePending: false, coreTaskSettlementPending: false, coreTaskTerminalExpected: 'failed',
+      runtimeCleanupPending: false, runtimeCleanupError: null, sessions: spec.sessions,
+    };
+    const bytes = JSON.stringify(meta);
+    await store.write(loc, bytes);
+    journalBytes.set(loc, bytes);
+    f.tasks.set(spec.taskId, { taskId: spec.taskId, pluginId: 'hana-math', scope: 'session', delivery: 'next-step', status: 'failed',
+      parentSessionId: owner.sessionId, parentSessionPath: owner.sessionPath, metadata: { researchRunId: spec.runId } });
+    f.tasks.set(spec.coreTaskId, { taskId: spec.coreTaskId, pluginId: 'hana-math', scope: 'app', delivery: 'none',
+      parentSessionId: null, parentSessionPath: null, handlerKey: null, status: spec.pendingCoreTask ? 'pending' : 'failed',
+      metadata: { researchRunId: spec.runId, researchTaskKind: 'core-execution' } });
+    if (spec.straySchedule) {
+      f.schedules.set(spec.straySchedule, { scheduleId: spec.straySchedule, pluginId: 'hana-math', scope: 'app',
+        handlerKey: 'math-research-once', payload: { runId: spec.runId } });
+    }
+    for (const s of spec.sessions) {
+      f.hostSessions.set(s.sessionId, { sessionId: s.sessionId, path: s.sessionPath, agentId: s.agentId, kind: s.kind,
+        ownerPluginId: 'hana-math', namespace: 'app', visibility: 'plugin_private', lifecycle: 'active', active: false, cwd: s.cwd });
+    }
+  }
+  await store.write(`context/projects/${projectId}/workers/worker-1/run-ref.json`,
+    JSON.stringify({ schemaVersion: 1, projectId, workerId: 'worker-1', runId: 'run-stop-2' }), true);
+  await store.write(`context/projects/${projectId}/workers/worker-2/run-ref.json`,
+    JSON.stringify({ schemaVersion: 1, projectId, workerId: 'worker-2', runId: 'run-stop-4' }), true);
+  await store.mkdir(`research/projects/${projectId}`, true);
+  await store.write(`research/projects/${projectId}/project.json`, JSON.stringify({
+    schemaVersion: 1, projectId, state: 'ready', creator: owner, creatorRejected: false,
+    main: { state: 'ready', identityConfirmed: true, ...mainSession, cwd: store.absolute(`context/projects/${projectId}/main`), kind: `math-project:${projectId}:main` },
+    worker: { workerId: 'worker-1', runs: ['run-stop-1', 'run-stop-2'], lastRun: 'run-stop-2', start: { state: 'started', runId: 'run-stop-2' }, assignment: { state: 'unassigned' } },
+    extraWorkers: [{ workerId: 'worker-2', runs: ['run-stop-3', 'run-stop-4'], lastRun: 'run-stop-4', start: { state: 'started', runId: 'run-stop-4' }, assignment: { state: 'unassigned' } }],
+  }));
+
+  // Direct recheck before prepareProjectHistory works on an unloaded deferred run (run-stop-4),
+  // while the remaining 3 runs still block confirmProjectAdmission.
+  const refs = runSpecs.map(({ workerId, runId }) => ({ workerId, runId }));
+  const r4 = await service.projectWorkerRecheck({ projectId, workerId: 'worker-2', runId: 'run-stop-4' }, recheckOptions);
+  assert.equal(r4.state, 'settled'); assert.equal(r4.code, 'RECHECK_SETTLED');
+  assert.equal(r4.recoveryUnsettledBefore, true); assert.equal(r4.recoveryUnsettledAfter, false);
+  await assert.rejects(service.confirmProjectAdmission(projectId, refs, () => true), { code: 'PROJECT_HISTORY_UNCONFIRMED' });
+
+  // Recheck run-stop-1 (already loaded with deferredHistory=true by confirmProjectAdmission above).
+  const r1 = await service.projectWorkerRecheck({ projectId, workerId: 'worker-1', runId: 'run-stop-1' }, recheckOptions);
+  assert.equal(r1.state, 'settled'); assert.equal(r1.code, 'RECHECK_SETTLED');
+  assert.equal(r1.recoveryUnsettledBefore, true); assert.equal(r1.recoveryUnsettledAfter, false);
+
+  // Recheck run-stop-2 while Host task discovery fails -> records attempted cleanup, stays unconfirmed, keeps admission blocked.
+  behavior.taskListError = true;
+  const r2Fail = await service.projectWorkerRecheck({ projectId, workerId: 'worker-1', runId: 'run-stop-2' }, recheckOptions);
+  assert.equal(r2Fail.state, 'unknown'); assert.equal(r2Fail.code, 'RECHECK_UNCONFIRMED'); assert.equal(r2Fail.recoveryUnsettledAfter, true);
+  assert.deepEqual(r2Fail.mutationAttempts, { scheduleRemove: 1, sessionAbort: 2, taskFail: 1 });
+  behavior.taskListError = false;
+  await assert.rejects(service.confirmProjectAdmission(projectId, refs, () => true), { code: 'PROJECT_HISTORY_UNCONFIRMED' });
+
+  // Retry run-stop-2 -> confirms all 4 Host resource domains clean and settles.
+  const r2 = await service.projectWorkerRecheck({ projectId, workerId: 'worker-1', runId: 'run-stop-2' }, recheckOptions);
+  assert.equal(r2.state, 'settled'); assert.equal(r2.code, 'RECHECK_SETTLED');
+  assert.equal(r2.recoveryUnsettledBefore, true); assert.equal(r2.recoveryUnsettledAfter, false);
+  assert.deepEqual(r2.mutationAttempts, { scheduleRemove: 0, sessionAbort: 2, taskFail: 0 });
+  // run-stop-3 still has an unreconciled historical session -> admission stays blocked!
+  await assert.rejects(service.confirmProjectAdmission(projectId, refs, () => true), { code: 'PROJECT_HISTORY_UNCONFIRMED' });
+
+  // Recheck run-stop-3 (priorJournalSettled=true so recoveryUnsettledBefore=false, yet sessions.length>0).
+  const r3 = await service.projectWorkerRecheck({ projectId, workerId: 'worker-2', runId: 'run-stop-3' }, recheckOptions);
+  assert.equal(r3.state, 'settled'); assert.equal(r3.code, 'RECHECK_SETTLED');
+  assert.equal(r3.recoveryUnsettledBefore, false); assert.equal(r3.recoveryUnsettledAfter, false);
+
+  // Repeat recheck is a zero-mutation no-op.
+  const beforeAgain = recheckCounts(f);
+  for (const spec of runSpecs) {
+    const again = await service.projectWorkerRecheck({ projectId, workerId: spec.workerId, runId: spec.runId }, recheckOptions);
+    assert.equal(again.code, 'RECHECK_NOT_NEEDED'); assert.equal(again.initiated, false);
+  }
+  assert.deepEqual(recheckCounts(f), beforeAgain);
+  assert.equal(f.calls.starts.length, 0); assert.equal(f.calls.taskCreate.length, 0);
+
+  // All 4 stopped runs reconciled -> confirmProjectAdmission succeeds and new worker run starts cleanly!
+  await service.confirmProjectAdmission(projectId, refs, () => true);
+  const started = await service.startWorkerRun({ projectId, workerId: 'worker-1' }, origin);
+  assert.equal(started.state, 'queued'); assert.equal(f.calls.taskCreate.length, 1);
+
+  // Historical journals remain byte-identical and old abort/schedule callbacks remain ignored.
+  const handler = f.handlers.get('math-research-once');
+  for (const spec of runSpecs) {
+    assert.deepEqual(await handler.abort(spec.taskId), { status: 'ignored' });
+    assert.deepEqual(await handler.run({ kind: 'schedule', input: { runId: spec.runId, nonce: 'old' } }), { status: 'ignored' });
+    assert.equal((await store.read(`research/runs/${spec.runId}/run.json`)).toString(), journalBytes.get(`research/runs/${spec.runId}/run.json`));
+  }
+  await service.dispose();
+  for (const [loc, bytes] of journalBytes) assert.equal((await store.read(loc)).toString(), bytes);
+});
+
+test('deferred recheck enforces exact identity, terminal/clean state, guard validity and creator auth through ProjectService', async t => {
+  const f = await fixture(t, {
+    createService: (sdk, options) => createResearchService(sdk, { ...options, deferHistoricalWork: true }),
+  });
+  const { store, service } = f;
+  const projectId = 'project-mayer-guard', workerId = 'worker-1';
+  const owner = { sessionId: 'owner-stable-id', sessionPath: origin.sessionPath };
+  const baseMeta = (runId, patch = {}) => ({
+    schemaVersion: 1, mode: 'project-worker', projectId, workerId, runId, taskId: `task-${runId}`, owner,
+    state: 'stopped', phase: 'stopped', endedAt: 100, finalizing: false, cleanupPending: false,
+    abortOutcome: 'confirmed', indeterminate: false, cleanupErrors: [], submissions: [], verifiedFactIds: [],
+    pendingMutations: [], scheduleIds: [], taskCreatePending: false, schedulePending: false,
+    taskSettlementPending: false, taskTerminalExpected: 'failed', coreTaskId: null,
+    coreTaskCreatePending: false, coreTaskSettlementPending: false, runtimeCleanupPending: false, runtimeCleanupError: null,
+    sessions: [{ role: 'worker', sessionId: `s-${runId}`, sessionPath: `/host/${runId}.jsonl`, active: false, cleanupPending: false, sendPending: false, sendState: 'accepted', abortOutcome: 'not-requested', cwd: store.absolute(`context/projects/${projectId}/workers/${workerId}`) }],
+    ...patch,
+  });
+  const writeRun = async (runId, content) => {
+    await store.mkdir(`research/runs/${runId}`, true);
+    await store.write(`research/runs/${runId}/run.json`, typeof content === 'string' ? content : JSON.stringify(content));
+  };
+  await writeRun('run-active', baseMeta('run-active', { state: 'running', phase: 'working', endedAt: null }));
+  await writeRun('run-dirty', baseMeta('run-dirty', { cleanupPending: true }));
+  await writeRun('run-wrong-worker', baseMeta('run-wrong-worker', { workerId: 'worker-2', sessions: [] }));
+  await writeRun('run-corrupt', '{broken');
+  await writeRun('run-guard-flip', baseMeta('run-guard-flip'));
+
+  const before = recheckCounts(f);
+  await assert.rejects(service.projectWorkerRecheck({ projectId, workerId, runId: 'run-missing' }, recheckOptions), { code: 'RECHECK_RUN_NOT_LOADED' });
+  await assert.rejects(service.projectWorkerRecheck({ projectId, workerId, runId: 'run-wrong-worker' }, recheckOptions), { code: 'RECHECK_RUN_MISMATCH' });
+  await assert.rejects(service.projectWorkerRecheck({ projectId: 'project-other', workerId, runId: 'run-guard-flip' }, recheckOptions), { code: 'RECHECK_RUN_MISMATCH' });
+  await assert.rejects(service.projectWorkerRecheck({ projectId, workerId, runId: 'run-active' }, recheckOptions), { code: 'RECHECK_RUN_ACTIVE' });
+  await assert.rejects(service.projectWorkerRecheck({ projectId, workerId, runId: 'run-dirty' }, recheckOptions), { code: 'RECHECK_RUN_DIRTY' });
+  await assert.rejects(service.projectWorkerRecheck({ projectId, workerId, runId: 'run-corrupt' }, recheckOptions), { code: 'RECOVERY_RECORD_INVALID' });
+  let calls = 0;
+  await assert.rejects(service.projectWorkerRecheck({ projectId, workerId, runId: 'run-guard-flip' }, { guard: () => ++calls === 1 }), { code: 'RECHECK_GUARD_INVALID' });
+  assert.deepEqual(recheckCounts(f), before);
+
+  // End-to-end creator-only ProjectService.recheck -> Main assign unblocked under deferHistoricalWork (real restart).
+  const pf = await projectFixture(t, { multiWorker: true });
+  const p = await pf.create({ problem: 'mayer deferred fixture', workers: 2 });
+  const rrun = 'run-e2e-stopped';
+  const g = await fixture(t, {
+    createService: (sdk, options) => createResearchService(sdk, { ...options, deferHistoricalWork: true }),
+    realContexts: true,
+  }, pf.dataDir);
+  const loc = `research/runs/${rrun}/run.json`;
+  const runMeta = {
+    ...baseMeta(rrun, { projectId: p.projectId, workerId: 'worker-1', owner: { sessionId: 'creator-stable', sessionPath: projectOrigin.sessionPath } }),
+    sessions: [{ role: 'worker', agentId: 'saved-worker', kind: `math-research:${rrun}:1`, sessionId: 'sess-e2e', sessionPath: '/host/e2e.jsonl', active: false, cleanupPending: false,
+      sendPending: false, sendState: 'accepted', abortOutcome: 'not-requested', cwd: g.store.absolute(`context/projects/${p.projectId}/workers/worker-1`) }],
+  };
+  await g.store.mkdir(`research/runs/${rrun}`, true);
+  await g.store.write(loc, JSON.stringify(runMeta));
+  await g.store.write(`context/projects/${p.projectId}/workers/worker-1/run-ref.json`,
+    JSON.stringify({ schemaVersion: 1, projectId: p.projectId, workerId: 'worker-1', runId: rrun }), true);
+  g.tasks.set(runMeta.taskId, { taskId: runMeta.taskId, pluginId: 'hana-math', scope: 'session', delivery: 'next-step', status: 'failed',
+    parentSessionId: 'creator-stable', parentSessionPath: projectOrigin.sessionPath, metadata: { researchRunId: rrun } });
+  g.hostSessions.set('sess-e2e', { sessionId: 'sess-e2e', path: '/host/e2e.jsonl', agentId: 'saved-worker', kind: `math-research:${rrun}:1`, ownerPluginId: 'hana-math',
+    namespace: 'app', visibility: 'plugin_private', lifecycle: 'active', active: false, cwd: runMeta.sessions[0].cwd });
+  // Simulate restart: bind the historical run in project.json and open a fresh ProjectService with deferHistoricalWork: true.
+  const projectFile = `research/projects/${p.projectId}/project.json`;
+  const record = await g.store.readJson(projectFile);
+  record.worker.runs = [rrun]; record.worker.lastRun = rrun; record.worker.start = { state: 'started', runId: rrun };
+  await g.store.write(projectFile, JSON.stringify(record), true);
+  const literature = { async search() { return { results: [] }; } };
+  const createCore = () => ({ async call() { return { ok: true }; }, async dispose() { return { confirmed: true }; } });
+  const restarted = await createProjectService(pf.sdk, {
+    contexts: pf.contexts, profiles: pf.profiles, research: g.service, createCore, literature, deferHistoricalWork: true,
+  });
+  t.after(() => restarted.dispose());
+
+  // Main cannot assign before recheck, and Main cannot invoke creator-only recheck.
+  await restarted.goal('start', { projectId: p.projectId, authorized: true }, projectOrigin);
+  await assert.rejects(restarted.assign({ workerId: 'worker-1', task: 'blocked task' }, p.context), { code: 'PROJECT_HISTORY_UNCONFIRMED' });
+  await assert.rejects(restarted.recheck({ projectId: p.projectId, workerId: 'worker-1', runId: rrun }, p.context), { code: 'PROJECT_OWNER_DENIED' });
+  await assert.rejects(restarted.recheck({ projectId: p.projectId, workerId: 'worker-2', runId: rrun }, projectOrigin), { code: 'PROJECT_WORKER_MISMATCH' });
+
+  // Original creator calls recheck -> settles, and Main assign now succeeds!
+  const settled = await restarted.recheck({ projectId: p.projectId, workerId: 'worker-1', runId: rrun }, projectOrigin);
+  assert.equal(settled.state, 'settled'); assert.equal(settled.code, 'RECHECK_SETTLED');
+  const assigned = await restarted.assign({ workerId: 'worker-1', task: 'unblocked task' }, p.context);
+  assert.equal(assigned.assigned, true);
+  await g.service.dispose();
 });
 
 test('late schedule acknowledgement is cleaned and duplicate dispatcher cannot replay', async (t) => {

@@ -201,6 +201,70 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
     'PROJECT_REPORT_TASK_UNCONFIRMED');
     return task;
   }
+  function matchesCreatedReportTask(p, m, task) {
+    return object(task) && typeof task.taskId === 'string' && task.taskId.length > 0
+      && task.pluginId === APP && task.scope === 'session' && task.handlerKey === HANDLER
+      && task.delivery === 'next-step' && matchesReportTaskFields(m, task.metadata)
+      && task.parentSessionId === m.creator.sessionId && task.parentSessionPath === m.creator.sessionPath
+      && m.creator.sessionId === p.meta.creator?.sessionId && m.creator.sessionPath === p.meta.creator?.sessionPath;
+  }
+  async function reconcileTaskCreation(p, r) {
+    const m = r.meta;
+    if (!m.taskCreating) return true;
+    // Wait for any in-flight same-process create call before trusting a zero-match listing.
+    if (r.taskCreatePending && r.taskCreatePromise) {
+      try { await bounded(r.taskCreatePromise); } catch { /* settled or timed out */ }
+      if (r.taskCreatePending) return false;
+    }
+    if (!m.taskCreating) return true;
+    if (typeof sdk.tasks?.list !== 'function') return false;
+    let listed;
+    try { listed = await bounded(sdk.tasks.list()); }
+    catch { return false; }
+    if (!Array.isArray(listed)) return false;
+    const sameReport = listed.filter(t => object(t) && t.pluginId === APP
+      && t.metadata?.projectId === m.projectId && t.metadata?.reportId === m.reportId);
+    const matching = sameReport.filter(t => matchesCreatedReportTask(p, m, t));
+    if (sameReport.length !== matching.length || matching.length > 1) return false;
+    if (matching.length === 1) {
+      const found = matching[0];
+      if (m.taskId && m.taskId !== found.taskId) return false;
+      m.taskId = found.taskId;
+      m.taskCreating = false;
+      return true;
+    }
+    if (m.taskId) return false;
+    m.taskCreating = false;
+    return true;
+  }
+  async function reconcileScheduleCreation(p, r) {
+    const m = r.meta;
+    if (!m.scheduleCreating) return true;
+    if (r.scheduleCreatePending && r.scheduleCreatePromise) {
+      try { await bounded(r.scheduleCreatePromise); } catch { /* settled or timed out */ }
+      if (r.scheduleCreatePending) return false;
+    }
+    if (!m.scheduleCreating) return true;
+    if (typeof sdk.tasks?.listSchedules !== 'function') return false;
+    let listed;
+    try { listed = await bounded(sdk.tasks.listSchedules()); }
+    catch { return false; }
+    if (!Array.isArray(listed)) return false;
+    const sameReport = listed.filter(s => object(s) && s.pluginId === APP && s.scope === 'app' && s.handlerKey === HANDLER
+      && s.payload?.projectId === m.projectId && s.payload?.reportId === m.reportId);
+    const matching = sameReport.filter(s => typeof s.scheduleId === 'string' && s.scheduleId.length > 0 && s.payload?.nonce === m.nonce);
+    if (sameReport.length !== matching.length || matching.length > 1) return false;
+    if (matching.length === 1) {
+      const found = matching[0];
+      if (m.scheduleId && m.scheduleId !== found.scheduleId) return false;
+      m.scheduleId = found.scheduleId;
+      m.scheduleCreating = false;
+      return true;
+    }
+    if (!m.scheduleId) m.scheduleCleaned = true;
+    m.scheduleCreating = false;
+    return true;
+  }
   async function readGuard(p, r) {
     current(p, r); const task = await taskReceipt(p, r); current(p, r);
     check(['pending', 'running'].includes(task.status), 'PROJECT_REPORT_TASK_INACTIVE');
@@ -2068,8 +2132,12 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       }
       if (linear) await admissionLinearCheck();
       r.meta.taskCreating = true; await save(p, r);
-      const task = await bounded(sdk.tasks.create({ scope: 'session', callToken: ctx.callToken, delivery: 'next-step', handlerKey: HANDLER,
+      r.taskCreatePending = true;
+      const taskCreatePromise = Promise.resolve().then(() => sdk.tasks.create({ scope: 'session', callToken: ctx.callToken, delivery: 'next-step', handlerKey: HANDLER,
         label: spec.label, metadata: reportTaskFields(r.meta) }));
+      r.taskCreatePromise = taskCreatePromise;
+      taskCreatePromise.finally(() => { r.taskCreatePending = false; }).catch(() => {});
+      const task = await bounded(taskCreatePromise);
       check(task?.pluginId === APP && task.scope === 'session' && task.handlerKey === HANDLER && task.delivery === 'next-step'
         && task.parentSessionId === p.meta.creator.sessionId && task.parentSessionPath === ctx.sessionPath
         && matchesReportTaskFields(r.meta, task.metadata) && typeof task.taskId === 'string', 'PROJECT_REPORT_TASK_UNCONFIRMED');
@@ -2086,8 +2154,12 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       check(!disposed, 'PROJECT_DISPOSED'); check(!r.meta.stopRequested, 'PROJECT_SUMMARY_STOPPED');
       if (mathMaterial) await mathMaterial.assertSource();
       r.meta.scheduleCreating = true; await save(p, r);
-      const schedule = await bounded(sdk.tasks.schedule({ scope: 'app', handlerKey: HANDLER, runAt: Date.now(), label: 'Write Math report once',
+      r.scheduleCreatePending = true;
+      const scheduleCreatePromise = Promise.resolve().then(() => sdk.tasks.schedule({ scope: 'app', handlerKey: HANDLER, runAt: Date.now(), label: 'Write Math report once',
         payload: { projectId: p.meta.projectId, reportId, nonce: r.meta.nonce } }));
+      r.scheduleCreatePromise = scheduleCreatePromise;
+      scheduleCreatePromise.finally(() => { r.scheduleCreatePending = false; }).catch(() => {});
+      const schedule = await bounded(scheduleCreatePromise);
       check(schedule?.pluginId === APP && schedule.scope === 'app' && schedule.handlerKey === HANDLER && typeof schedule.scheduleId === 'string', 'PROJECT_REPORT_SCHEDULE_UNCONFIRMED');
       // An immediate handler can run before the schedule receipt. Never restore
       // a schedule that the handler already confirmed removed.
@@ -2367,11 +2439,14 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         || r.meta.writerStarting || r.failedSave;
       if (TERMINAL.has(r.meta.state) && !r.meta.cleanupPending && r.meta.taskSettlement === 'confirmed'
         && !(linearKind(r.meta.kind) && r.meta.scheduleId)) return view(r);
+      const taskCreatingReconciled = r.meta.taskCreating ? await reconcileTaskCreation(p, r) : false;
+      const scheduleCreatingReconciled = r.meta.scheduleCreating ? await reconcileScheduleCreation(p, r) : false;
       const terminalState = r.meta.state;
       r.meta.stopRequested = true; if (!TERMINAL.has(terminalState)) r.meta.state = 'stopped';
       r.meta.cleanupPending ||= r.meta.taskCreating || r.meta.scheduleCreating || r.meta.writerStarting;
       await save(p, r);
-      try { await unschedule(p, r); } catch { r.meta.cleanupPending = true; }
+      let unscheduleFailed = false;
+      try { await unschedule(p, r); } catch { unscheduleFailed = true; r.meta.cleanupPending = true; }
       if (r.handle) {
         delete r.meta.recoveryStop; delete r.meta.recoveryError;
         try { const stopped = await r.handle.stop(); r.meta.writer = stoppedWriterEvidence(p, r, stopped); r.meta.cleanupPending = stopped?.cleanupPending !== false; }
@@ -2384,7 +2459,11 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
           r.meta.cleanupPending = !CONFIRMED_RECOVERY_STOPS.has(stopped.abortOutcome);
         } catch (error) { r.meta.recoveryError = code(error); r.meta.cleanupPending = true; }
       } else if (r.meta.writerStarting) r.meta.cleanupPending = true;
-      else if (r.meta.kind === 'paper-revision' && ['operator-notes', 'gap-fill', 'compile-fix'].includes(r.meta.revision.mode) && !r.failedSave
+      else if ((taskCreatingReconciled || scheduleCreatingReconciled) && !unscheduleFailed && !r.failedSave
+        && !r.meta.taskCreating && !r.meta.scheduleCreating && !r.meta.scheduleId) {
+        r.meta.cleanupPending = false;
+        if (!r.meta.taskId) r.meta.taskSettlement = 'confirmed';
+      } else if (r.meta.kind === 'paper-revision' && ['operator-notes', 'gap-fill', 'compile-fix'].includes(r.meta.revision.mode) && !r.failedSave
         && !r.meta.taskId && !r.meta.taskCreating && !r.meta.scheduleId && !r.meta.scheduleCreating) {
         // A recovered pre-task archive failure has no Host resources. Never clear uncertain creation markers.
         r.meta.cleanupPending = false; r.meta.taskSettlement = 'confirmed';
@@ -2403,6 +2482,8 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
       const m = r.meta;
       if (!reportNeedsRecovery(m)) return view(r);
       const unfinished = !TERMINAL.has(m.state);
+      if (m.taskCreating) await reconcileTaskCreation(p, r);
+      if (m.scheduleCreating) await reconcileScheduleCreation(p, r);
       let pending = m.taskCreating || m.scheduleCreating || m.writerStarting || r.failedSave;
       if (unfinished) m.stopRequested = true;
       // Make the unresolved stop durable before Host side effects. Keep the recorded
@@ -2921,7 +3002,11 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
         }
         if (!TERMINAL.has(meta.state) || meta.cleanupPending || meta.taskCreating || meta.scheduleCreating || meta.writerStarting) {
           meta.state = 'interrupted'; setReportError(meta, 'PROJECT_REPORT_INTERRUPTED');
-          meta.cleanupPending = meta.cleanupPending || meta.taskCreating || meta.scheduleCreating || meta.writerStarting;
+          const taskCreatingReconciled = meta.taskCreating ? await reconcileTaskCreation(p, r) : false;
+          const scheduleCreatingReconciled = meta.scheduleCreating ? await reconcileScheduleCreation(p, r) : false;
+          meta.cleanupPending = ((taskCreatingReconciled || scheduleCreatingReconciled)
+            && !meta.taskCreating && !meta.scheduleCreating && !meta.writerStarting && !meta.writer?.sessionId && !r.failedSave
+            ? false : meta.cleanupPending) || meta.taskCreating || meta.scheduleCreating || meta.writerStarting;
           if (meta.writer?.sessionId) {
             delete meta.recoveryStop; delete meta.recoveryError;
             try {
@@ -2931,6 +3016,7 @@ export async function createProjectReportService({ sdk, store, summaryWriter, au
             } catch (error) { meta.cleanupPending = true; meta.recoveryError = code(error); }
           }
           try { await unschedule(p, r); } catch { meta.cleanupPending = true; }
+          if (!meta.cleanupPending && !meta.taskId && !meta.taskCreating) meta.taskSettlement = 'confirmed';
           await save(p, r);
         }
         if (meta.taskSettlement !== 'confirmed') await settle(p, r);

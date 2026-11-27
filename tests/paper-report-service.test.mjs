@@ -1882,3 +1882,119 @@ test('in-memory handle stop clears stale recoveryStop and recoveryError receipts
     }
   });
 });
+
+for (const mode of ['same-process-no-task', 'same-process-orphan-task', 'deferred-restart-no-task', 'deferred-restart-orphan-task']) {
+  test(`paper-revision task creation timeout reconciles via Host tasks.list and unblocks replacement (${mode})`, async t => {
+    const f = await fixture(t), b = await notesSource(f);
+    f.sdk.tasks.list = async () => [...f.tasks.values()].map(row => structuredClone(row));
+    f.sdk.tasks.listSchedules = async () => [...f.schedules.values()].map(row => structuredClone(row));
+    f.sdk.tasks.getSchedule = async id => (f.schedules.has(id) ? structuredClone(f.schedules.get(id)) : null);
+    const origCreate = f.sdk.tasks.create;
+    let injectOnce = true;
+    f.sdk.tasks.create = async input => {
+      if (!injectOnce) return origCreate(input);
+      injectOnce = false;
+      if (mode.endsWith('orphan-task')) await origCreate(input);
+      throw Object.assign(new Error('Host task create timed out'), { code: 'PROJECT_REPORT_CONTROL_TIMEOUT' });
+    };
+
+    let failedReportId;
+    await assert.rejects(f.rawService.start(f.p, b.args, owner), err => {
+      failedReportId = err.reportId;
+      return err.code === 'PROJECT_REPORT_CONTROL_TIMEOUT';
+    });
+    assert.ok(failedReportId);
+    const stuck = await f.metadata({ reportId: failedReportId });
+    assert.equal(stuck.state, 'failed');
+    assert.equal(stuck.taskCreating, true);
+    assert.equal(stuck.cleanupPending, true);
+    assert.equal(stuck.taskId, null);
+    assert.equal(f.calls.writer.length, 1, 'reviser never started');
+
+    if (mode.startsWith('deferred-restart')) {
+      await f.open({ deferHistoricalWork: true });
+    }
+    // Replacement is blocked until creator runs formal stop reconciliation.
+    await assert.rejects(f.rawService.start(f.p, b.args, owner), { code: 'PROJECT_SUMMARY_BUSY' });
+
+    const stopped = await f.rawService.stop(f.p, { reportId: failedReportId }, owner, revisionKind);
+    assert.equal(stopped.cleanupPending, false);
+    assert.equal(stopped.taskSettlement, 'confirmed');
+    const settled = await f.metadata({ reportId: failedReportId });
+    assert.equal(settled.taskCreating, false);
+    assert.equal(settled.cleanupPending, false);
+    assert.equal(settled.taskSettlement, 'confirmed');
+    if (mode.endsWith('orphan-task')) {
+      assert.ok(typeof settled.taskId === 'string' && settled.taskId.length > 0);
+      assert.equal(f.tasks.get(settled.taskId).status, 'failed');
+    } else {
+      assert.equal(settled.taskId, null);
+    }
+
+    // Subsequent revision now starts cleanly!
+    const next = await f.rawService.start(f.p, b.args, owner);
+    assert.equal(next.state, 'queued');
+    assert.notEqual(next.reportId, failedReportId);
+    await f.rawService.stop(f.p, next, owner, revisionKind);
+  });
+}
+
+test('taskCreating and scheduleCreating timeout recovery fail closed on list failure, forged/duplicate tasks, or in-flight create, and recover orphan schedules', async t => {
+  // 1. Fail-closed on list failure, forged metadata, and duplicate matching tasks
+  for (const fault of ['list-error', 'forged-task', 'duplicate-task']) await t.test(fault, async t => {
+    const f = await fixture(t), b = await notesSource(f);
+    const origCreate = f.sdk.tasks.create;
+    let first = true;
+    f.sdk.tasks.create = async input => {
+      if (!first) return origCreate(input);
+      first = false;
+      if (fault === 'forged-task') {
+        const forged = await origCreate(input);
+        f.tasks.get(forged.taskId).parentSessionId = 'foreign-session';
+      } else if (fault === 'duplicate-task') {
+        await origCreate(input);
+        await origCreate(input);
+      }
+      throw Object.assign(new Error('timeout'), { code: 'PROJECT_REPORT_CONTROL_TIMEOUT' });
+    };
+    f.sdk.tasks.list = async () => {
+      if (fault === 'list-error') throw Object.assign(new Error('list unavailable'), { code: 'HOST_UNAVAILABLE' });
+      return [...f.tasks.values()].map(row => structuredClone(row));
+    };
+    let failedId;
+    await assert.rejects(f.rawService.start(f.p, b.args, owner), err => { failedId = err.reportId; return err.code === 'PROJECT_REPORT_CONTROL_TIMEOUT'; });
+    const stopped = await f.rawService.stop(f.p, { reportId: failedId }, owner, revisionKind);
+    assert.equal(stopped.cleanupPending, true);
+    assert.notEqual(stopped.taskSettlement, 'confirmed');
+    assert.equal((await f.metadata({ reportId: failedId })).taskCreating, true);
+    await assert.rejects(f.rawService.start(f.p, b.args, owner), { code: 'PROJECT_SUMMARY_BUSY' });
+  });
+
+  // 2. Orphan schedule created during scheduleCreating timeout is discovered, unscheduled, and unblocked (including after deferred restart)
+  for (const deferred of [false, true]) await t.test(`scheduleCreating orphan (deferred=${deferred})`, async t => {
+    const f = await fixture(t), b = await notesSource(f);
+    f.sdk.tasks.list = async () => [...f.tasks.values()].map(row => structuredClone(row));
+    f.sdk.tasks.listSchedules = async () => [...f.schedules.values()].map(row => structuredClone(row));
+    f.sdk.tasks.getSchedule = async id => (f.schedules.has(id) ? structuredClone(f.schedules.get(id)) : null);
+    const origSchedule = f.sdk.tasks.schedule;
+    let first = true;
+    f.sdk.tasks.schedule = async input => {
+      if (!first) return origSchedule(input);
+      first = false;
+      await origSchedule(input);
+      throw Object.assign(new Error('schedule timeout'), { code: 'PROJECT_REPORT_CONTROL_TIMEOUT' });
+    };
+    let failedId;
+    await assert.rejects(f.rawService.start(f.p, b.args, owner), err => { failedId = err.reportId; return err.code === 'PROJECT_REPORT_CONTROL_TIMEOUT'; });
+    assert.equal(f.schedules.size, 1);
+    if (deferred) await f.open({ deferHistoricalWork: true });
+    await assert.rejects(f.rawService.start(f.p, b.args, owner), { code: 'PROJECT_SUMMARY_BUSY' });
+    const stopped = await f.rawService.stop(f.p, { reportId: failedId }, owner, revisionKind);
+    assert.equal(stopped.cleanupPending, false);
+    assert.equal(stopped.taskSettlement, 'confirmed');
+    assert.equal(f.schedules.size, 0);
+    const next = await f.rawService.start(f.p, b.args, owner);
+    assert.equal(next.state, 'queued');
+    await f.rawService.stop(f.p, next, owner, revisionKind);
+  });
+});

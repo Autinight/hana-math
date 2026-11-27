@@ -1693,13 +1693,17 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
       if (projectPreparations.get(projectId) === permit) projectPreparations.delete(projectId);
     }
   }
+  function deferredAdmissionUnreconciled(r) {
+    return r.deferredHistory === true && r.deferredHistoryReconciled !== true
+      && (r.recoveryUnsettled === true || r.meta.sessions.length > 0);
+  }
   async function confirmProjectAdmission(projectId, expected, guard, options) {
     if (!deferHistoricalWork) return;
     admittedProjects.delete(projectId);
     await prepareProjectHistory(projectId, expected, guard, options);
     assertWorkerAdmission(guard);
     check(preparedProjects.has(projectId) && !disposed && [...runs.values()].every(r => r.meta.projectId !== projectId
-      || !r.deferredHistory || !r.recoveryUnsettled && !workerBusy(r) && r.meta.sessions.length === 0),
+      || !r.deferredHistory || !r.recoveryUnsettled && !workerBusy(r) && !deferredAdmissionUnreconciled(r)),
     'PROJECT_HISTORY_UNCONFIRMED');
     admittedProjects.add(projectId);
   }
@@ -1919,6 +1923,7 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
           && Object.keys(cleanup.meta.recovery).length === 4) {
           // This synchronous guard/clear pair never rewrites historical run.json.
           job.guard(); r.recoveryUnsettled = false;
+          if (r.deferredHistory) r.deferredHistoryReconciled = true;
           for (let i = recoveryErrors.length - 1; i >= 0; i--) if (recoveryErrors[i].runId === runId
             && recoveryErrors[i].error?.code === 'RECOVERY_CLEANUP_PENDING') recoveryErrors.splice(i, 1);
           job.state = 'settled'; job.code = 'RECHECK_SETTLED';
@@ -1954,18 +1959,32 @@ export async function createResearchService(sdk, { contexts, profiles, createCor
       check(result !== false, 'RECHECK_GUARD_INVALID');
     };
     callerGuard();
-    const r = runs.get(runId); check(r, 'RECHECK_RUN_NOT_LOADED');
-    check(!r.deferredHistory, 'PROJECT_HISTORY_UNCONFIRMED');
+    let r = runs.get(runId), loadedDeferred = false;
+    if (!r && deferHistoricalWork) {
+      try {
+        r = await readPriorRun(runId, m => check(m?.mode === 'project-worker' && m.projectId === projectId
+          && m.workerId === workerId && m.runId === runId, 'RECHECK_RUN_MISMATCH'));
+      } catch (error) {
+        if (error?.code === 'RUN_NOT_FOUND') throw failure('RECHECK_RUN_NOT_LOADED');
+        throw error;
+      }
+      callerGuard();
+      const installed = runs.get(runId);
+      if (installed) r = installed;
+      else loadedDeferred = true;
+    }
+    check(r, 'RECHECK_RUN_NOT_LOADED');
     check(r.meta.mode === 'project-worker' && r.meta.projectId === projectId && r.meta.workerId === workerId && r.meta.runId === runId, 'RECHECK_RUN_MISMATCH');
     check(!ACTIVE.has(r.meta.state), 'RECHECK_RUN_ACTIVE');
     check(['finished', 'failed', 'stopped', 'interrupted'].includes(r.meta.state), 'RECHECK_RUN_NOT_TERMINAL');
     check(cleanWorkerTerminal(r.meta) && !r.persistenceFailed, 'RECHECK_RUN_DIRTY');
-    const before = r.recoveryUnsettled === true;
+    const before = r.recoveryUnsettled === true, needsDeferred = deferredAdmissionUnreconciled(r);
     const dto = (state, code, initiated, joined, attempts, job = null) => ({ projectId, workerId, runId, state, code,
       recoveryUnsettledBefore: before, recoveryUnsettledAfter: r.recoveryUnsettled === true, initiated, joined,
       recheckPending: job ? !job.done : false,
       mutationAttempts: { ...attempts } });
-    if (!before) { callerGuard(); return dto('unknown', 'RECHECK_NOT_NEEDED', false, false, { scheduleRemove: 0, sessionAbort: 0, taskFail: 0 }); }
+    if (!before && !needsDeferred) { callerGuard(); return dto('unknown', 'RECHECK_NOT_NEEDED', false, false, { scheduleRemove: 0, sessionAbort: 0, taskFail: 0 }); }
+    if (loadedDeferred) { callerGuard(); runs.set(runId, r); }
     const { checking, initiated } = recoveryCheck(r, callerGuard, true), job = checking.recheck;
     let timeout = false;
     try { await bounded(checking); } catch (error) { timeout = error.code === 'CONTROL_TIMEOUT'; }
