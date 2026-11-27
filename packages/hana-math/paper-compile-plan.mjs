@@ -39,6 +39,20 @@ export function buildPaperCompilePlan({ sourceBytes, sourceSha256, cwd, command,
       '-no-mktex=tex', '-no-mktex=tfm', '-no-mktex=pk', 'main.tex'] };
 }
 
+const UNSETTLED_REF_PATTERNS = [
+  /(?:^|\n)(?:LaTeX|Package\s+[^\s:]+)\s+Warning:\s*(?:Reference|Citation)\b[\s\S]{0,240}?\bundefined\b/i,
+  /(?:^|\n)(?:LaTeX|Package\s+[^\s:]+)\s+Warning:\s*Label\b[^\r\n]*\bmultiply[- ]defined\b/i,
+  /(?:^|\n)(?:LaTeX|Package\s+[^\s:]+)\s+Warning:[^\r\n]*(?:There were undefined (?:references|citations)|There were multiply-defined labels|Label\(s\) may have changed|has changed|re-?run\b)/i,
+  /\bThere were undefined (?:references|citations)\b/i,
+  /\bThere were multiply-defined labels\b/i,
+  /\bLabel\(s\) may have changed\b/i,
+  /\bRerun\s+(?:to\s+get|LaTeX|pdflatex|BibTeX|Biber)\b/i,
+  /\bPlease\s+(?:\(re\)|re-?)?run\b/i,
+];
+function hasUnsettledReferences(log) {
+  return UNSETTLED_REF_PATTERNS.some(pattern => pattern.test(log));
+}
+
 // Retrospective lexical recorder check and PDF envelope only. Realpath checks,
 // isolation, exit/timeout handling and PDF interpretation are not supplied here.
 export function checkPaperCompileOutput({ logBytes, flsBytes, pdfBytes, cwd, readRoots, pass }) {
@@ -46,7 +60,7 @@ export function checkPaperCompileOutput({ logBytes, flsBytes, pdfBytes, cwd, rea
   const log = decode(logBytes), fls = decode(flsBytes);
   requireCheck(/^This is pdfTeX[, ]/.test(log) && !log.includes('\0'), 'LOG_INVALID');
   requireCheck(!/(?:^|\n)\s*!|(?:LaTeX|Package\s+[^\r\n]+) Error:|Fatal error|Emergency stop|error occurred|^.+:\d+:.*(?:Error|Undefined control sequence)/im.test(log), 'TEX_ERROR');
-  if (pass === 2) requireCheck(!/undefined|Rerun|re-run|Please\s+(?:\(re\))?run|Label\(s\) may have changed/i.test(log), 'REFERENCES_UNSETTLED');
+  if (pass === 2) requireCheck(!hasUnsettledReferences(log), 'REFERENCES_UNSETTLED');
   requireCheck(/Output written on main\.pdf\s*\(/.test(log), 'LOG_INVALID');
   requireCheck(bytesWithin(pdfBytes, PDF_MAX) && pdfBytes.length > 8
     && /^%PDF-(?:1\.[0-9]|2\.0)(?:\r|\n)/.test(Buffer.from(pdfBytes.subarray(0, 16)).toString('latin1'))

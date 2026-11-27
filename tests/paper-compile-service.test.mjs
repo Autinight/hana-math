@@ -193,13 +193,17 @@ test('real local pdflatex compiles valid paper, captures compile-fix log on erro
 
   // Seed a clean settled paper-source report + a broken paper-source report + a clean passing math review.
   const goodTex = Buffer.from([
-    '\\documentclass{article}',
-    '\\usepackage{amsmath}',
+    '\\documentclass{amsart}',
+    '\\usepackage{amsmath,amssymb,amsthm,hyperref}',
+    '\\newtheorem{theorem}{Theorem}',
     '\\title{Real TeX Compile Verification}',
     '\\begin{document}',
     '\\maketitle',
-    '\\section{Main Result}',
-    'For every $n \\ge 1$, we have $n^2 \\ge n$. See \\cite{Alpha}.',
+    '\\tableofcontents',
+    '\\section{Main Result}\\label{sec:main}',
+    '\\begin{theorem}\\label{thm:main}',
+    'For every $n \\ge 1$, we have $n^2 \\ge n$. See Section~\\ref{sec:main} and \\cite{Alpha}.',
+    '\\end{theorem}',
     '\\begin{thebibliography}{9}',
     '\\bibitem{Alpha} Opaque Author, \\emph{Verified Reference}, 2026.',
     '\\end{thebibliography}',

@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "hana-math",
   "name": "Hana Math",
-  "version": "0.38.2",
+  "version": "0.38.3",
   "entry": "index.js",
   "capabilities": ["app/agents.read", "app/agents.manage", "app/resources.read", "app/resources.write", "app/runtime.execute", "app/runtime.native", "app/runtime.network", "app/process.spawn", "app/tools.expose-to-model", "app/tasks.manage", "app/session.start-turn", "app/session.switch-model", "app/session.thinking-level", "app/session.tools.configure", "app/session.stage-file", "app/sessions.home"],
   "network": {

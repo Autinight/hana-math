@@ -274,6 +274,18 @@ export function createPaperCompileService(sdk, {
       });
       await fs.writeFile(path.join(canonicalJobDir, 'main.tex'), sourceBytes, { mode: 0o600 });
 
+      const readOptional = async name => {
+        try { return await fs.readFile(path.join(canonicalJobDir, name)); }
+        catch { return null; }
+      };
+      const readOutputs = async () => {
+        const [logBytes, flsBytes, pdfBytes] = await Promise.all([
+          readOptional('main.log'), readOptional('main.fls'), readOptional('main.pdf'),
+        ]);
+        const logText = logBytes ? new TextDecoder('utf-8', { fatal: false }).decode(logBytes) : '';
+        return { logBytes, flsBytes, pdfBytes, logText };
+      };
+
       let lastPass = 0;
       let lastExec = null;
       for (const pass of [1, 2]) {
@@ -282,14 +294,26 @@ export function createPaperCompileService(sdk, {
         if (lastExec.exitCode !== 0) break;
       }
 
-      const readOptional = async name => {
-        try { return await fs.readFile(path.join(canonicalJobDir, name)); }
-        catch { return null; }
-      };
-      const [logBytes, flsBytes, pdfBytes] = await Promise.all([
-        readOptional('main.log'), readOptional('main.fls'), readOptional('main.pdf'),
-      ]);
-      const logText = logBytes ? new TextDecoder('utf-8', { fatal: false }).decode(logBytes) : '';
+      let { logBytes, flsBytes, pdfBytes, logText } = await readOutputs();
+      let checked = null;
+      let checkError = null;
+      if (lastExec && lastExec.exitCode === 0) {
+        try {
+          checked = checkPaperCompileOutput({ logBytes, flsBytes, pdfBytes, cwd: canonicalJobDir, readRoots: resolved.readRoots, pass: 2 });
+        } catch (err) {
+          if (err?.code === 'PAPER_COMPILE_REFERENCES_UNSETTLED') {
+            // Allow one final pass for documents (e.g. TOC + hyperref outlines) that genuinely need 3 passes to settle.
+            lastPass = 3;
+            lastExec = await runner(plan.command, plan.args, { cwd: canonicalJobDir, timeoutMs });
+            ({ logBytes, flsBytes, pdfBytes, logText } = await readOutputs());
+            if (lastExec && lastExec.exitCode === 0) {
+              try {
+                checked = checkPaperCompileOutput({ logBytes, flsBytes, pdfBytes, cwd: canonicalJobDir, readRoots: resolved.readRoots, pass: 2 });
+              } catch (thirdErr) { checkError = thirdErr; }
+            }
+          } else { checkError = err; }
+        }
+      }
       const version = extractPdfTexVersion(logText);
       const fallbackLog = !logBytes && lastExec ? Buffer.from(`${lastExec.stdout || ''}\n${lastExec.stderr || ''}`.trim() + '\n', 'utf8') : null;
       const effectiveLogBytes = logBytes || fallbackLog || Buffer.from('No TeX log produced.\n', 'utf8');
@@ -315,18 +339,10 @@ export function createPaperCompileService(sdk, {
         };
       }
 
-      try {
-        const checked = checkPaperCompileOutput({
-          logBytes,
-          flsBytes,
-          pdfBytes,
-          cwd: canonicalJobDir,
-          readRoots: resolved.readRoots,
-          pass: 2,
-        });
+      if (checked) {
         return {
           ok: true,
-          pass: 2,
+          pass: lastPass,
           executable: resolved.resolvedPath,
           configuredPath: resolved.configuredPath,
           mode: resolved.mode,
@@ -339,22 +355,21 @@ export function createPaperCompileService(sdk, {
           checked,
           logExcerpt: extractCompileLogExcerpt(logText, 1200),
         };
-      } catch (checkError) {
-        return {
-          ok: false,
-          errorCode: checkError?.code || 'PAPER_COMPILE_OUTPUT_INVALID',
-          message: `TeX 产物核验未通过：${checkError?.code || checkError?.message || 'OUTPUT_INVALID'}`,
-          pass: 2,
-          executable: resolved.resolvedPath,
-          configuredPath: resolved.configuredPath,
-          mode: resolved.mode,
-          version,
-          cwd: canonicalJobDir,
-          readRoots: resolved.readRoots,
-          logBytes: effectiveLogBytes,
-          logExcerpt: extractCompileLogExcerpt(effectiveLogText),
-        };
       }
+      return {
+        ok: false,
+        errorCode: checkError?.code || 'PAPER_COMPILE_OUTPUT_INVALID',
+        message: `TeX 产物核验未通过：${checkError?.code || checkError?.message || 'OUTPUT_INVALID'}`,
+        pass: lastPass,
+        executable: resolved.resolvedPath,
+        configuredPath: resolved.configuredPath,
+        mode: resolved.mode,
+        version,
+        cwd: canonicalJobDir,
+        readRoots: resolved.readRoots,
+        logBytes: effectiveLogBytes,
+        logExcerpt: extractCompileLogExcerpt(effectiveLogText),
+      };
     } finally {
       await fs.rm(jobDir, { recursive: true, force: true }).catch(() => {});
     }

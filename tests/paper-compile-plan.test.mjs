@@ -38,6 +38,29 @@ test('pass 1 may request a rerun and pass 2 must settle; record only a PDF envel
   assert.notEqual(first.logSha256, second.logSha256);
   assert.deepEqual(second, { inputs: [cwd + '/main.tex', tex + '/format/pdflatex.fmt'],
     pdfSha256: sha(pdf), pdfBytes: pdf.length, logSha256: sha(output.logBytes), flsSha256: sha(output.flsBytes) });
+
+  // Benign hyperref / rerunfilecheck Info log lines must not trigger a false positive.
+  const hyperrefBenign = log([
+    `(${tex}/texmf-dist/tex/latex/rerunfilecheck/rerunfilecheck.sty`,
+    'Package: rerunfilecheck 2025-06-21 v1.11 Rerun checks for auxiliary files (HO)',
+    "Package uniquecounter Info: New unique counter `rerunfilecheck' on input line 2",
+    "Package rerunfilecheck Info: File `main.out' has not changed.",
+    '(rerunfilecheck)             Checksum: 0524C03908F303C182C5C4A94A1B8E5E;175.',
+  ].join('\n'));
+  assert.equal(checkPaperCompileOutput({ ...output, logBytes: hyperrefBenign }).pdfSha256, sha(pdf));
+
+  // Real rerunfilecheck / undefined reference / wrapped LaTeX warnings must still fail pass 2.
+  for (const warning of [
+    "Package rerunfilecheck Warning: File `main.out' has changed.\n(rerunfilecheck)                Rerun to get outlines right",
+    "LaTeX Warning: Reference `thm:missing' on page 3\n               undefined on input line 88.",
+    "LaTeX Warning: Citation `Ghost2026' on page 1 undefined on input line 12.",
+    'LaTeX Warning: There were undefined references.',
+    'LaTeX Warning: There were multiply-defined labels.',
+    'Package biblatex Warning: Please (re)run Biber on the file:',
+    'Package longtable Warning: Table widths have changed. Rerun LaTeX.',
+  ]) {
+    fail(() => checkPaperCompileOutput({ ...output, logBytes: log(warning) }), 'REFERENCES_UNSETTLED');
+  }
 });
 test('reject TeX failure even with success-looking PDF message, missing success log and invalid PDF envelope', () => {
   fail(() => checkPaperCompileOutput({ ...output, logBytes: log('! Undefined control sequence.'), pass: 1 }), 'TEX_ERROR');
